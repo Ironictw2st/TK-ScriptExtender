@@ -1290,10 +1290,10 @@ function se.modify.attitude(a, b, level)
 end
 
 -- se.query.faction_force_gdp(faction_key) -> { total = n, entries = "..." } | nil, message
---   Sum of the gdp_abs ("region_gdp") values that effects put on the FACTION itself, i.e. effects
---   with a force_to_faction_own* (or faction_to_faction_own) scope. With horde_income=1 in
---   script_extender.cfg the DLL adds this total to the faction's region income 1:1, so factions
---   without regions earn from such effects.
+--   Sum of the gdp_abs ("region_gdp") values that effects put on the FACTION itself (scopes
+--   force_to_faction_own*, faction_to_faction_own) or on its MILITARY FORCES (force_to_force_own,
+--   what horde building bundles use). With horde_income=1 in script_extender.cfg the DLL adds
+--   this total to the faction's region income 1:1, so factions without regions earn from them.
 function se.query.faction_force_gdp(faction_key)
 	local okn, err = need("se_faction_gdp_bonus")
 	if not okn then return nil, err end

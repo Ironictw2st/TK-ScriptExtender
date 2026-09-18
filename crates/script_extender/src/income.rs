@@ -42,6 +42,8 @@ type EffectCtx = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 static HOOK: OnceLock<GenericDetour<UpdateIncome>> = OnceLock::new();
 static EFFECT_CTX: OnceLock<usize> = OnceLock::new();
 static LOGGED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(8);
+/// set while the Lua query runs: list every record-bearing effect value of the faction
+static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "system" {
     fn IsBadReadPtr(lp: *const c_void, ucb: usize) -> i32;
@@ -86,25 +88,61 @@ fn entry_value(bits: u32) -> f32 {
     }
 }
 
-/// (sum of the faction's region_gdp values on GDP type records, per-entry description)
+/// Faction-level values plus the values on each of the faction's military forces (mod bundles
+/// for hordes use `force_to_force_own`, which stays on the army). Forces: FACTION+0xe00 array of
+/// handles (count +0xdfc), `**elem` = MILITARY_FORCE, owner handle at force+0xd8 (bundle list at
+/// force+0x698, FUN_14140c700). A force is only read when its owner is this faction and its
+/// +0x18 sub-object has the same vtable as the faction's effect holder.
 unsafe fn faction_gdp_bonus(faction: usize) -> Result<(f32, Vec<String>), String> {
+    let (mut sum, mut rows) = holder_gdp_bonus(faction, "faction")?;
+    let (n, arr) = (rd(faction + 0xdfc) as usize, rq(faction + 0xe00));
+    if n > 0 && n <= 256 && readable(arr, n * 8) {
+        let holder_vt = rq(faction + 0x18);
+        for i in 0..n {
+            let force = rq(rq(arr + i * 8));
+            if force == 0 || !readable(force, 0x6a0) { continue; }
+            if rq(rq(force + 0xd8)) != faction || rq(force + 0x18) != holder_vt {
+                if DIAG.load(std::sync::atomic::Ordering::Relaxed) {
+                    log!("    force[{i}] {:#x} skipped: owner {:#x}, holder vtable {:#x} (faction's {:#x})", force, rq(rq(force + 0xd8)), rq(force + 0x18), holder_vt);
+                }
+                continue;
+            }
+            if let Ok((s, r)) = holder_gdp_bonus(force, &format!("force[{i}]")) {
+                sum += s;
+                rows.extend(r);
+            }
+        }
+    }
+    Ok((sum, rows))
+}
+
+/// (sum of one holder's region_gdp values on GDP type records, per-entry description)
+unsafe fn holder_gdp_bonus(faction: usize, who: &str) -> Result<(f32, Vec<String>), String> {
     let f: EffectCtx = core::mem::transmute(*EFFECT_CTX.get().ok_or("engine table missing")?);
     let ctx = f((faction + 0x18) as *mut c_void) as usize;
-    if ctx == 0 || !readable(ctx, 0x10) { return Err("faction effect values not available".into()); }
+    if ctx == 0 || !readable(ctx, 0x10) { return Err("effect values not available".into()); }
     let (count, data) = (rd(ctx + 4) as usize, rq(ctx + 8));
     if count > 20_000 || (count > 0 && !readable(data, count * 0x18)) {
         return Err(format!("effect value vector not plausible (count {count}, data {:#x})", data));
     }
     let (mut sum, mut rows) = (0.0f32, Vec::new());
+    let mut with_record = 0usize;
     for i in 0..count {
         let en = data + i * 0x18;
         let rec = rq(en + 0x10);
         if rec == 0 { continue; }
+        with_record += 1;
         let key = record_key(rec);
+        if DIAG.load(std::sync::atomic::Ordering::Relaxed) && with_record <= 60 {
+            log!("    entry kind {} id {} record {:#x} key '{}' raw {:#010x} words {:016x} {:016x}", (rd(en) >> 16) & 0xff, rd(en) & 0xffff, rec, key, rd(en + 4), rq(rec), rq(rec + 8));
+        }
         if !GDP_TYPES.contains(&key.as_str()) { continue; }
         let (id, kind, v) = (rd(en) & 0xffff, (rd(en) >> 16) & 0xff, entry_value(rd(en + 4)));
-        rows.push(format!("kind {kind} id {id} {key} = {v} (raw {:#010x})", rd(en + 4)));
+        rows.push(format!("{who}: kind {kind} id {id} {key} = {v} (raw {:#010x})", rd(en + 4)));
         if id == ID_REGION_GDP { sum += v; }
+    }
+    if DIAG.load(std::sync::atomic::Ordering::Relaxed) {
+        log!("    {who} {:#x} ctx {:#x}: {count} effect values, {with_record} with a record", faction, ctx);
     }
     Ok((sum, rows))
 }
@@ -161,7 +199,9 @@ pub unsafe fn register(l: *mut LuaState) {
 
 unsafe extern "C" fn se_faction_gdp_bonus(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
+    DIAG.store(true, std::sync::atomic::Ordering::Relaxed);
     let r = crate::progression::faction_from_arg(l, 1).and_then(|f| faction_gdp_bonus(f));
+    DIAG.store(false, std::sync::atomic::Ordering::Relaxed);
     match r {
         Ok((sum, rows)) => {
             log!("se_faction_gdp_bonus: sum {sum}; hook {}; {}", if HOOK.get().is_some() { "on" } else { "off" }, rows.join("; "));
