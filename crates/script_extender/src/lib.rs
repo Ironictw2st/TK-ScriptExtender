@@ -24,6 +24,10 @@ mod cai;
 mod potential;
 mod xp;
 mod build;
+mod buildings;
+mod alliances;
+mod bundles;
+mod diplomacy;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,6 +79,10 @@ fn bootstrap() {
     potential::init(&table);
     xp::init(&table);
     build::init(&table);
+    buildings::init(&table);
+    alliances::init(&table);
+    bundles::init(&table);
+    diplomacy::init(&table);
     build::apply_config();
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");

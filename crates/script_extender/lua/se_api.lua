@@ -886,6 +886,337 @@ function se.modify.build_number(build, short, modified)
 	return se_build_info_set(build or "", short or "", modified)
 end
 
+----------------------------------------------------------------------------------------------
+-- region slots and buildings
+----------------------------------------------------------------------------------------------
+
+function se.region(key)
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	if type(key) ~= "string" or key == "" then return nil, "region key must be a non-empty string" end
+	local ok, r = pcall(function() return cm:query_region(key) end)
+	if not ok or is_null(r) then return nil, "no region '" .. key .. "'" end
+	return r
+end
+
+-- Ordered slot entries {index, slot, name, type} of a region (index = position in slot_list()).
+local function region_slots(r)
+	local ok, list = pcall(function() return r:slot_list() end)
+	if not ok then return nil, "slot_list failed" end
+	local out = {}
+	for i = 0, list:num_items() - 1 do
+		local sl = list:item_at(i)
+		local okn, name = pcall(function() return sl:name() end)
+		local okt, ty = pcall(function() return sl:type() end)
+		out[#out + 1] = { index = i, slot = sl, name = okn and str(name) or "", type = okt and str(ty) or "" }
+	end
+	return out
+end
+
+local function slot_of(region_key, index)
+	local r, err = se.region(region_key)
+	if not r then return nil, err end
+	local list, e2 = region_slots(r)
+	if not list then return nil, e2 end
+	for _, e in ipairs(list) do if e.index == num(index) then return e, r end end
+	return nil, "region " .. region_key .. " has no slot index " .. str(index)
+end
+
+-- se.query.region_slots(region_key) -> { {index, name, type, has_building, building, chain, health, engine}, ... }
+function se.query.region_slots(region_key)
+	local r, err = se.region(region_key)
+	if not r then return nil, err end
+	local list, e2 = region_slots(r)
+	if not list then return nil, e2 end
+	local out = {}
+	for _, e in ipairs(list) do
+		local row = { index = e.index, name = e.name, type = e.type }
+		local okh, has = pcall(function() return e.slot:has_building() end)
+		row.has_building = okh and has == true
+		if row.has_building then
+			local okb, b = pcall(function() return e.slot:building() end)
+			if okb and not is_null(b) then
+				row.building = str(b:name()); row.chain = str(b:chain()); row.health = num(b:percent_health())
+			end
+		end
+		if se.available("se_slot_info") then
+			local hb, key, health, can, info = se_slot_info(e.slot)
+			if hb ~= nil then row.engine_key, row.engine_health, row.can_damage, row.engine = str(key), num(health), can == true, str(info)
+			else row.engine = str(key) end
+		end
+		out[#out + 1] = row
+	end
+	return out
+end
+
+-- se.query.building_candidates(region_key, slot_index) -> { level_key, ... } the engine allows now
+function se.query.building_candidates(region_key, slot_index)
+	local okn, err = need("se_slot_candidates")
+	if not okn then return nil, err end
+	local e, e2 = slot_of(region_key, slot_index)
+	if not e then return nil, e2 end
+	local s, e3 = se_slot_candidates(e.slot)
+	if s == nil or s == "" then return {}, e3 end
+	local out = {}
+	for k in str(s):gmatch("[^,]+") do out[#out + 1] = k end
+	return out
+end
+
+local function slot_action(tag, native, region_key, slot_index, f)
+	local okn, err = need(native)
+	if not okn then return false, err end
+	return on_model(tag, function()
+		local e, e2 = slot_of(region_key, slot_index)
+		if not e then return false, e2 end
+		return f(e)
+	end)
+end
+
+-- se.modify.building_damage(region_key, slot_index, percent)
+function se.modify.building_damage(region_key, slot_index, percent)
+	return slot_action("building_damage(" .. str(region_key) .. ", " .. str(slot_index) .. ", " .. str(percent) .. ")", "se_slot_damage", region_key, slot_index, function(e)
+		return se_slot_damage(e.slot, num(percent))
+	end)
+end
+
+-- se.modify.building_repair(region_key, slot_index, opts) : opts.free = true repairs directly
+-- (no cost); default uses the engine's repair command (charges like the UI).
+function se.modify.building_repair(region_key, slot_index, opts)
+	opts = opts or {}
+	return slot_action("building_repair(" .. str(region_key) .. ", " .. str(slot_index) .. ")", "se_slot_repair", region_key, slot_index, function(e)
+		return se_slot_repair(e.slot, opts.free == true)
+	end)
+end
+
+-- se.modify.building_destroy(region_key, slot_index)
+function se.modify.building_destroy(region_key, slot_index)
+	return slot_action("building_destroy(" .. str(region_key) .. ", " .. str(slot_index) .. ")", "se_slot_destroy", region_key, slot_index, function(e)
+		return se_slot_destroy(e.slot)
+	end)
+end
+
+-- se.modify.building_construct(region_key, slot_index, level_key, opts)
+--   Issues the engine's construct command for level_key (upgrade / conversion = the target
+--   level key). opts.complete = true also pays to complete next turn; opts.free = true refunds
+--   whatever the treasury lost (construction and completion costs) to the owning faction.
+function se.modify.building_construct(region_key, slot_index, level_key, opts)
+	opts = opts or {}
+	local okn, err = need("se_slot_construct")
+	if not okn then return false, err end
+	if type(level_key) ~= "string" or level_key == "" then return false, "level_key must be a non-empty string" end
+	local cm, e0 = cm_()
+	if not cm then return false, e0 end
+	return on_model("building_construct(" .. str(region_key) .. ", " .. str(slot_index) .. ", " .. level_key .. ")", function()
+		local e, e2 = slot_of(region_key, slot_index)
+		if not e then return false, e2 end
+		local okf, f = pcall(function() return e.slot:faction() end)
+		if not okf or is_null(f) then return false, "slot has no owning faction" end
+		local fkey = str(f:name())
+		local before = num(f:treasury()) or 0
+		local ok, msg = se_slot_construct(e.slot, f, level_key)
+		if not ok then return false, msg end
+		local report = { str(msg) }
+		if opts.complete then
+			local ok2, msg2 = se_slot_pay_to_complete(e.slot)
+			report[#report + 1] = "pay_to_complete -> " .. str(ok2) .. " : " .. str(msg2)
+		end
+		if opts.free then
+			local after = num(cm:query_faction(fkey):treasury()) or before
+			local spent = before - after
+			if spent > 0 then
+				cm:modify_faction(fkey):increase_treasury(spent)
+				report[#report + 1] = "refunded " .. spent
+			else
+				report[#report + 1] = "nothing to refund (treasury " .. before .. " -> " .. after .. ")"
+			end
+		end
+		return true, table.concat(report, "; ")
+	end)
+end
+
+----------------------------------------------------------------------------------------------
+-- alliances / coalitions
+----------------------------------------------------------------------------------------------
+
+local function alliance_by_cqi(cqi)
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local ok, list = pcall(function() return cm:query_model():world():alliance_list() end)
+	if not ok then return nil, "alliance_list failed" end
+	for i = 0, list:num_items() - 1 do
+		local a = list:item_at(i)
+		local okc, c = pcall(function() return a:cqi() end)
+		if okc and num(c) == num(cqi) then return a end
+	end
+	return nil, "no alliance with cqi " .. str(cqi)
+end
+
+-- se.query.alliances() -> { {cqi, name, members = {faction keys}, engine}, ... }
+function se.query.alliances()
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local ok, list = pcall(function() return cm:query_model():world():alliance_list() end)
+	if not ok then return nil, "alliance_list failed" end
+	local out = {}
+	for i = 0, list:num_items() - 1 do
+		local a = list:item_at(i)
+		local row = { members = {} }
+		local okc, c = pcall(function() return a:cqi() end)
+		row.cqi = okc and num(c) or nil
+		local okm, m = pcall(function() return a:members() end)
+		if okm and type(m) == "userdata" then
+			for j = 0, m:num_items() - 1 do row.members[#row.members + 1] = str(m:item_at(j):name()) end
+		end
+		if row.cqi and se.available("se_alliance_info") then
+			local name, info = se_alliance_info(a, row.cqi)
+			if name ~= nil then row.name, row.engine = str(name), str(info) else row.engine = str(info) end
+		end
+		out[#out + 1] = row
+	end
+	return out
+end
+
+-- se.modify.alliance_name(cqi, text, mode) : rename an alliance/coalition (mode "inline" default,
+-- or "pointer"); check persistence with a save/load.
+function se.modify.alliance_name(cqi, text, mode)
+	local okn, err = need("se_alliance_name_set")
+	if not okn then return false, err end
+	if type(text) ~= "string" or text == "" then return false, "text must be a non-empty string" end
+	return on_model("alliance_name(" .. str(cqi) .. ", " .. text .. ")", function()
+		local a, e1 = alliance_by_cqi(cqi)
+		if not a then return false, e1 end
+		return se_alliance_name_set(a, num(cqi), text, mode or "inline")
+	end)
+end
+
+----------------------------------------------------------------------------------------------
+-- effect bundles
+----------------------------------------------------------------------------------------------
+
+-- se.query.effect_bundle(bundle_key [, faction_key]) -> { count, dump } | nil, message
+-- (faction_key only provides the model; defaults to the local player's faction)
+function se.query.effect_bundle(bundle_key, faction_key)
+	local okn, err = need("se_effect_bundle_info")
+	if not okn then return nil, err end
+	local cm, e0 = cm_()
+	if not cm then return nil, e0 end
+	faction_key = faction_key or cm:get_local_faction()
+	local f, e1 = se.faction(faction_key)
+	if not f then return nil, e1 end
+	local count, dump = se_effect_bundle_info(f, bundle_key)
+	if count == nil then return nil, str(dump) end
+	return { count = num(count), dump = str(dump) }
+end
+
+----------------------------------------------------------------------------------------------
+-- faction income lines (script-side: paid into the treasury at the faction's turn start;
+-- persisted through cm:save_named_value; not shown in the engine's income breakdown)
+----------------------------------------------------------------------------------------------
+
+se._income = se._income or {}
+
+local function income_encode()
+	local parts = {}
+	for fk, lines in pairs(se._income) do
+		for label, amount in pairs(lines) do parts[#parts + 1] = fk .. ":" .. label .. ":" .. str(amount) end
+	end
+	return table.concat(parts, "|")
+end
+
+local function income_install_listener()
+	if se._income_listener then return true end
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core" end
+	local cm = cm_()
+	core:add_listener("se_income_lines", "FactionTurnStart", true, function(context)
+		local name = str(context:faction():name())
+		local lines = se._income[name]
+		if not lines then return end
+		local total = 0
+		for _, amount in pairs(lines) do total = total + amount end
+		if total > 0 then cm:modify_faction(name):increase_treasury(total)
+		elseif total < 0 then cm:modify_faction(name):decrease_treasury(-total) end
+		log("income lines: " .. name .. " " .. str(total))
+	end, true)
+	se._income_listener = true
+	return true
+end
+
+-- se.modify.faction_income(faction_key, amount, label) : add/replace a per-turn income line
+-- (amount 0 removes it). Returns ok, message.
+function se.modify.faction_income(faction_key, amount, label)
+	local cm, e0 = cm_()
+	if not cm then return false, e0 end
+	label = label or "se_income"
+	local f, e1 = se.faction(faction_key)
+	if not f then return false, e1 end
+	se._income[faction_key] = se._income[faction_key] or {}
+	if num(amount) == nil or num(amount) == 0 then se._income[faction_key][label] = nil
+	else se._income[faction_key][label] = num(amount) end
+	pcall(function() cm:save_named_value("se_income_lines", income_encode()) end)
+	local ok, err = income_install_listener()
+	if not ok then return false, err end
+	return true, faction_key .. " '" .. label .. "' = " .. str(amount) .. " per turn (applied at FactionTurnStart)"
+end
+
+-- se.query.faction_income(faction_key) -> { label = amount, ... , total = n }
+function se.query.faction_income(faction_key)
+	local lines = se._income[faction_key] or {}
+	local out, total = {}, 0
+	for label, amount in pairs(lines) do out[label] = amount; total = total + amount end
+	out.total = total
+	return out
+end
+
+-- se.load_income_lines() : restore saved lines (call once after a campaign load)
+function se.load_income_lines()
+	local cm, e0 = cm_()
+	if not cm then return false, e0 end
+	local ok, enc = pcall(function() return cm:load_named_value("se_income_lines", "") end)
+	if not ok or type(enc) ~= "string" or enc == "" then return false, "no saved income lines" end
+	se._income = {}
+	for part in enc:gmatch("[^|]+") do
+		local fk, label, amount = part:match("^([^:]+):([^:]+):(.+)$")
+		if fk then se._income[fk] = se._income[fk] or {}; se._income[fk][label] = num(amount) end
+	end
+	return income_install_listener()
+end
+
+----------------------------------------------------------------------------------------------
+-- diplomacy: standing and attitude events
+----------------------------------------------------------------------------------------------
+
+-- se.query.attitude(a, b) -> { standing, stock } (standing of a towards b)
+function se.query.attitude(a, b)
+	local fa, e1 = se.faction(a)
+	if not fa then return nil, e1 end
+	local fb, e2 = se.faction(b)
+	if not fb then return nil, e2 end
+	local t = {}
+	local oks, st = pcall(function() return fa:diplomatic_standing_with(fb) end)
+	t.stock = oks and num(st) or nil
+	if se.available("se_attitude_get") then
+		local v = se_attitude_get(fa, fb)
+		t.standing = num(v)
+	end
+	return t
+end
+
+-- se.modify.attitude(a, b, level) : fire the engine's attitude-change event from a towards b.
+-- level 1/2/3 = small/medium/large positive, -1/-2/-3 = negative (values come from the DB
+-- attitude event records, so a mod sets the exact numbers there).
+function se.modify.attitude(a, b, level)
+	local okn, err = need("se_attitude_change")
+	if not okn then return false, err end
+	return on_model("attitude(" .. str(a) .. ", " .. str(b) .. ", " .. str(level) .. ")", function()
+		local fa, e1 = se.faction(a)
+		if not fa then return false, e1 end
+		local fb, e2 = se.faction(b)
+		if not fb then return false, e2 end
+		return se_attitude_change(fa, fb, num(level))
+	end)
+end
+
 -- Pretty-print helper for console use: se.dump(se.query.retinue(1))
 function se.dump(v, indent)
 	indent = indent or ""
