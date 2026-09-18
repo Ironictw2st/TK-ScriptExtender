@@ -29,8 +29,17 @@
 //!   se_ar_variables_reset(q_faction) -> ok, msg
 //!   se_ar_variable_list(q_faction) -> "key=value;..." of every autoresolver_* key
 //!   se_ar_prediction(q_faction) -> ok, "k=v;..." | false, msg
-//!   se_ar_plan_set(spec) / se_ar_plan_get() / se_ar_plan_clear()  plan storage (consumed by the
-//!     hooks of later versions; 0.24 only stores it)
+//!   se_ar_plan_set(q_faction, spec) / se_ar_plan_get() / se_ar_plan_clear(): the plan is keyed to
+//!     the pending battle object that exists when it is set; the hook ignores every other battle
+//!   se_ar_recompute(q_faction) -> ok, msg   re-run the engine's compute routine for the current
+//!     pending battle so that the panel shows the planned outcome
+//!
+//! Result layout used by the hook (mapped live, 2026-09-18): alliance summary (0x68) = {+0 vector
+//! of INLINE army records, +0x10 men before, +0x18 men after, +0x20 men lost, +0x28 kills,
+//! +0x64 u32 prediction enum}; army record: +0x20 vector of unit records, stride 0x188:
+//! +0x20 UniString name, +0x50 men initial, +0x54 men at start, +0x58 men after, +0x64 hp initial,
+//! +0x68 hp at start, +0x6c hp after (characters: men 1/1/1, only hp moves). R+0x98 / +0x9c
+//! attacker strength before / after, R+0xa0 / +0xa4 defender.
 
 use crate::addrs::Table;
 use crate::log;
@@ -58,6 +67,9 @@ static INDEX: OnceLock<Result<HashMap<String, usize>, String>> = OnceLock::new()
 /// idx -> value before the first script write (for reset)
 static ORIGINAL: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
 static PLAN: Mutex<Option<String>> = Mutex::new(None);
+/// pending battle object the plan belongs to
+static PLAN_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COMPUTE_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ar_variable_get", se_ar_variable_get);
@@ -68,6 +80,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ar_plan_set", se_ar_plan_set);
     lua::set_global_fn(l, "se_ar_plan_get", se_ar_plan_get);
     lua::set_global_fn(l, "se_ar_plan_clear", se_ar_plan_clear);
+    lua::set_global_fn(l, "se_ar_recompute", se_ar_recompute);
 }
 
 extern "system" {
@@ -267,13 +280,36 @@ unsafe extern "C" fn se_ar_prediction(l: *mut LuaState) -> c_int {
 }
 
 unsafe extern "C" fn se_ar_plan_set(l: *mut LuaState) -> c_int {
-    let spec = lua::to_str(l, 1);
+    let spec = lua::to_str(l, 2);
     let r: Result<String, String> = (|| {
         if spec.len() > 8192 { return Err("plan is too long".into()); }
+        let world = world_of(l, 1)?;
+        let pb = rq(world + OFF_WORLD_PENDING_BATTLE);
+        if pb == 0 || !readable(pb, 0x180) { return Err("no pending battle object".into()); }
         *PLAN.lock().map_err(|_| "state lock poisoned")? = Some(spec.clone());
-        Ok(format!("plan stored ({} bytes): {spec}", spec.len()))
+        PLAN_PB.store(pb, std::sync::atomic::Ordering::SeqCst);
+        Ok(format!("plan stored for pending battle {:#x}: {spec}", pb))
     })();
     bool_result(l, r, "se_ar_plan_set")
+}
+
+unsafe extern "C" fn se_ar_recompute(l: *mut LuaState) -> c_int {
+    let r: Result<String, String> = (|| {
+        let target = COMPUTE_TARGET.load(std::sync::atomic::Ordering::SeqCst);
+        if target == 0 { return Err("the auto-resolve hook is not installed".into()); }
+        let world = world_of(l, 1)?;
+        let pb = rq(world + OFF_WORLD_PENDING_BATTLE);
+        if pb == 0 || !readable(pb, 0x180) { return Err("no pending battle object".into()); }
+        let night = (rd(pb + 0x11c) & 0xff) as usize;
+        if night > 1 { return Err("night flag is not a boolean; layout mismatch".into()); }
+        let count = rd(pb + 0xcc + night * 0x10);
+        if count == 0 || count > 16 { return Err(format!("the pending battle has {count} results; nothing to recompute")); }
+        // Through the hooked entry, exactly as the engine calls it at the click.
+        let f: ComputeResults = core::mem::transmute(target);
+        f(pb as *mut c_void, night as u8);
+        Ok(format!("results recomputed for pending battle {:#x}", pb))
+    })();
+    bool_result(l, r, "se_ar_recompute")
 }
 
 unsafe extern "C" fn se_ar_plan_get(l: *mut LuaState) -> c_int {
@@ -285,6 +321,7 @@ unsafe extern "C" fn se_ar_plan_get(l: *mut LuaState) -> c_int {
 unsafe extern "C" fn se_ar_plan_clear(l: *mut LuaState) -> c_int {
     let r: Result<String, String> = (|| {
         let had = PLAN.lock().map_err(|_| "state lock poisoned")?.take().is_some();
+        PLAN_PB.store(0, std::sync::atomic::Ordering::SeqCst);
         Ok(if had { "plan cleared".into() } else { "no plan was stored".into() })
     })();
     bool_result(l, r, "se_ar_plan_clear")
@@ -343,10 +380,139 @@ unsafe extern "C" fn compute_detour(pb: *mut c_void, night: u8) {
     let plan = PLAN.lock().ok().and_then(|g| g.clone());
     log!("ar_compute_results(pb={:#x}, night={night}): results {before} -> {after}, plan {}", p, plan.as_deref().unwrap_or("none"));
     if after == 0 || after > 16 { return; }
+    if let Some(spec) = plan.as_deref() {
+        if PLAN_PB.load(std::sync::atomic::Ordering::SeqCst) == p {
+            let data = rq(slot + 8);
+            if readable(data, after * 8) {
+                match apply_plan(rq(data + (after - 1) * 8), spec) {
+                    Ok(m) => log!("  plan applied: {m}"),
+                    Err(e) => log!("  plan NOT applied: {e}"),
+                }
+            }
+        } else {
+            log!("  plan belongs to another pending battle; left alone");
+        }
+    }
     if DUMPS_LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
         let data = rq(slot + 8);
         if readable(data, after * 8) { dump_result(rq(data + (after - 1) * 8)); }
     }
+}
+
+struct SidePlan { scale: f32, max: f32 }
+
+fn plan_value(spec: &str, key: &str) -> Option<String> {
+    spec.split(';').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+}
+
+const UNIT_STRIDE: usize = 0x188;
+
+/// (units data, count) of a side when it has exactly one army record, else an error text.
+unsafe fn side_units(sum: usize) -> Result<(usize, usize), String> {
+    let (armies, adata) = (rd(sum + 4) as usize, rq(sum + 8));
+    if armies != 1 { return Err(format!("{armies} army records (only single-record sides are handled)")); }
+    if !readable(adata, 0x30) { return Err("army record not readable".into()); }
+    let (n, data) = (rd(adata + 0x24) as usize, rq(adata + 0x28));
+    if n == 0 || n > 80 || !readable(data, n * UNIT_STRIDE) { return Err(format!("unit vector not plausible (count {n})")); }
+    for u in 0..n {
+        let r = data + u * UNIT_STRIDE;
+        let (start, after, hp_start, hp_after) = (rd(r + 0x54), rd(r + 0x58), rd(r + 0x68), rd(r + 0x6c));
+        if start > 100_000 || after > start || hp_start > 100_000_000 || hp_after > hp_start {
+            return Err(format!("unit {u} fields not plausible (men {start}->{after}, hp {hp_start}->{hp_after})"));
+        }
+    }
+    Ok((data, n))
+}
+
+unsafe fn side_loss(data: usize, n: usize) -> f32 {
+    let (mut hp_start, mut hp_after) = (0u64, 0u64);
+    for u in 0..n {
+        hp_start += rd(data + u * UNIT_STRIDE + 0x68) as u64;
+        hp_after += rd(data + u * UNIT_STRIDE + 0x6c) as u64;
+    }
+    if hp_start == 0 { 0.0 } else { 1.0 - hp_after as f32 / hp_start as f32 }
+}
+
+/// Rewrites the freshly computed result according to the plan: per-unit survivors and hit points,
+/// the side summaries, the prediction blocks and (when the winner is forced) the result enums.
+unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
+    if !readable(res, 0xa8) || rd(res + 0x1c) != 2 { return Err("result does not have two alliance summaries".into()); }
+    let sums = rq(res + 0x20);
+    if !readable(sums, 0xd0) { return Err("alliance summaries not readable".into()); }
+    let num = |k: &str| plan_value(spec, k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite());
+    let plans = [
+        SidePlan { scale: num("cas_att_scale").unwrap_or(1.0).clamp(0.0, 10.0), max: num("cas_att_max").unwrap_or(1.0).clamp(0.0, 1.0) },
+        SidePlan { scale: num("cas_def_scale").unwrap_or(1.0).clamp(0.0, 10.0), max: num("cas_def_max").unwrap_or(1.0).clamp(0.0, 1.0) },
+    ];
+    let winner = plan_value(spec, "winner");
+    let att_enum = rd(res + 0x64 + 0xc);
+    let def_enum = rd(res + 0x7c + 0xc);
+    if att_enum > 8 || def_enum > 8 { return Err(format!("prediction enums not plausible ({att_enum}, {def_enum})")); }
+    let attacker_wins = att_enum < 4;
+    let swap = match winner.as_deref() {
+        Some("attacker") => !attacker_wins && att_enum != 4,
+        Some("defender") => attacker_wins,
+        _ => false,
+    };
+    let sides = [side_units(sums), side_units(sums + 0x68)];
+    let losses = [sides[0].as_ref().map(|(d, n)| side_loss(*d, *n)).unwrap_or(0.0), sides[1].as_ref().map(|(d, n)| side_loss(*d, *n)).unwrap_or(0.0)];
+    if swap && (sides[0].is_err() || sides[1].is_err()) {
+        return Err(format!("cannot force the winner: attacker {:?}, defender {:?}", sides[0].as_ref().err(), sides[1].as_ref().err()));
+    }
+    let mut report = Vec::new();
+    let mut lost_after = [0u32; 2];
+    for i in 0..2 {
+        let sum = sums + i * 0x68;
+        let (data, n) = match &sides[i] {
+            Ok(v) => *v,
+            Err(e) => { report.push(format!("side {i} skipped: {e}")); lost_after[i] = rd(sum + 0x20); continue; }
+        };
+        // forced winner: this side takes the other side's loss level
+        let level = if swap && losses[i] > 0.0001 { losses[1 - i] / losses[i] } else { 1.0 };
+        let (mut men_before, mut men_after, mut hp_b, mut hp_a) = (0u32, 0u32, 0u64, 0u64);
+        for u in 0..n {
+            let r = data + u * UNIT_STRIDE;
+            let (start, after, hp_start, hp_after) = (rd(r + 0x54), rd(r + 0x58), rd(r + 0x68), rd(r + 0x6c));
+            if hp_start > 0 {
+                let loss = 1.0 - hp_after as f32 / hp_start as f32;
+                let new_loss = (loss * level * plans[i].scale).clamp(0.0, 1.0).min(plans[i].max);
+                let new_hp = ((hp_start as f32) * (1.0 - new_loss)).round() as u32;
+                let mut new_men = ((start as f32) * (1.0 - new_loss)).round() as u32;
+                if new_hp > 0 && new_men == 0 && start > 0 { new_men = 1; }
+                if new_hp == 0 { new_men = 0; }
+                core::ptr::write_unaligned((r + 0x6c) as *mut u32, new_hp.min(hp_start));
+                core::ptr::write_unaligned((r + 0x58) as *mut u32, new_men.min(start));
+            }
+            men_before += start; men_after += rd(r + 0x58); hp_b += hp_start as u64; hp_a += rd(r + 0x6c) as u64;
+            let _ = after;
+        }
+        let old_lost = rd(sum + 0x20);
+        core::ptr::write_unaligned((sum + 0x18) as *mut u64, men_after as u64);
+        core::ptr::write_unaligned((sum + 0x20) as *mut u64, men_before.saturating_sub(men_after) as u64);
+        lost_after[i] = men_before.saturating_sub(men_after);
+        // prediction block casualties % and the strength-after float follow the hit point loss
+        let block = res + if i == 0 { 0x64 } else { 0x7c };
+        let new_frac = if hp_b == 0 { 0.0 } else { 1.0 - hp_a as f32 / hp_b as f32 };
+        core::ptr::write_unaligned((block + 8) as *mut f32, new_frac * 100.0);
+        let (sb, sa) = (res + 0x98 + i * 8, res + 0x9c + i * 8);
+        let before_strength = core::ptr::read_unaligned(sb as *const f32);
+        if before_strength.is_finite() && before_strength > 0.0 {
+            core::ptr::write_unaligned(sa as *mut f32, before_strength * (1.0 - new_frac));
+        }
+        report.push(format!("side {i}: men {men_before} -> {men_after} (lost {old_lost} -> {}), loss {:.1}% -> {:.1}%", lost_after[i], losses[i] * 100.0, new_frac * 100.0));
+    }
+    // kills of each side = what the other side lost
+    core::ptr::write_unaligned((sums + 0x28) as *mut u64, lost_after[1] as u64);
+    core::ptr::write_unaligned((sums + 0x68 + 0x28) as *mut u64, lost_after[0] as u64);
+    if swap {
+        core::ptr::write_unaligned((res + 0x64 + 0xc) as *mut u32, def_enum);
+        core::ptr::write_unaligned((res + 0x7c + 0xc) as *mut u32, att_enum);
+        let (a, d) = (rd(sums + 0x64), rd(sums + 0x68 + 0x64));
+        core::ptr::write_unaligned((sums + 0x64) as *mut u32, d);
+        core::ptr::write_unaligned((sums + 0x68 + 0x64) as *mut u32, a);
+        report.push(format!("winner forced to {}: enums {att_enum}/{def_enum} -> {def_enum}/{att_enum}", winner.unwrap_or_default()));
+    }
+    Ok(report.join("; "))
 }
 
 pub fn install_hooks(t: &Table) {
@@ -365,7 +531,8 @@ pub fn install_hooks(t: &Table) {
                     return;
                 }
                 let _ = COMPUTE_HOOK.set(d);
-                log!("auto-resolve hook installed (observe only)");
+                COMPUTE_TARGET.store(target as usize, std::sync::atomic::Ordering::SeqCst);
+                log!("auto-resolve hook installed");
             }
             Err(e) => log!("failed to create the auto-resolve hook: {e}"),
         }

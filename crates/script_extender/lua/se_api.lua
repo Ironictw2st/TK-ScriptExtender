@@ -1504,7 +1504,9 @@ local function encode_plan(plan, ctx)
 end
 
 -- se.modify.autoresolve_plan(plan [, ctx]): store the plan for the current pending battle.
--- (0.24 stores and validates it; the engine hooks that consume it arrive with 0.25 - 0.27.)
+-- DLL 0.26 applies plan.winner and plan.casualties to the engine's result (prediction and the
+-- real resolve); plan.bias and plan.duels are stored for the later versions.
+-- plan.refresh_prediction = false skips the immediate recompute of the panel prediction.
 function se.modify.autoresolve_plan(plan, ctx)
 	local okn, err = need("se_ar_plan_set")
 	if not okn then return false, err end
@@ -1517,7 +1519,17 @@ function se.modify.autoresolve_plan(plan, ctx)
 	local spec, e1 = encode_plan(plan, ctx)
 	if not spec then return false, e1 end
 	se._ar_plan = plan
-	return se_ar_plan_set(spec)
+	return on_model("autoresolve_plan", function()
+		local f, e2 = local_faction()
+		if not f then return false, e2 end
+		local ok, msg = se_ar_plan_set(f, spec)
+		if ok and plan.refresh_prediction ~= false and se.available("se_ar_recompute") then
+			-- run the engine's compute routine again so the pre-battle panel shows the planned result
+			local ok2, msg2 = se_ar_recompute(f)
+			msg = str(msg) .. "; recompute -> " .. str(ok2) .. " : " .. str(msg2)
+		end
+		return ok, msg
+	end)
 end
 
 function se.modify.autoresolve_plan_clear()
