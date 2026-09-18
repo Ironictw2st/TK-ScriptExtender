@@ -60,6 +60,8 @@ jobs:
         with:
           name: "Script extender ${{ github.ref_name }}"
           generate_release_notes: true
+          # Tags like v0.24.0-beta.1 publish as pre-releases (TK Mod Manager offers them only on its pre-release channel).
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             script_extender.dll
             injector.exe
