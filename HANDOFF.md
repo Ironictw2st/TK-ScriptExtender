@@ -85,7 +85,7 @@ a native is present. `se.version()` = DLL version.
 | Assignments | `assignment(cqi)` -> key, state, rounds, **province** | (none) | ASSIGNMENT `+0x28` -> target `+0xb8` -> PROVINCE, key at `*(*(prov+0x20))+8` |
 | Campaign AI | `cai_personality(key)` (model thread) | `cai_personality(key, personality_key)` | component `+0x10` key / `+0x30` runtime object from registry `*(ai_world+0xa70)`; persists |
 | Faction potential | `faction_potential(key)` | `faction_potential(key, value)` (-100..150) | FACTION `+0xee0` {base,bonus,roll} + `FUN_1419f5aa0`; persists |
-| Menu build number | `build_number()` -> {build, short, modified} | `build_number(build, short, modified)`; also auto-applied at injection from `<dll dir>\script_extender.cfg` (`build_number=`, `build_number_short=`, `build_modified=`) | GameCore = `*(*(DAT_143c53a28)+0x960)`; CA::Strings at `+0x90` (BuildNumber) / `+0xa0` (BuildNumberShort), byte `+0xea` IsBuildModified; composed once by FUN_1402e6740 ("v%d.%d.%d  Build %d.%d (modded)") - 0.17, live test pending |
+| Menu build number | `build_number()` -> {build, short, modified} | `build_number(build, short, modified)`; also auto-applied at injection from `<dll dir>\script_extender.cfg` (`build_number=`, `build_number_short=`, `build_modified=`) | GameCore = `*(*(DAT_143c53a28)+0x960)`; CA::Strings at `+0x90` (BuildNumber) / `+0xa0` (BuildNumberShort), byte `+0xea` IsBuildModified; composed once by FUN_1402e6740 ("v%d.%d.%d  Build %d.%d (modded)"). 0.18: cfg is read from the DLL folder or its parent, and the apply waits (background thread, up to 120 s) until GameCore holds the composed strings, so injecting seconds after launch is fine. Verified live through the mod manager. |
 | Diplomacy | (stock) | not wrapped yet: use `cm:modify_faction(a):apply_automatic_diplomatic_deal(situation, query_faction_b, "faction_key:"..b)` after `can_apply_automatic_diplomatic_deal`; situations e.g. `data_defined_situation_war_proposer_to_recipient`, `..._peace`, `..._create_alliance_no_conditions`, `..._vassalise_recipient_forced` | vanilla `3k_campaign_diplomacy_manager.lua:555+` |
 
 Raw natives (all `se_*` globals) are listed at the top of each `src/*.rs` file; treat them as
@@ -115,7 +115,7 @@ internal. Test/console scripts for every feature live in
 xp/assignment probes; 0.9 unit vtable match; 0.10 float numbers, disband via empty key,
 governor bypass; 0.11 assignment province; 0.12 flat xp, skill points, effect value, CAI
 personality, potential; 0.13 CAI apply owner fix, float effect value; 0.14 registry-based
-personality object; 0.15 registry self-check; **0.16 menu build number + cfg file (wrote into the wrong object); **0.17 correct GameCore pointer (current)****.
+personality object; 0.15 registry self-check; **0.16 menu build number + cfg file (wrote into the wrong object); 0.17 correct GameCore pointer; **0.18 cfg lookup in parent folder + deferred apply (current; verified through TKModManager, which builds from the workspace and stages `dll\<version>\`)**.
 
 ## 7. When the game updates
 

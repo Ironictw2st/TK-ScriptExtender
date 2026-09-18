@@ -133,13 +133,29 @@ pub unsafe fn apply(build: &str, short: &str, modified: Option<bool>) -> Result<
     Ok(msg)
 }
 
-/// `<dll dir>\script_extender.cfg`, one `key=value` per line (`#` comments):
-///   build_number=..., build_number_short=..., build_modified=0|1
+/// `script_extender.cfg` next to the DLL, else in the DLL's parent folder (mod-manager layout
+/// `dll\script_extender.cfg` + `dll\<version>\script_extender.dll`). One `key=value` per line
+/// (`#` comments): build_number=..., build_number_short=..., build_modified=0|1
+fn config_text() -> Option<(std::path::PathBuf, String)> {
+    let dir = crate::process::self_dir()?;
+    let mut candidates = vec![dir.join("script_extender.cfg")];
+    if let Some(parent) = dir.parent() {
+        candidates.push(parent.join("script_extender.cfg"));
+    }
+    for path in candidates {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return Some((path, text));
+        }
+    }
+    None
+}
+
+/// Called from the bootstrap thread. The manager injects seconds after launch, before the game
+/// has composed its build strings, so the apply is retried in a background thread until
+/// GameCore holds plausible text (then done once), giving up after two minutes.
 pub fn apply_config() {
-    let Some(dir) = crate::process::self_dir() else { return };
-    let path = dir.join("script_extender.cfg");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        log!("no config at {} (build number left alone)", path.display());
+    let Some((path, text)) = config_text() else {
+        log!("no script_extender.cfg next to the DLL or in its parent folder (build number left alone)");
         return;
     };
     let (mut build, mut short, mut modified) = (String::new(), String::new(), None);
@@ -162,10 +178,33 @@ pub fn apply_config() {
         log!("config at {} sets nothing", path.display());
         return;
     }
-    match unsafe { apply(&build, &short, modified) } {
-        Ok(m) => log!("config applied: {m}"),
-        Err(e) => log!("config not applied: {e}"),
-    }
+    log!("config at {}: build='{}' short='{}' modified={:?}; waiting for GameCore", path.display(), build, short, modified);
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut last_err = String::new();
+        loop {
+            let ready = unsafe { ENGINE.get().map(|e| view(e)) };
+            match ready {
+                Some(Ok(_)) => {
+                    // The game composes its strings during start-up; give it a moment more so
+                    // our text is written after, not before, that composition.
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    match unsafe { apply(&build, &short, modified) } {
+                        Ok(m) => log!("config applied: {m}"),
+                        Err(e) => log!("config not applied: {e}"),
+                    }
+                    return;
+                }
+                Some(Err(e)) => last_err = e,
+                None => last_err = "engine table missing".into(),
+            }
+            if std::time::Instant::now() >= deadline {
+                log!("config not applied: GameCore never became ready ({last_err})");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
 }
 
 unsafe extern "C" fn se_build_info_get(l: *mut LuaState) -> c_int {
