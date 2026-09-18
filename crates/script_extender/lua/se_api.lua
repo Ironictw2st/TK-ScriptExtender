@@ -1289,6 +1289,283 @@ function se.modify.attitude(a, b, level)
 	end)
 end
 
+----------------------------------------------------------------------------------------------
+-- auto-resolve: tunables, prediction, per-battle plan and the script handler (0.24)
+----------------------------------------------------------------------------------------------
+
+se.autoresolve = se.autoresolve or {}
+se._ar_vars = se._ar_vars or {}
+
+local function parse_kv(s)
+	local t = {}
+	for k, v in str(s):gmatch("([%w_]+)=([^;]*)") do
+		local n = tonumber(v)
+		if n ~= nil then t[k] = n else t[k] = v end
+	end
+	return t
+end
+
+local function local_faction()
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local ok, key = pcall(function() return cm:get_local_faction() end)
+	if not ok or type(key) ~= "string" then return nil, "no local faction" end
+	local f, e1 = se.faction(key)
+	if not f then return nil, e1 end
+	return f, key
+end
+
+-- se.query.autoresolver_variable(key) -> number | nil, message   (keys "autoresolver_*")
+function se.query.autoresolver_variable(key)
+	local okn, err = need("se_ar_variable_get")
+	if not okn then return nil, err end
+	local f, e1 = local_faction()
+	if not f then return nil, e1 end
+	local v, msg = se_ar_variable_get(f, str(key))
+	if v == nil then return nil, str(msg) end
+	return num(v)
+end
+
+-- se.query.autoresolver_variables() -> { key = value, ... } for every autoresolver_* key
+function se.query.autoresolver_variables()
+	local okn, err = need("se_ar_variable_list")
+	if not okn then return nil, err end
+	local f, e1 = local_faction()
+	if not f then return nil, e1 end
+	local s, msg = se_ar_variable_list(f)
+	if s == nil then return nil, str(msg) end
+	return parse_kv(s)
+end
+
+local function ar_vars_listener()
+	if se._ar_vars_listener then return end
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return end
+	se._ar_vars_listener = true
+	-- The engine rebuilds the variable array when its per-round overrides change; put the
+	-- script's values back at the start of every turn of the local player.
+	core:add_listener("se_ar_vars", "FactionTurnStart", true, function(context)
+		local okf, fkey = pcall(function() return context:faction():name() end)
+		local cm = cm_()
+		if not okf or not cm or fkey ~= cm:get_local_faction() then return end
+		local f = se.faction(fkey)
+		if not f then return end
+		for k, v in pairs(se._ar_vars) do se_ar_variable_set(f, k, v) end
+	end, true)
+end
+
+-- se.modify.autoresolver_variable(key, value): retune one of the simulator's constants for this
+-- session (not saved: call it again after a load). Only "autoresolver_*" keys.
+function se.modify.autoresolver_variable(key, value)
+	local okn, err = need("se_ar_variable_set")
+	if not okn then return false, err end
+	if type(key) ~= "string" or not num(value) then return false, "usage: autoresolver_variable(key, number)" end
+	return on_model("autoresolver_variable(" .. key .. ", " .. str(value) .. ")", function()
+		local f, e1 = local_faction()
+		if not f then return false, e1 end
+		local ok, msg = se_ar_variable_set(f, key, num(value))
+		if ok then se._ar_vars[key] = num(value); ar_vars_listener() end
+		return ok, msg
+	end)
+end
+
+-- se.modify.autoresolver_variables_reset(): every variable back to what the engine had.
+function se.modify.autoresolver_variables_reset()
+	local okn, err = need("se_ar_variables_reset")
+	if not okn then return false, err end
+	return on_model("autoresolver_variables_reset()", function()
+		local f, e1 = local_faction()
+		if not f then return false, e1 end
+		se._ar_vars = {}
+		return se_ar_variables_reset(f)
+	end)
+end
+
+-- se.query.autoresolve_prediction() -> { available, attacker_prediction, attacker_casualties,
+--   defender_prediction, defender_casualties, night, result_index, results } | nil, message
+-- The engine's own prediction for the pending battle (what the pre-battle panel shows).
+function se.query.autoresolve_prediction()
+	local okn, err = need("se_ar_prediction")
+	if not okn then return nil, err end
+	local f, e1 = local_faction()
+	if not f then return nil, e1 end
+	local ok, s = se_ar_prediction(f)
+	if not ok then return nil, str(s) end
+	local t = parse_kv(s)
+	t.available = t.available == 1
+	return t
+end
+
+local function try(obj, method, arg)
+	if obj == nil then return nil end
+	local ok, v = pcall(function()
+		if arg ~= nil then return obj[method](obj, arg) end
+		return obj[method](obj)
+	end)
+	if ok then return v end
+	return nil
+end
+
+local function side_of(general, secondary, local_key)
+	local side = { forces = {}, characters = {} }
+	local function add(ch)
+		if ch == nil or is_null(ch) then return end
+		local fac = try(ch, "faction")
+		local row = { cqi = num(try(ch, "cqi") or try(ch, "command_queue_index")), faction = str(try(fac, "name")),
+			template = str(try(ch, "generation_template_key")), rank = num(try(ch, "rank")) }
+		side.characters[#side.characters + 1] = row
+		if side.faction == nil then side.faction = row.faction; side.is_human = try(fac, "is_human") == true end
+		if row.faction == local_key then side.is_local_player = true end
+		if try(ch, "has_military_force") == true then
+			local mf = try(ch, "military_force")
+			local units = try(mf, "unit_list")
+			side.forces[#side.forces + 1] = { cqi = num(try(mf, "command_queue_index")), general_cqi = row.cqi, units = num(try(units, "num_items")) }
+		end
+	end
+	add(general)
+	if secondary ~= nil then
+		for i = 0, (num(try(secondary, "num_items")) or 0) - 1 do add(try(secondary, "item_at", i)) end
+	end
+	return side
+end
+
+-- se.query.pending_battle() -> context table | nil, message
+--   { active, battle_type, is_siege, is_ambush, is_night, human_involved,
+--     attacker = { faction, is_human, is_local_player, strength, forces = {{cqi, general_cqi, units}},
+--                  characters = {{cqi, faction, template, rank}} }, defender = { ... },
+--     prediction = se.query.autoresolve_prediction() }
+function se.query.pending_battle()
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local ok, pb = pcall(function() return cm:query_model():pending_battle() end)
+	if not ok or pb == nil or is_null(pb) then return nil, "no pending battle interface" end
+	local okl, local_key = pcall(function() return cm:get_local_faction() end)
+	local ctx = { active = try(pb, "is_active") == true, battle_type = str(try(pb, "battle_type")),
+		is_siege = try(pb, "seige_battle") == true, is_ambush = try(pb, "ambush_battle") == true,
+		is_night = try(pb, "night_battle") == true, human_involved = try(pb, "human_involved") == true }
+	ctx.attacker = side_of(try(pb, "has_attacker") == true and try(pb, "attacker") or nil, try(pb, "secondary_attackers"), okl and local_key or nil)
+	ctx.defender = side_of(try(pb, "has_defender") == true and try(pb, "defender") or nil, try(pb, "secondary_defenders"), okl and local_key or nil)
+	ctx.attacker.strength = num(try(pb, "attacker_strength"))
+	ctx.defender.strength = num(try(pb, "defender_strength"))
+	ctx.local_player_involved = ctx.attacker.is_local_player == true or ctx.defender.is_local_player == true
+	ctx.prediction = se.query.autoresolve_prediction()
+	return ctx
+end
+
+local function clamp(v, lo, hi, default)
+	v = num(v)
+	if v == nil then return default end
+	if v < lo then return lo elseif v > hi then return hi end
+	return v
+end
+
+local FATES = { kill = true, wound = true, spare = true, flee = true }
+
+-- plan -> "k=v;..." for the DLL. Values are clamped here (bias 0.1-10, scales and chances 0-1).
+local function encode_plan(plan, ctx)
+	if type(plan) ~= "table" then return nil, "plan must be a table" end
+	local parts = { "v=1" }
+	local function put(k, v) if v ~= nil then parts[#parts + 1] = k .. "=" .. str(v) end end
+	local af = ctx and ctx.attacker and ctx.attacker.forces[1]
+	local df = ctx and ctx.defender and ctx.defender.forces[1]
+	put("att_force", af and af.cqi); put("def_force", df and df.cqi)
+	if type(plan.bias) == "table" then
+		put("bias_att", clamp(plan.bias.attacker, 0.1, 10, nil)); put("bias_def", clamp(plan.bias.defender, 0.1, 10, nil))
+	end
+	if plan.winner ~= nil then
+		if plan.winner ~= "attacker" and plan.winner ~= "defender" then return nil, "plan.winner must be 'attacker', 'defender' or nil" end
+		put("winner", plan.winner)
+	end
+	if type(plan.casualties) == "table" then
+		for side, tag in pairs({ attacker = "att", defender = "def" }) do
+			local c = plan.casualties[side]
+			if type(c) == "table" then
+				put("cas_" .. tag .. "_scale", clamp(c.scale, 0, 10, nil)); put("cas_" .. tag .. "_max", clamp(c.max, 0, 1, nil))
+			end
+		end
+	end
+	if type(plan.duels) == "table" then
+		put("duel_max", clamp(plan.duels.max, 0, 16, nil))
+		if plan.duels.default ~= nil then
+			if plan.duels.default ~= "vanilla" and plan.duels.default ~= "none" then return nil, "plan.duels.default must be 'vanilla' or 'none'" end
+			put("duel_default", plan.duels.default)
+		end
+		local rows = {}
+		for i, d in ipairs(plan.duels.pairs or {}) do
+			if type(d) ~= "table" or not num(d.a) or not num(d.b) then return nil, "plan.duels.pairs[" .. i .. "] needs character cqis a and b" end
+			if d.fate ~= nil and not FATES[d.fate] then return nil, "plan.duels.pairs[" .. i .. "].fate must be kill, wound, spare or flee" end
+			rows[#rows + 1] = table.concat({ str(num(d.a)), str(num(d.b)), d.happen == false and "0" or "1",
+				str(clamp(d.win_chance, 0, 1, -1)), str(num(d.winner) or -1), d.fate or "-" }, ",")
+		end
+		if #rows > 0 then put("duels", table.concat(rows, "|")) end
+	end
+	return table.concat(parts, ";")
+end
+
+-- se.modify.autoresolve_plan(plan [, ctx]): store the plan for the current pending battle.
+-- (0.24 stores and validates it; the engine hooks that consume it arrive with 0.25 - 0.27.)
+function se.modify.autoresolve_plan(plan, ctx)
+	local okn, err = need("se_ar_plan_set")
+	if not okn then return false, err end
+	local cm, e0 = cm_()
+	if not cm then return false, e0 end
+	local ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
+	if ok_mp and mp == true then return false, "refused: multiplayer campaign" end
+	ctx = ctx or se.query.pending_battle()
+	if not ctx or not ctx.local_player_involved then return false, "refused: no pending battle with the local player" end
+	local spec, e1 = encode_plan(plan, ctx)
+	if not spec then return false, e1 end
+	se._ar_plan = plan
+	return se_ar_plan_set(spec)
+end
+
+function se.modify.autoresolve_plan_clear()
+	local okn, err = need("se_ar_plan_clear")
+	if not okn then return false, err end
+	se._ar_plan = nil
+	return se_ar_plan_clear()
+end
+
+-- se.query.autoresolve_plan() -> plan table (as given), encoded string
+function se.query.autoresolve_plan()
+	local s = se.available("se_ar_plan_get") and se_ar_plan_get() or ""
+	return se._ar_plan, str(s)
+end
+
+-- se.autoresolve.set_handler(function(ctx) return plan_or_nil end)
+--   Called on every PendingBattle that involves the local player (single-player only), with
+--   the table of se.query.pending_battle(). Return a plan table to steer that auto-resolve, or
+--   nil for vanilla behaviour. The plan is dropped again on BattleCompleted.
+function se.autoresolve.set_handler(fn)
+	if type(fn) ~= "function" then return false, "handler must be a function" end
+	se.autoresolve.handler = fn
+	if se._ar_listener then return true, "handler replaced" end
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	se._ar_listener = true
+	core:add_listener("se_ar_pending", "PendingBattle", true, function()
+		local h = se.autoresolve.handler
+		if type(h) ~= "function" then return end
+		pcall(se.modify.autoresolve_plan_clear)
+		local ctx = se.query.pending_battle()
+		if not ctx or not ctx.local_player_involved then return end
+		local okh, plan = pcall(h, ctx)
+		if not okh then log("autoresolve handler error: " .. str(plan)) return end
+		if plan == nil then log("autoresolve handler: vanilla (nil plan)") return end
+		local ok, msg = se.modify.autoresolve_plan(plan, ctx)
+		log("autoresolve plan -> " .. str(ok) .. " : " .. str(msg))
+	end, true)
+	core:add_listener("se_ar_completed", "BattleCompleted", true, function()
+		pcall(se.modify.autoresolve_plan_clear)
+	end, true)
+	return true, "handler installed"
+end
+
+function se.autoresolve.clear_handler()
+	se.autoresolve.handler = nil
+	return se.modify.autoresolve_plan_clear()
+end
+
 -- Pretty-print helper for console use: se.dump(se.query.retinue(1))
 function se.dump(v, indent)
 	indent = indent or ""

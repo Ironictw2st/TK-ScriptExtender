@@ -26,6 +26,7 @@ mod xp;
 mod build;
 mod buildings;
 mod alliances;
+mod autoresolve;
 mod bundles;
 mod diplomacy;
 

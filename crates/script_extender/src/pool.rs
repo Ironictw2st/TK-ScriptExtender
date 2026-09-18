@@ -55,6 +55,7 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::buildings::register(l);
     crate::alliances::register(l);
     crate::bundles::register(l);
+    crate::autoresolve::register(l);
     crate::diplomacy::register(l);
 }
 
