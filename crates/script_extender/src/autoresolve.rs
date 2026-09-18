@@ -467,9 +467,15 @@ unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
             Ok(v) => *v,
             Err(e) => { report.push(format!("side {i} skipped: {e}")); lost_after[i] = rd(sum + 0x20); continue; }
         };
+        if !swap && plans[i].scale == 1.0 && plans[i].max >= 1.0 {
+            report.push(format!("side {i}: untouched ({n} unit records)"));
+            lost_after[i] = rd(sum + 0x20);
+            continue;
+        }
+        let mut detail = Vec::new();
         // forced winner: this side takes the other side's loss level
         let level = if swap && losses[i] > 0.0001 { losses[1 - i] / losses[i] } else { 1.0 };
-        let (mut men_before, mut men_after, mut hp_b, mut hp_a) = (0u32, 0u32, 0u64, 0u64);
+        let (mut men_before, mut men_after, mut men_after_old, mut hp_b, mut hp_a) = (0u32, 0u32, 0u32, 0u64, 0u64);
         for u in 0..n {
             let r = data + u * UNIT_STRIDE;
             let (start, after, hp_start, hp_after) = (rd(r + 0x54), rd(r + 0x58), rd(r + 0x68), rd(r + 0x6c));
@@ -484,12 +490,19 @@ unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
                 core::ptr::write_unaligned((r + 0x58) as *mut u32, new_men.min(start));
             }
             men_before += start; men_after += rd(r + 0x58); hp_b += hp_start as u64; hp_a += rd(r + 0x6c) as u64;
-            let _ = after;
+            men_after_old += after;
+            detail.push(format!("{start}:{after}>{}", rd(r + 0x58)));
         }
         let old_lost = rd(sum + 0x20);
-        core::ptr::write_unaligned((sum + 0x18) as *mut u64, men_after as u64);
-        core::ptr::write_unaligned((sum + 0x20) as *mut u64, men_before.saturating_sub(men_after) as u64);
-        lost_after[i] = men_before.saturating_sub(men_after);
+        let (sum_before, sum_after) = (rd(sum + 0x10), rd(sum + 0x18));
+        let new_after = (sum_after as i64 + men_after as i64 - men_after_old as i64).clamp(0, sum_before as i64) as u32;
+        core::ptr::write_unaligned((sum + 0x18) as *mut u64, new_after as u64);
+        core::ptr::write_unaligned((sum + 0x20) as *mut u64, sum_before.saturating_sub(new_after) as u64);
+        lost_after[i] = sum_before.saturating_sub(new_after);
+        if men_before != sum_before {
+            report.push(format!("side {i}: unit records cover {men_before} of {sum_before} men"));
+        }
+        log!("  side {i} units (start:after>new): {}", detail.join(" "));
         // prediction block casualties % and the strength-after float follow the hit point loss
         let block = res + if i == 0 { 0x64 } else { 0x7c };
         let new_frac = if hp_b == 0 { 0.0 } else { 1.0 - hp_a as f32 / hp_b as f32 };
