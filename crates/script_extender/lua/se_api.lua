@@ -949,13 +949,17 @@ function se.query.region_slots(region_key)
 	return out
 end
 
--- se.query.building_candidates(region_key, slot_index) -> { level_key, ... } the engine allows now
-function se.query.building_candidates(region_key, slot_index)
+-- se.query.building_candidates(region_key, slot_index, opts) -> { level_key, ... }
+--   Default lists every level the slot's current chain set offers, blocked ones included.
+--   opts.only_valid = true: only what the UI would let you build right now (empty as soon as
+--   the slot has a blocking reason). opts.all_chains = true: every chain the slot can hold.
+function se.query.building_candidates(region_key, slot_index, opts)
+	opts = opts or {}
 	local okn, err = need("se_slot_candidates")
 	if not okn then return nil, err end
 	local e, e2 = slot_of(region_key, slot_index)
 	if not e then return nil, e2 end
-	local s, e3 = se_slot_candidates(e.slot)
+	local s, e3 = se_slot_candidates(e.slot, opts.only_valid == true, opts.all_chains == true)
 	if s == nil or s == "" then return {}, e3 end
 	local out = {}
 	for k in str(s):gmatch("[^,]+") do out[#out + 1] = k end
@@ -996,9 +1000,14 @@ function se.modify.building_destroy(region_key, slot_index)
 end
 
 -- se.modify.building_construct(region_key, slot_index, level_key, opts)
---   Issues the engine's construct command for level_key (upgrade / conversion = the target
---   level key). opts.complete = true also pays to complete next turn; opts.free = true refunds
---   whatever the treasury lost (construction and completion costs) to the owning faction.
+--   Starts construction of level_key in the slot (upgrade / conversion = the target level key).
+--   opts.force (default true): ignore the engine's blocking reasons (cost, requirements, siege);
+--     force = false behaves like the UI button.
+--   opts.any_chain (default true): when the key is not an upgrade of the current building, look
+--     it up among every chain the slot can hold.
+--   opts.free = true: no cost (anything the treasury still lost is refunded).
+--   opts.turns = n: construction time in turns; opts.complete = true is turns = 1.
+--   opts.pay_to_complete = true: also issue the engine's pay-to-complete-next-turn command.
 function se.modify.building_construct(region_key, slot_index, level_key, opts)
 	opts = opts or {}
 	local okn, err = need("se_slot_construct")
@@ -1013,10 +1022,15 @@ function se.modify.building_construct(region_key, slot_index, level_key, opts)
 		if not okf or is_null(f) then return false, "slot has no owning faction" end
 		local fkey = str(f:name())
 		local before = num(f:treasury()) or 0
-		local ok, msg = se_slot_construct(e.slot, f, level_key)
+		local force = opts.force ~= false
+		local turns = num(opts.turns) or (opts.complete and 1) or 0
+		local ok, msg = se_slot_construct(e.slot, f, level_key, force, false, opts.free == true, turns)
+		if not ok and opts.any_chain ~= false then
+			ok, msg = se_slot_construct(e.slot, f, level_key, force, true, opts.free == true, turns)
+		end
 		if not ok then return false, msg end
 		local report = { str(msg) }
-		if opts.complete then
+		if opts.pay_to_complete then
 			local ok2, msg2 = se_slot_pay_to_complete(e.slot)
 			report[#report + 1] = "pay_to_complete -> " .. str(ok2) .. " : " .. str(msg2)
 		end
@@ -1106,6 +1120,64 @@ function se.query.effect_bundle(bundle_key, faction_key)
 	local count, dump = se_effect_bundle_info(f, bundle_key)
 	if count == nil then return nil, str(dump) end
 	return { count = num(count), dump = str(dump) }
+end
+
+-- effects = { {effect = "effect_key", scope = "campaign_effect_scope_key", value = n}, ... }
+local function effect_spec(effects)
+	if type(effects) ~= "table" or #effects == 0 then return nil, "effects must be a non-empty list of {effect=, scope=, value=}" end
+	local parts = {}
+	for i, row in ipairs(effects) do
+		if type(row) ~= "table" or type(row.effect) ~= "string" or type(row.scope) ~= "string" or not num(row.value) then
+			return nil, "effects[" .. i .. "] needs effect (string), scope (string) and value (number)"
+		end
+		parts[#parts + 1] = row.effect .. "|" .. row.scope .. "|" .. string.format("%.4f", num(row.value))
+	end
+	return table.concat(parts, ";")
+end
+
+local function bundle_call(tag, native, faction_key, f)
+	local okn, err = need(native)
+	if not okn then return false, err end
+	local cm, e0 = cm_()
+	if not cm then return false, e0 end
+	faction_key = faction_key or cm:get_local_faction()
+	return on_model(tag, function()
+		local fac, e1 = se.faction(faction_key)
+		if not fac then return false, e1 end
+		return f(fac)
+	end)
+end
+
+-- se.modify.effect_bundle_define(bundle_key, effects [, faction_key])
+--   Replaces the effect list of an EXISTING effect_bundles record for this game session. Every
+--   later stock apply_effect_bundle(bundle_key, ...) on any holder (faction, character, region,
+--   force, ...) carries the new effects; bundles applied earlier keep what they had until they
+--   are removed and applied again. Not saved: define again after every load (first tick) and
+--   re-apply. faction_key only provides the model.
+function se.modify.effect_bundle_define(bundle_key, effects, faction_key)
+	local spec, e0 = effect_spec(effects)
+	if not spec then return false, e0 end
+	return bundle_call("effect_bundle_define(" .. str(bundle_key) .. ")", "se_effect_bundle_define", faction_key, function(fac)
+		return se_effect_bundle_define(fac, bundle_key, spec)
+	end)
+end
+
+-- se.modify.effect_bundle_restore(bundle_key [, faction_key]) : stock effect list back.
+function se.modify.effect_bundle_restore(bundle_key, faction_key)
+	return bundle_call("effect_bundle_restore(" .. str(bundle_key) .. ")", "se_effect_bundle_restore", faction_key, function(fac)
+		return se_effect_bundle_restore(fac, bundle_key)
+	end)
+end
+
+-- se.modify.effect_bundle_apply_custom(faction_key, bundle_key, effects [, turns])
+--   Applies bundle_key to the faction with its own effect list (the engine's per-instance custom
+--   list); the DB record and other holders of the bundle are untouched. turns 0 = permanent.
+function se.modify.effect_bundle_apply_custom(faction_key, bundle_key, effects, turns)
+	local spec, e0 = effect_spec(effects)
+	if not spec then return false, e0 end
+	return bundle_call("effect_bundle_apply_custom(" .. str(faction_key) .. ", " .. str(bundle_key) .. ")", "se_effect_bundle_apply_custom", faction_key, function(fac)
+		return se_effect_bundle_apply_custom(fac, bundle_key, num(turns) or 0, spec)
+	end)
 end
 
 ----------------------------------------------------------------------------------------------

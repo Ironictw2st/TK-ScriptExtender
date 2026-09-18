@@ -14,9 +14,12 @@
 //!
 //! Natives (q_slot = QUERY_SLOT script object):
 //!   se_slot_info(q_slot) -> has_building, level_key, health, can_damage, info
-//!   se_slot_candidates(q_slot) -> "key,key,..." (levels the engine would let you build here)
+//!   se_slot_candidates(q_slot, only_valid, all_chains) -> "key,key,..."
 //!   se_slot_damage(q_slot, percent) / se_slot_repair(q_slot, free) / se_slot_destroy(q_slot)
-//!   se_slot_construct(q_slot, q_faction, level_key) / se_slot_pay_to_complete(q_slot)
+//!   se_slot_construct(q_slot, q_faction, level_key, force, all_chains, free, turns)
+//!   se_slot_pay_to_complete(q_slot)
+//!   List entry (0x30): +0 record, +8 manager, +0x10 cost, +0x14 turns, +0x18 reason bits
+//!   (0x2000/0x4000 = cannot afford), +0x1c is-upgrade, +0x20 f32 1.0, +0x24 secondary cost.
 
 use crate::addrs::Table;
 use crate::log;
@@ -200,31 +203,51 @@ struct Vec3 {
     data: *mut c_void,
 }
 
-type VfCandidates = unsafe extern "C" fn(*mut c_void, *mut Vec3, u32, u32, u32, u32, u32, u32);
+// arg6 (superchain filter) is a pointer-sized argument, the others are bytes.
+type VfCandidates = unsafe extern "C" fn(*mut c_void, *mut Vec3, u32, u32, u32, usize, u32, u32);
 
-unsafe fn candidates(e: &Engine, s: &Slot) -> Vec<String> {
+/// Run `f` over the manager's constructible-level entries (0x30 bytes each, entry+0 = record).
+/// M vfunc +0x130 -> +0x128 (FUN_141b207b0): arg3 only_valid (1 = return nothing as soon as the
+/// slot has a blocking reason; 0 = list everything), arg5 all_chains (0 = upgrades/conversions of
+/// the current building, 1 = every chain the slot can hold), arg6 superchain filter, arg8 ignore
+/// the siege check. The construct virtual (+0x10, FUN_141b0d980) takes one of these entries.
+unsafe fn with_candidates<R>(e: &Engine, s: &Slot, only_valid: bool, all_chains: bool, f: impl FnOnce(&[(usize, usize, String)]) -> R) -> R {
     let mut v = Vec3 { cap: 0, count: 0, data: core::ptr::null_mut() };
-    let f: VfCandidates = core::mem::transmute(vf(s.manager, 0x130));
-    f(s.manager as *mut c_void, &mut v, 1, 1, 0, 0, 0, 0);
-    let mut out = Vec::new();
-    for i in 0..(v.count as usize).min(256) {
+    let list: VfCandidates = core::mem::transmute(vf(s.manager, 0x130));
+    list(s.manager as *mut c_void, &mut v, only_valid as u32, 1, all_chains as u32, 0, 0, 0);
+    let mut entries = Vec::new();
+    for i in 0..(v.count as usize).min(512) {
         let entry = v.data as usize + i * 0x30;
         let rec = rq(entry);
         let key = record_key(rec);
-        out.push(if key.is_empty() { format!("{:#x}", rec) } else { key });
+        entries.push((entry, rec, if key.is_empty() { format!("{:#x}", rec) } else { key }));
     }
+    let r = f(&entries);
     if !v.data.is_null() {
         (e.free)(v.data);
     }
-    out
+    r
+}
+
+unsafe fn candidates(e: &Engine, s: &Slot, only_valid: bool, all_chains: bool) -> Vec<String> {
+    with_candidates(e, s, only_valid, all_chains, |entries| {
+        for (entry, _, key) in entries.iter().take(12) {
+            let words: Vec<String> = (0..6).map(|k| format!("{:016x}", rq(*entry + k * 8))).collect();
+            log!("  candidate {key}: {}", words.join(" "));
+        }
+        entries.iter().map(|(_, _, k)| k.clone()).collect()
+    })
 }
 
 unsafe extern "C" fn se_slot_candidates(l: *mut LuaState) -> c_int {
     let result: Result<String, String> = (|| {
         let e = ENGINE.get().ok_or("engine table missing")?;
         let s = slot_from_arg(e, l, 1)?;
-        let list = candidates(e, &s);
-        log!("se_slot_candidates: {} -> {} candidates: {}", describe(e, &s), list.len(), list.join(", "));
+        let api = lua::api().ok_or("lua api missing")?;
+        let only_valid = (api.toboolean)(l, 2) != 0;
+        let all_chains = (api.toboolean)(l, 3) != 0;
+        let list = candidates(e, &s, only_valid, all_chains);
+        log!("se_slot_candidates(only_valid={only_valid}, all_chains={all_chains}): {} -> {} candidates: {}", describe(e, &s), list.len(), list.join(", "));
         Ok(list.join(","))
     })();
     match result {
@@ -312,13 +335,47 @@ unsafe extern "C" fn se_slot_construct(l: *mut LuaState) -> c_int {
         if table.is_null() { return Err("building_levels table missing".into()); }
         let rec = with_string(e, &key, |sp| (e.record_base)(table, sp)) as usize;
         if rec == 0 || !readable(rec, 0x20) { return Err(format!("no building_levels record named '{key}'")); }
-        let list = candidates(e, &s);
-        if !list.iter().any(|k| k == &key) {
-            return Err(format!("'{key}' is not constructible in this slot now; candidates: {}", list.join(", ")));
-        }
+        let api = lua::api().ok_or("lua api missing")?;
+        let force = (api.toboolean)(l, 4) != 0;
+        let all_chains = (api.toboolean)(l, 5) != 0;
+        let free = (api.toboolean)(l, 6) != 0;
+        let turns = (api.tointeger)(l, 7) as i64;
+        if turns > 100 { return Err(format!("turns {turns} is out of range")); }
+        // FUN_141b0d980 stores the new construction item at M+0x10 without looking at the old one.
+        if rq(s.manager + 0x10) != 0 { return Err(format!("this slot already has a construction in progress (manager+0x10 = {:#x}); cancel it first", rq(s.manager + 0x10))); }
         let before = describe(e, &s);
-        (e.construct)(s.manager as *mut c_void, rec as *mut c_void);
-        Ok(format!("{before}: construction of '{key}' issued (record {:#x})", rec))
+        // force = list with only_valid off (blocked options included) and hand the entry to the
+        // construct virtual directly, which is what CCQ_REGION_BUILDING_CONSTRUCT does after its
+        // own (only_valid) lookup.
+        with_candidates(e, &s, !force, all_chains, |entries| {
+            match entries.iter().find(|(_, r, _)| *r == rec) {
+                Some((entry, _, _)) => {
+                    let words: Vec<String> = (0..6).map(|k| format!("{:016x}", rq(*entry + k * 8))).collect();
+                    log!("se_slot_construct: entry {}", words.join(" "));
+                    // Work on a copy: +0x10 cost and +0x24/+0x28 secondary cost are what
+                    // FUN_141b106a0 charges, +0x14 is the construction time in turns.
+                    let mut item = [0u8; 0x30];
+                    core::ptr::copy_nonoverlapping(*entry as *const u8, item.as_mut_ptr(), 0x30);
+                    let ip = item.as_mut_ptr() as usize;
+                    if free {
+                        core::ptr::write_unaligned((ip + 0x10) as *mut u32, 0);
+                        core::ptr::write_unaligned((ip + 0x24) as *mut u32, 0);
+                        core::ptr::write_unaligned((ip + 0x28) as *mut u32, 0);
+                    }
+                    if turns > 0 {
+                        core::ptr::write_unaligned((ip + 0x14) as *mut u32, turns as u32);
+                    }
+                    let construct: unsafe extern "C" fn(*mut c_void, *mut c_void) = core::mem::transmute(vf(s.manager, 0x10));
+                    construct(s.manager as *mut c_void, ip as *mut c_void);
+                    Ok(format!("{before}: construction of '{key}' issued (force={force}, all_chains={all_chains}, free={free}, cost {} -> {}, turns {} -> {}, reasons {:#x})",
+                        rd(*entry + 0x10), rd(ip + 0x10), rd(*entry + 0x14), rd(ip + 0x14), rd(*entry + 0x18)))
+                }
+                None => {
+                    let keys: Vec<String> = entries.iter().map(|(_, _, k)| k.clone()).collect();
+                    Err(format!("'{key}' is not in this slot's list (force={force}, all_chains={all_chains}); {} candidates: {}", keys.len(), keys.join(", ")))
+                }
+            }
+        })
     })();
     bool_result(l, r, "se_slot_construct")
 }
