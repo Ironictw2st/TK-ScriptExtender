@@ -100,6 +100,14 @@ unsafe fn ca_string(sp: usize) -> String {
     if !readable(sp, 16) {
         return String::new();
     }
+    // Short strings live inline: the qword at +8 has its top nibble == 8 and the characters
+    // start at +0 (seen on building_levels key "3k_city_3").
+    if rq(sp + 8) >> 60 == 8 {
+        let raw = core::slice::from_raw_parts(sp as *const u8, 15);
+        let n = raw.iter().position(|&c| c == 0).unwrap_or(15);
+        let ok = n > 0 && raw[..n].iter().all(|c| c.is_ascii_graphic());
+        return if ok { String::from_utf8_lossy(&raw[..n]).into_owned() } else { String::new() };
+    }
     let len = rd(sp) as usize;
     let ptr = rq(sp + 8);
     if len == 0 || len > 128 || !readable(ptr, len) {

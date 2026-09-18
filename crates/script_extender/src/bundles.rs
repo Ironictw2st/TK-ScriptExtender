@@ -105,6 +105,14 @@ unsafe fn ca_string(sp: usize) -> String {
     if !readable(sp, 16) {
         return String::new();
     }
+    // Short strings live inline: the qword at +8 has its top nibble == 8 and the characters
+    // start at +0 (seen on building_levels key "3k_city_3").
+    if rq(sp + 8) >> 60 == 8 {
+        let raw = core::slice::from_raw_parts(sp as *const u8, 15);
+        let n = raw.iter().position(|&c| c == 0).unwrap_or(15);
+        let ok = n > 0 && raw[..n].iter().all(|c| c.is_ascii_graphic());
+        return if ok { String::from_utf8_lossy(&raw[..n]).into_owned() } else { String::new() };
+    }
     let len = rd(sp) as usize;
     let ptr = rq(sp + 8);
     if len == 0 || len > 128 || !readable(ptr, len) {
@@ -224,6 +232,37 @@ unsafe fn build_entries(e: &Engine, list: &[(usize, usize, f32)]) -> Result<usiz
     Ok(data)
 }
 
+/// FUN_141902ea0 (what MODIFY_FACTION:apply_effect_bundle calls) does not take the FACTION base
+/// the query interfaces hand out but its effect-holder base: the routine resolves the world
+/// through a handle at +0x58, which is FACTION+0x288, so holder = FACTION + 0x230 and the bundle
+/// instance list is holder+0x1c0 (0.23.0 passed FACTION itself and the copy constructor wrote
+/// into .rdata). The list is checked before anything is handed to the engine.
+const OFF_FACTION_EFFECT_HOLDER: usize = 0x230;
+const OFF_HOLDER_BUNDLES: usize = 0x1c0;
+
+unsafe fn faction_bundle_holder(faction: usize) -> Result<usize, String> {
+    let (base, size) = crate::process::main_module();
+    let holder = faction + OFF_FACTION_EFFECT_HOLDER;
+    let vt = rq(holder);
+    let vt_ok = vt >= base && vt < base + size;
+    let list = holder + OFF_HOLDER_BUNDLES;
+    let (cap, count, data) = (rd(list) as usize, rd(list + 4) as usize, rq(list + 8));
+    if cap > 4096 || count > cap || (cap != 0 && !readable(data, cap * 0x38)) || (data >= base && data < base + size) {
+        return Err(format!("bundle list at holder+{:#x} does not look like a vector (cap {cap}, count {count}, data {:#x})", OFF_HOLDER_BUNDLES, data));
+    }
+    for i in 0..count {
+        let rec = rq(data + i * 0x38);
+        if record_key(rec).is_empty() {
+            return Err(format!("bundle instance {i} of {count} has no readable record key (record {:#x})", rec));
+        }
+    }
+    // An empty list proves nothing about the offset; then at least a vtable has to be there.
+    if count == 0 && !vt_ok {
+        return Err(format!("empty bundle list and no vtable at faction+{:#x} ({:#x}); refusing", OFF_FACTION_EFFECT_HOLDER, vt));
+    }
+    Ok(holder)
+}
+
 unsafe fn bool_result(l: *mut LuaState, r: Result<String, String>, who: &str) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     match r {
@@ -287,6 +326,8 @@ unsafe extern "C" fn se_effect_bundle_apply_custom(l: *mut LuaState) -> c_int {
         if key.is_empty() { return Err("bundle key is empty".into()); }
         if !(0..=10000).contains(&turns) { return Err(format!("turns {turns} is out of range (0 = permanent)")); }
         let (faction, db) = db_of(e, l, 1)?;
+        let holder = faction_bundle_holder(faction)?;
+        let before = rd(holder + OFF_HOLDER_BUNDLES + 4);
         let rec = bundle_record(e, l, 1, &key)?;
         let list = parse_spec(e, db, &spec)?;
         let mut w = [0u64; 8];
@@ -302,10 +343,11 @@ unsafe extern "C" fn se_effect_bundle_apply_custom(l: *mut LuaState) -> c_int {
         core::ptr::write_unaligned((wp + 0x30) as *mut usize, data);
         (e.instance_rebuild)(wp as *mut c_void, 0);
         let active = rd(wp + 0x14);
-        (e.faction_apply)(faction as *mut c_void, wp as *mut c_void);
+        (e.faction_apply)(holder as *mut c_void, wp as *mut c_void);
+        let after = rd(holder + OFF_HOLDER_BUNDLES + 4);
         (e.custom_dtor)((wp + 0x28) as *mut c_void);
         (e.effects_dtor)((wp + 0x10) as *mut c_void);
-        Ok(format!("'{key}' applied to faction {:#x} for {turns} turns with {} custom effects ({active} active after rebuild)", faction, list.len()))
+        Ok(format!("'{key}' applied to faction {:#x} for {turns} turns with {} custom effects ({active} active after rebuild; faction bundles {before} -> {after})", faction, list.len()))
     })();
     bool_result(l, r, "se_effect_bundle_apply_custom")
 }
