@@ -4,7 +4,7 @@ members = ["crates/script_extender", "crates/injector", "crates/inject_core"]
 
 [workspace.package]
 edition = "2021"
-version = "0.26.1"
+version = "0.26.2"
 publish = false
 
 # Release profile: small stripped DLL, no unwinding across the FFI boundary.

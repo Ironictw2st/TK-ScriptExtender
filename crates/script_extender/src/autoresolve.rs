@@ -335,7 +335,7 @@ unsafe extern "C" fn se_ar_plan_clear(l: *mut LuaState) -> c_int {
 
 type ComputeResults = unsafe extern "C" fn(*mut c_void, u8);
 static COMPUTE_HOOK: OnceLock<GenericDetour<ComputeResults>> = OnceLock::new();
-static DUMPS_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(6);
+static DUMPS_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(12);
 
 unsafe fn hex_words(p: usize, bytes: usize) -> String {
     (0..bytes / 8).map(|k| format!("{:016x}", rq(p + k * 8))).collect::<Vec<_>>().join(" ")
@@ -344,14 +344,18 @@ unsafe fn hex_words(p: usize, bytes: usize) -> String {
 unsafe fn dump_result(res: usize) {
     if !readable(res, 0xa8) { return; }
     log!("  result {:#x}: {}", res, hex_words(res, 0xa8));
+    let (duels, ddata) = (rd(res + 0x2c) as usize, rq(res + 0x30));
+    for k in 0..duels.min(8) {
+        if readable(ddata + k * 0x38, 0x38) { log!("  duel[{k}] {:#x}: {}", ddata + k * 0x38, hex_words(ddata + k * 0x38, 0x38)); }
+    }
     let (count, sums) = (rd(res + 0x1c) as usize, rq(res + 0x20));
     for i in 0..count.min(2) {
         let s = sums + i * 0x68;
         if !readable(s, 0x68) { break; }
         log!("  alliance[{i}] {:#x}: {}", s, hex_words(s, 0x68));
         let (armies, adata) = (rd(s + 4) as usize, rq(s + 8));
-        for a in 0..armies.min(4) {
-            let army = rq(adata + a * 8);
+        for a in 0..armies.min(1) {
+            let army = adata; // army records are stored inline
             if !readable(army, 0x90) { break; }
             log!("    army[{a}] {:#x}: {}", army, hex_words(army, 0x90));
             for off in [0usize, 0x20, 0x40, 0x50, 0x70] {
@@ -481,7 +485,10 @@ unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
             let (start, after, hp_start, hp_after) = (rd(r + 0x54), rd(r + 0x58), rd(r + 0x68), rd(r + 0x6c));
             if hp_start > 0 {
                 let loss = 1.0 - hp_after as f32 / hp_start as f32;
-                let new_loss = (loss * level * plans[i].scale).clamp(0.0, 1.0).min(plans[i].max);
+                let mut new_loss = (loss * level * plans[i].scale).clamp(0.0, 1.0).min(plans[i].max);
+                // Characters (single-man records) are never made worse by casualty or winner
+                // rules: their fate belongs to the duel / fate controls.
+                if start <= 1 { new_loss = new_loss.min(loss); }
                 let new_hp = ((hp_start as f32) * (1.0 - new_loss)).round() as u32;
                 let mut new_men = ((start as f32) * (1.0 - new_loss)).round() as u32;
                 if new_hp > 0 && new_men == 0 && start > 0 { new_men = 1; }
@@ -518,12 +525,20 @@ unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
     core::ptr::write_unaligned((sums + 0x28) as *mut u64, lost_after[1] as u64);
     core::ptr::write_unaligned((sums + 0x68 + 0x28) as *mut u64, lost_after[0] as u64);
     if swap {
+        // BATTLE_RESULTS header (the first 0x60 bytes are what FUN_141850df0 copies into the
+        // fought result): +4 i32 winning alliance index (-1 none, 0 attacker, 1 defender);
+        // alliance summary +0x60 = that side's battle_result_types id (what
+        // attacker_battle_result() reports). The prediction blocks carry the same ids.
+        let old_winner = rd(res + 4);
+        if old_winner > 1 { return Err(format!("winner index {old_winner:#x} is not 0/1; winner not forced")); }
+        let (a, d) = (rd(sums + 0x60), rd(sums + 0x68 + 0x60));
+        if a > 9 || d > 9 { return Err(format!("alliance result ids not plausible ({a}, {d}); winner not forced")); }
+        core::ptr::write_unaligned((res + 4) as *mut u32, 1 - old_winner);
+        core::ptr::write_unaligned((sums + 0x60) as *mut u32, d);
+        core::ptr::write_unaligned((sums + 0x68 + 0x60) as *mut u32, a);
         core::ptr::write_unaligned((res + 0x64 + 0xc) as *mut u32, def_enum);
         core::ptr::write_unaligned((res + 0x7c + 0xc) as *mut u32, att_enum);
-        let (a, d) = (rd(sums + 0x64), rd(sums + 0x68 + 0x64));
-        core::ptr::write_unaligned((sums + 0x64) as *mut u32, d);
-        core::ptr::write_unaligned((sums + 0x68 + 0x64) as *mut u32, a);
-        report.push(format!("winner forced to {}: enums {att_enum}/{def_enum} -> {def_enum}/{att_enum}", winner.unwrap_or_default()));
+        report.push(format!("winner forced to {}: winner index {old_winner} -> {}, result ids {a}/{d} -> {d}/{a}", winner.unwrap_or_default(), 1 - old_winner));
     }
     Ok(report.join("; "))
 }
