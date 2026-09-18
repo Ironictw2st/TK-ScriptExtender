@@ -71,6 +71,14 @@ static PLAN: Mutex<Option<String>> = Mutex::new(None);
 static PLAN_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static COMPUTE_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+struct Engine {
+    string_from_cstr: unsafe extern "C" fn(*mut c_void, *const core::ffi::c_char) -> *mut c_void,
+    string_dtor: unsafe extern "C" fn(*mut c_void),
+    alloc: unsafe extern "C" fn(usize, u32) -> *mut c_void,
+    free: unsafe extern "C" fn(*mut c_void),
+}
+static ENGINE: OnceLock<Engine> = OnceLock::new();
+
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ar_variable_get", se_ar_variable_get);
     lua::set_global_fn(l, "se_ar_variable_set", se_ar_variable_set);
@@ -388,9 +396,15 @@ unsafe extern "C" fn compute_detour(pb: *mut c_void, night: u8) {
         if PLAN_PB.load(std::sync::atomic::Ordering::SeqCst) == p {
             let data = rq(slot + 8);
             if readable(data, after * 8) {
-                match apply_plan(rq(data + (after - 1) * 8), spec) {
+                let res = rq(data + (after - 1) * 8);
+                match apply_plan(res, spec) {
                     Ok(m) => log!("  plan applied: {m}"),
                     Err(e) => log!("  plan NOT applied: {e}"),
+                }
+                match apply_duels(p, res, spec) {
+                    Ok(m) if m.is_empty() => {}
+                    Ok(m) => log!("  {m}"),
+                    Err(e) => log!("  duel rules NOT applied: {e}"),
                 }
             }
         } else {
@@ -543,7 +557,173 @@ unsafe fn apply_plan(res: usize, spec: &str) -> Result<String, String> {
     Ok(report.join("; "))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Duels. FUN_14226f320(sim) (first call of the simulator's post-processing FUN_142269d90) rolls
+// them: candidates per side = FUN_142264ad0 (16-byte entries {unit, i32 power, i32}); while
+// fewer than autoresolver_duel_max_limit: chance = base + min(n_att, n_def) * character_mod -
+// done * additional, clamped to [chance_min, chance_max], one roll; both duelists are picked at
+// random (FUN_14225b9d0); then it is deterministic: diff = power_a - power_b, |diff| >
+// autoresolver_duel_refuse_variable -> refused (states 3/3, +0x28/+0x2c = 2/2), else the
+// stronger one wins (states 0/5) and is stored FIRST. Record (0x38, vector at R+0x28, pushed
+// by FUN_141ff2c00): +0 CA::String unit key of the first duelist, +0x10 second, +0x20 u32 cqi
+// first, +0x24 cqi second, +0x28/+0x2c u32 (2/2 refused; a duration float appears at +0x28
+// for fought duels), +0x30 u32 state first (0 won, 3 refused), +0x34 state second (5 lost).
+// ---------------------------------------------------------------------------------------------
+
+const DUEL_STRIDE: usize = 0x38;
+
+struct DuelRule { a: u32, b: u32, happen: bool, win_chance: f32, winner: i64, a_key: String, b_key: String }
+
+fn parse_duel_rules(spec: &str) -> Vec<DuelRule> {
+    let Some(v) = plan_value(spec, "duels") else { return Vec::new() };
+    v.split('|').filter_map(|row| {
+        let f: Vec<&str> = row.split(',').collect();
+        if f.len() < 5 { return None; }
+        Some(DuelRule {
+            a: f[0].parse::<f32>().ok()? as u32,
+            b: f[1].parse::<f32>().ok()? as u32,
+            happen: f[2] != "0",
+            win_chance: f[3].parse().unwrap_or(-1.0),
+            winner: f[4].parse::<f32>().map(|x| x as i64).unwrap_or(-1),
+            a_key: f.get(6).map(|s| s.to_string()).unwrap_or_default(),
+            b_key: f.get(7).map(|s| s.to_string()).unwrap_or_default(),
+        })
+    }).collect()
+}
+
+/// Deterministic 0..1 value for a pair in one pending battle (the prediction run and the run at
+/// the click must agree).
+fn pair_roll(pb: usize, a: u32, b: u32) -> f32 {
+    let mut x = (pb as u64) ^ ((a.min(b) as u64) << 32 | a.max(b) as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    x ^= x >> 33; x = x.wrapping_mul(0xff51_afd7_ed55_8ccd); x ^= x >> 33; x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53); x ^= x >> 33;
+    (x >> 40) as f32 / (1u64 << 24) as f32
+}
+
+unsafe fn duel_remove(e: &Engine, res: usize, i: usize) {
+    let (count, data) = (rd(res + 0x2c) as usize, rq(res + 0x30));
+    let rec = data + i * DUEL_STRIDE;
+    (e.string_dtor)(rec as *mut c_void);
+    (e.string_dtor)((rec + 0x10) as *mut c_void);
+    if i + 1 < count {
+        core::ptr::copy_nonoverlapping((data + (count - 1) * DUEL_STRIDE) as *const u8, rec as *mut u8, DUEL_STRIDE);
+    }
+    core::ptr::write_unaligned((res + 0x2c) as *mut u32, (count - 1) as u32);
+}
+
+unsafe fn duel_set_winner(rec: usize, winner: u32) {
+    if rd(rec + 0x20) != winner && rd(rec + 0x24) == winner {
+        let mut tmp = [0u8; 16];
+        core::ptr::copy_nonoverlapping(rec as *const u8, tmp.as_mut_ptr(), 16);
+        core::ptr::copy_nonoverlapping((rec + 0x10) as *const u8, rec as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), (rec + 0x10) as *mut u8, 16);
+        let (first, second) = (rd(rec + 0x20), rd(rec + 0x24));
+        core::ptr::write_unaligned((rec + 0x20) as *mut u32, second);
+        core::ptr::write_unaligned((rec + 0x24) as *mut u32, first);
+    }
+    // a fought duel: first duelist won (0), second lost (5)
+    if rd(rec + 0x30) == 3 || rd(rec + 0x34) == 3 {
+        core::ptr::write_unaligned((rec + 0x28) as *mut u64, 0);
+    }
+    core::ptr::write_unaligned((rec + 0x30) as *mut u32, 0);
+    core::ptr::write_unaligned((rec + 0x34) as *mut u32, 5);
+}
+
+unsafe fn duel_append(e: &Engine, res: usize, first: (u32, &str), second: (u32, &str)) -> Result<(), String> {
+    let (cap, count, data) = (rd(res + 0x28) as usize, rd(res + 0x2c) as usize, rq(res + 0x30));
+    let mut data = data;
+    if count >= cap {
+        let new_cap = (cap * 2).max(2);
+        let fresh = (e.alloc)(new_cap * DUEL_STRIDE, 0) as usize;
+        if fresh == 0 { return Err("engine allocator returned null".into()); }
+        core::ptr::write_bytes(fresh as *mut u8, 0, new_cap * DUEL_STRIDE);
+        if count > 0 { core::ptr::copy_nonoverlapping(data as *const u8, fresh as *mut u8, count * DUEL_STRIDE); }
+        if data != 0 { (e.free)(data as *mut c_void); }
+        core::ptr::write_unaligned((res + 0x28) as *mut u32, new_cap as u32);
+        core::ptr::write_unaligned((res + 0x30) as *mut usize, fresh);
+        data = fresh;
+    }
+    let rec = data + count * DUEL_STRIDE;
+    core::ptr::write_bytes(rec as *mut u8, 0, DUEL_STRIDE);
+    for (off, key) in [(0usize, first.1), (0x10, second.1)] {
+        let mut c = key.as_bytes().to_vec();
+        c.push(0);
+        (e.string_from_cstr)((rec + off) as *mut c_void, c.as_ptr() as *const core::ffi::c_char);
+    }
+    core::ptr::write_unaligned((rec + 0x20) as *mut u32, first.0);
+    core::ptr::write_unaligned((rec + 0x24) as *mut u32, second.0);
+    core::ptr::write_unaligned((rec + 0x30) as *mut u32, 0);
+    core::ptr::write_unaligned((rec + 0x34) as *mut u32, 5);
+    core::ptr::write_unaligned((res + 0x2c) as *mut u32, (count + 1) as u32);
+    Ok(())
+}
+
+unsafe fn apply_duels(pb: usize, res: usize, spec: &str) -> Result<String, String> {
+    let rules = parse_duel_rules(spec);
+    let default_none = plan_value(spec, "duel_default").as_deref() == Some("none");
+    let max = plan_value(spec, "duel_max").and_then(|v| v.parse::<f32>().ok()).map(|v| v as usize);
+    if rules.is_empty() && !default_none && max.is_none() { return Ok(String::new()); }
+    let e = ENGINE.get().ok_or("engine table missing")?;
+    let (cap, count, data) = (rd(res + 0x28) as usize, rd(res + 0x2c) as usize, rq(res + 0x30));
+    if count > cap || cap > 64 || (count > 0 && !readable(data, count * DUEL_STRIDE)) {
+        return Err(format!("duel vector not plausible (cap {cap}, count {count}, data {:#x})", data));
+    }
+    let before = count;
+    let rule_for = |x: u32, y: u32| rules.iter().find(|r| (r.a == x && r.b == y) || (r.a == y && r.b == x));
+    let mut report = Vec::new();
+    // 1. removals: forbidden pairs, and everything without a rule when the default is "none"
+    let mut i = 0;
+    while i < rd(res + 0x2c) as usize {
+        let rec = rq(res + 0x30) + i * DUEL_STRIDE;
+        let (x, y) = (rd(rec + 0x20), rd(rec + 0x24));
+        let drop = match rule_for(x, y) { Some(r) => !r.happen, None => default_none };
+        if drop { report.push(format!("removed {x} vs {y}")); duel_remove(e, res, i); } else { i += 1; }
+    }
+    // 2. winners of the duels that stay, 3. forced duels the engine did not roll
+    for r in rules.iter().filter(|r| r.happen) {
+        let desired = if r.winner == r.a as i64 || r.winner == r.b as i64 { r.winner as u32 }
+            else if r.win_chance >= 0.0 { if pair_roll(pb, r.a, r.b) < r.win_chance { r.a } else { r.b } }
+            else { 0 };
+        let n = rd(res + 0x2c) as usize;
+        let found = (0..n).map(|k| rq(res + 0x30) + k * DUEL_STRIDE).find(|rec| {
+            let (x, y) = (rd(rec + 0x20), rd(rec + 0x24));
+            (x == r.a && y == r.b) || (x == r.b && y == r.a)
+        });
+        match found {
+            Some(rec) => {
+                if desired != 0 { duel_set_winner(rec, desired); report.push(format!("{} vs {}: winner {desired}", r.a, r.b)); }
+            }
+            None => {
+                if r.a_key.is_empty() || r.b_key.is_empty() {
+                    report.push(format!("{} vs {}: not rolled by the engine and no unit keys given, cannot force it", r.a, r.b));
+                    continue;
+                }
+                let w = if desired != 0 { desired } else { r.a };
+                let (first, second) = if w == r.a { ((r.a, r.a_key.as_str()), (r.b, r.b_key.as_str())) } else { ((r.b, r.b_key.as_str()), (r.a, r.a_key.as_str())) };
+                duel_append(e, res, first, second)?;
+                report.push(format!("{} vs {}: duel created, winner {w}", r.a, r.b));
+            }
+        }
+    }
+    // 4. cap
+    if let Some(m) = max {
+        while rd(res + 0x2c) as usize > m {
+            let last = rd(res + 0x2c) as usize - 1;
+            duel_remove(e, res, last);
+            report.push("trimmed to max".into());
+        }
+    }
+    Ok(format!("duels {before} -> {}: {}", rd(res + 0x2c), report.join(", ")))
+}
+
 pub fn install_hooks(t: &Table) {
+    let _ = ENGINE.set(unsafe {
+        Engine {
+            string_from_cstr: core::mem::transmute(t.get("string_from_cstr")),
+            string_dtor: core::mem::transmute(t.get("string_dtor")),
+            alloc: core::mem::transmute(t.get("engine_alloc")),
+            free: core::mem::transmute(t.get("engine_free")),
+        }
+    });
     if crate::build::config_value("autoresolve_hooks").as_deref() == Some("0") {
         log!("autoresolve hooks disabled by script_extender.cfg");
         return;

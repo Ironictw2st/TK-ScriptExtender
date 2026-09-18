@@ -1462,6 +1462,22 @@ end
 
 local FATES = { kill = true, wound = true, spare = true, flee = true }
 
+-- Land unit key of a character's own (hero) unit: needed to create a duel the engine did not
+-- roll. Resolved only when the character's force has exactly one hero unit; otherwise the plan
+-- has to give a_key / b_key itself.
+local function hero_unit_key(cqi)
+	local ch = se.character(cqi)
+	if not ch or try(ch, "has_military_force") ~= true then return nil end
+	local units = try(try(ch, "military_force"), "unit_list")
+	local found, n = nil, 0
+	for i = 0, (num(try(units, "num_items")) or 0) - 1 do
+		local key = try(try(units, "item_at", i), "unit_key")
+		if type(key) == "string" and key:find("_hero_") then found = key; n = n + 1 end
+	end
+	if n == 1 then return found end
+	return nil
+end
+
 -- plan -> "k=v;..." for the DLL. Values are clamped here (bias 0.1-10, scales and chances 0-1).
 local function encode_plan(plan, ctx)
 	if type(plan) ~= "table" then return nil, "plan must be a table" end
@@ -1495,8 +1511,10 @@ local function encode_plan(plan, ctx)
 		for i, d in ipairs(plan.duels.pairs or {}) do
 			if type(d) ~= "table" or not num(d.a) or not num(d.b) then return nil, "plan.duels.pairs[" .. i .. "] needs character cqis a and b" end
 			if d.fate ~= nil and not FATES[d.fate] then return nil, "plan.duels.pairs[" .. i .. "].fate must be kill, wound, spare or flee" end
+			local a_key = type(d.a_key) == "string" and d.a_key or hero_unit_key(num(d.a)) or ""
+			local b_key = type(d.b_key) == "string" and d.b_key or hero_unit_key(num(d.b)) or ""
 			rows[#rows + 1] = table.concat({ str(num(d.a)), str(num(d.b)), d.happen == false and "0" or "1",
-				str(clamp(d.win_chance, 0, 1, -1)), str(num(d.winner) or -1), d.fate or "-" }, ",")
+				str(clamp(d.win_chance, 0, 1, -1)), str(num(d.winner) or -1), d.fate or "-", a_key, b_key }, ",")
 		end
 		if #rows > 0 then put("duels", table.concat(rows, "|")) end
 	end
@@ -1504,8 +1522,14 @@ local function encode_plan(plan, ctx)
 end
 
 -- se.modify.autoresolve_plan(plan [, ctx]): store the plan for the current pending battle.
--- DLL 0.26 applies plan.winner and plan.casualties to the engine's result (prediction and the
--- real resolve); plan.bias and plan.duels are stored for the later versions.
+-- The engine hook applies plan.winner and plan.casualties (0.26.2+) and plan.duels (0.27+):
+--   duels.default = "none" removes every duel without a rule, duels.max trims the list,
+--   pairs[i] = { a = cqi, b = cqi, happen = false } forbids that duel,
+--   { a, b, winner = cqi } or { a, b, win_chance = 0..1 (chance that a wins) } sets the winner,
+--   and a pair the engine did not roll is created when both hero unit keys are known (a_key /
+--   b_key, looked up automatically for forces with a single hero unit). `fate` is accepted but
+--   not applied yet (the loser's wound / death is rolled by the campaign afterwards), and
+--   plan.bias is stored only.
 -- plan.refresh_prediction = false skips the immediate recompute of the panel prediction.
 function se.modify.autoresolve_plan(plan, ctx)
 	local okn, err = need("se_ar_plan_set")
