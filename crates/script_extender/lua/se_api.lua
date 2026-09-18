@@ -1381,8 +1381,9 @@ function se.modify.autoresolver_variables_reset()
 	end)
 end
 
--- se.query.autoresolve_prediction() -> { available, attacker_prediction, attacker_casualties,
---   defender_prediction, defender_casualties, night, result_index, results } | nil, message
+-- se.query.autoresolve_prediction() -> { available, attacker_prediction, defender_prediction,
+--   <side>_casualties_percent, <side>_strength_share, <side>_men_before / _men_after / _men_lost,
+--   night, result_index, results } | nil, message
 -- The engine's own prediction for the pending battle (what the pre-battle panel shows).
 function se.query.autoresolve_prediction()
 	local okn, err = need("se_ar_prediction")

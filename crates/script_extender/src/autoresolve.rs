@@ -13,8 +13,11 @@
 //! Pending battle PB = `*(world + 0x3b80)` (the `pending_battle` native FUN_1415ff330):
 //!   +0x11c night byte, +0xe8 u32 index of the autoresolver result in use,
 //!   results vectors per day/night at PB + 0xc8 + night*0x10 {cap, count @+0xcc, data @+0xd0} of
-//!   result pointers; result R: attacker block R+0x7c, defender block R+0x64, block+8 u32
-//!   predicted casualties, block+0xc u32 prediction enum (CcoPendingBattleAlliance getters
+//!   result pointers; result R (0xa8 bytes): **attacker block R+0x64, defender block R+0x7c**
+//!   (verified live: the CCO's +0xc0 byte is "is attacker"), block = {+0 f32 strength share %,
+//!   +4 f32 same, +8 f32 predicted casualties %, +0xc u32 prediction enum, +0x10 u32};
+//!   R+0x18 vector of two 0x68-byte alliance summaries {+0 vector of army records, +0x10 men
+//!   before, +0x18 men after, +0x20 men lost, ...} (CcoPendingBattleAlliance getters
 //!   FUN_142f460a0 / FUN_142f89f70):
 //!   0 close_victory 1 decisive_victory 2 heroic_victory 3 pyrrhic_victory 4 draw
 //!   5 close_defeat 6 decisive_defeat 7 crushing_defeat 8 valiant_defeat
@@ -29,8 +32,10 @@
 //!   se_ar_plan_set(spec) / se_ar_plan_get() / se_ar_plan_clear()  plan storage (consumed by the
 //!     hooks of later versions; 0.24 only stores it)
 
+use crate::addrs::Table;
 use crate::log;
 use crate::lua::{self, LuaState};
+use retour::GenericDetour;
 use core::ffi::{c_int, c_void};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -244,11 +249,17 @@ unsafe extern "C" fn se_ar_prediction(l: *mut LuaState) -> c_int {
         if !readable(res, 0x100) { return Ok(out + ";available=0"); }
         let words: Vec<String> = (0..0x20).map(|k| format!("{:08x}", rd(res + k * 4))).collect();
         log!("se_ar_prediction: result {:#x}: {}", res, words.join(" "));
-        for (side, off) in [("attacker", 0x7c_usize), ("defender", 0x64)] {
-            let casualties = rd(res + off + 8);
+        let sums = rq(res + 0x20);
+        for (i, (side, off)) in [("attacker", 0x64_usize), ("defender", 0x7c)].into_iter().enumerate() {
+            let share = core::ptr::read_unaligned((res + off) as *const f32);
+            let casualties = core::ptr::read_unaligned((res + off + 8) as *const f32);
             let e = rd(res + off + 0xc) as usize;
             let name = PREDICTIONS.get(e).copied().unwrap_or("unknown");
-            out += &format!(";{side}_prediction={name};{side}_prediction_id={e};{side}_casualties={casualties}");
+            out += &format!(";{side}_prediction={name};{side}_prediction_id={e};{side}_casualties_percent={casualties};{side}_strength_share={share}");
+            if rd(res + 0x1c) == 2 && readable(sums, 0xd0) {
+                let s = sums + i * 0x68;
+                out += &format!(";{side}_men_before={};{side}_men_after={};{side}_men_lost={}", rd(s + 0x10), rd(s + 0x18), rd(s + 0x20));
+            }
         }
         Ok(out + ";available=1")
     })();
@@ -277,4 +288,86 @@ unsafe extern "C" fn se_ar_plan_clear(l: *mut LuaState) -> c_int {
         Ok(if had { "plan cleared".into() } else { "no plan was stored".into() })
     })();
     bool_result(l, r, "se_ar_plan_clear")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hook: FUN_14185e030(PB, night). 0.25 only observes: every run (the prediction when the panel
+// opens, the real resolve at the click, AI battles) is logged with a deep dump of the new result,
+// so the per-unit layout can be mapped before anything is rewritten.
+// ---------------------------------------------------------------------------------------------
+
+type ComputeResults = unsafe extern "C" fn(*mut c_void, u8);
+static COMPUTE_HOOK: OnceLock<GenericDetour<ComputeResults>> = OnceLock::new();
+static DUMPS_LEFT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(6);
+
+unsafe fn hex_words(p: usize, bytes: usize) -> String {
+    (0..bytes / 8).map(|k| format!("{:016x}", rq(p + k * 8))).collect::<Vec<_>>().join(" ")
+}
+
+unsafe fn dump_result(res: usize) {
+    if !readable(res, 0xa8) { return; }
+    log!("  result {:#x}: {}", res, hex_words(res, 0xa8));
+    let (count, sums) = (rd(res + 0x1c) as usize, rq(res + 0x20));
+    for i in 0..count.min(2) {
+        let s = sums + i * 0x68;
+        if !readable(s, 0x68) { break; }
+        log!("  alliance[{i}] {:#x}: {}", s, hex_words(s, 0x68));
+        let (armies, adata) = (rd(s + 4) as usize, rq(s + 8));
+        for a in 0..armies.min(4) {
+            let army = rq(adata + a * 8);
+            if !readable(army, 0x90) { break; }
+            log!("    army[{a}] {:#x}: {}", army, hex_words(army, 0x90));
+            for off in [0usize, 0x20, 0x40, 0x50, 0x70] {
+                let (n, data) = (rd(army + off + 4) as usize, rq(army + off + 8));
+                if n == 0 || n > 64 || !readable(data, 0x40) { continue; }
+                log!("      vec@{:#x} count {n} data {:#x}: {}", off, data, hex_words(data, 0x100.min(n * 0x40).max(0x40)));
+                let first = rq(data);
+                if readable(first, 0x80) && first > 0x10000 && first >> 44 != 0 {
+                    log!("        [0] -> {:#x}: {}", first, hex_words(first, 0x80));
+                    let second = rq(data + 8);
+                    if n > 1 && readable(second, 0x80) { log!("        [1] -> {:#x}: {}", second, hex_words(second, 0x80)); }
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn compute_detour(pb: *mut c_void, night: u8) {
+    let Some(hook) = COMPUTE_HOOK.get() else { return };
+    let p = pb as usize;
+    let slot = p + 0xc8 + (night as usize & 1) * 0x10;
+    let before = if readable(slot, 0x10) { rd(slot + 4) } else { 0 };
+    hook.call(pb, night);
+    if !readable(slot, 0x10) { return; }
+    let after = rd(slot + 4) as usize;
+    let plan = PLAN.lock().ok().and_then(|g| g.clone());
+    log!("ar_compute_results(pb={:#x}, night={night}): results {before} -> {after}, plan {}", p, plan.as_deref().unwrap_or("none"));
+    if after == 0 || after > 16 { return; }
+    if DUMPS_LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+        let data = rq(slot + 8);
+        if readable(data, after * 8) { dump_result(rq(data + (after - 1) * 8)); }
+    }
+}
+
+pub fn install_hooks(t: &Table) {
+    if crate::build::config_value("autoresolve_hooks").as_deref() == Some("0") {
+        log!("autoresolve hooks disabled by script_extender.cfg");
+        return;
+    }
+    let target: ComputeResults = unsafe { core::mem::transmute(t.get("ar_compute_results")) };
+    // SAFETY: anchor-verified prologue (pushes, lea rbp,[rsp-0x40], sub rsp): no RIP-relative
+    // instruction in the relocated bytes.
+    unsafe {
+        match GenericDetour::new(target, compute_detour) {
+            Ok(d) => {
+                if let Err(e) = crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()) {
+                    log!("failed to enable the auto-resolve hook: {e}");
+                    return;
+                }
+                let _ = COMPUTE_HOOK.set(d);
+                log!("auto-resolve hook installed (observe only)");
+            }
+            Err(e) => log!("failed to create the auto-resolve hook: {e}"),
+        }
+    }
 }

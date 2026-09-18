@@ -85,6 +85,7 @@ fn bootstrap() {
     bundles::init(&table);
     diplomacy::init(&table);
     build::apply_config();
+    autoresolve::install_hooks(&table);
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }

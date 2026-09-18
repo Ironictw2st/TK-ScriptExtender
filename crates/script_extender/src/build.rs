@@ -150,6 +150,12 @@ fn config_text() -> Option<(std::path::PathBuf, String)> {
     None
 }
 
+/// Value of one `key=value` line of script_extender.cfg, if the file and the key exist.
+pub fn config_value(key: &str) -> Option<String> {
+    let (_, text) = config_text()?;
+    text.lines().filter_map(|l| l.trim().split_once('=')).find(|(k, _)| k.trim() == key).map(|(_, v)| v.trim().trim_matches('"').to_string())
+}
+
 /// Called from the bootstrap thread. The manager injects seconds after launch, before the game
 /// has composed its build strings, so the apply is retried in a background thread until
 /// GameCore holds plausible text (then done once), giving up after two minutes.
@@ -170,6 +176,7 @@ pub fn apply_config() {
                 "build_number" => build = v.to_string(),
                 "build_number_short" => short = v.to_string(),
                 "build_modified" => modified = Some(v == "1" || v.eq_ignore_ascii_case("true")),
+                "autoresolve_hooks" => {}
                 _ => log!("config: unknown key '{k}' ignored"),
             }
         }
