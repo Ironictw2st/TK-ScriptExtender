@@ -4,7 +4,7 @@
 //!   EFFECT_BUNDLE record: +0x3c effect count, +0x40 -> entries (0x30 bytes each; from the
 //!   potential-handicap apply and FUN_140e87a50: entry+8 effect record, entry+0x10 scope record,
 //!   entry+0x28 advancement stage; value expected at +0x18, to be confirmed live)
-//!   apply (faction): wrapper = FUN_140e6ea50(&w, record, turns); FUN_141902ea0(faction, &w)
+//!   apply (faction): wrapper = FUN_140e6ea50(&w, record, turns); FUN_1419a2f80(faction, &w)
 //!
 //!   Entry (0x30, confirmed live): +0 effect record, +8 scope record, +0x10 f32 value,
 //!   +0x18 vector{cap,count,data} of resolved bonus values (filled by the entry constructor
@@ -12,7 +12,7 @@
 //!   Bundle instance (0x38, FUN_140e6ea50): +0 record, +8 turns, +0x10 vector of 0x28-byte active
 //!   effects, +0x20 record+0x34, +0x24 byte, **+0x28 vector of custom 0x30 entries**: when its
 //!   count is not 0, FUN_140e87a50(instance, stage) builds the active effects from it instead of
-//!   the record. FUN_140e81b50 (holder container add, inside FUN_141902ea0 for factions) deep
+//!   the record. FUN_140e81b50 (holder container add, inside FUN_1419a2f80 for factions) deep
 //!   copies both vectors; the caller destroys its instance with FUN_140e71e00(+0x28) and
 //!   FUN_1402fdd40(+0x10).
 //!
@@ -21,7 +21,7 @@
 //! se_effect_bundle_define(q_faction, key, spec) -> ok, msg   rewrite the DB record's list (this
 //!     process only; every later stock apply_effect_bundle of that key uses it, on any holder)
 //! se_effect_bundle_restore(q_faction, key) -> ok, msg        put the stock list back
-//! se_effect_bundle_apply_custom(q_faction, key, turns, spec, m_faction) -> ok, msg   apply the bundle to the
+//! se_effect_bundle_apply_custom(q_faction, key, turns, spec) -> ok, msg   apply the bundle to the
 //!     faction with a per-instance effect list (the record is left alone)
 
 use crate::addrs::Table;
@@ -232,59 +232,31 @@ unsafe fn build_entries(e: &Engine, list: &[(usize, usize, f32)]) -> Result<usiz
     Ok(data)
 }
 
-/// FUN_141902ea0 (what MODIFY_FACTION:apply_effect_bundle calls) takes `*(modify_script_obj+0x18)`,
-/// which is NOT the FACTION base the query interfaces hand out (0.23.0 passed FACTION: the copy
-/// constructor wrote into .rdata; 0.23.1 guessed FACTION+0x230: FUN_141948890 read garbage).
-/// The holder is therefore read from the MODIFY_FACTION object the script passes in, exactly
-/// like the stock native does, and only accepted when
-///   - its world handle (`*(*(holder+0x58))+0x78`, the routine's own resolver) is the faction's world,
-///   - its bundle list at +0x1c0 is a sane vector with at least one instance, and every
-///     instance's record has a readable key.
-const OFF_HOLDER_WORLD_HANDLE: usize = 0x58;
-const OFF_HOLDER_BUNDLES: usize = 0x1c0;
+/// Six Lua natives are called apply_effect_bundle, one per holder type; they differ in where the
+/// world handle sits on `*(script_obj+0x18)` and in the holder routine they call:
+///   FUN_14159a380 character (+0x250): FUN_141a36fa0(FUN_141a34960(character), w)
+///   FUN_14159a650 **faction (+0x288): FUN_1419a2f80(faction, w), instance list at FACTION+0xc78**
+///   FUN_14159a4f0 (+0xa0) FUN_141902e40, FUN_14159a900 (+0xa0) FUN_14140c700,
+///   FUN_14159a7b0 (+0x58) FUN_141774210, FUN_14159aa60 (+0x58) FUN_141902ea0 (list at +0x1c0)
+/// 0.23.0 - 0.23.2 used the last one on a FACTION, which is why they crashed or refused.
+const OFF_FACTION_BUNDLES: usize = 0xc78;
 
-unsafe fn check_holder(holder: usize, world: usize) -> Result<(), String> {
+unsafe fn check_faction_bundles(faction: usize) -> Result<u32, String> {
     let (base, size) = crate::process::main_module();
-    if !readable(holder, OFF_HOLDER_BUNDLES + 0x40) { return Err("not readable".into()); }
-    let w = rq(rq(holder + OFF_HOLDER_WORLD_HANDLE) + 0x78);
-    if w != world { return Err(format!("world handle resolves to {:#x}, expected {:#x}", w, world)); }
-    let list = holder + OFF_HOLDER_BUNDLES;
+    let list = faction + OFF_FACTION_BUNDLES;
+    if !readable(list, 0x10) { return Err("faction bundle list is not readable".into()); }
     let (cap, count, data) = (rd(list) as usize, rd(list + 4) as usize, rq(list + 8));
-    if cap == 0 || cap > 4096 || count > cap || !readable(data, cap * 0x38) || (data >= base && data < base + size) {
-        return Err(format!("bundle list is not a sane vector (cap {cap}, count {count}, data {:#x})", data));
+    let empty = cap == 0 && count == 0 && data == 0;
+    if !empty && (cap == 0 || cap > 4096 || count > cap || !readable(data, cap * 0x38) || (data >= base && data < base + size)) {
+        return Err(format!("faction+{:#x} is not a sane bundle vector (cap {cap}, count {count}, data {:#x})", OFF_FACTION_BUNDLES, data));
     }
-    if count == 0 { return Err("bundle list is empty; apply any stock bundle to the faction first so the list can be verified".into()); }
     for i in 0..count {
         let rec = rq(data + i * 0x38);
         if record_key(rec).is_empty() {
             return Err(format!("bundle instance {i} of {count} has no readable record key (record {:#x})", rec));
         }
     }
-    Ok(())
-}
-
-unsafe fn holder_from_modify_arg(l: *mut LuaState, idx: c_int, faction: usize) -> Result<usize, String> {
-    let api = lua::api().ok_or("lua api missing")?;
-    let ty = (api.type_)(l, idx);
-    if ty != lua::LUA_TLIGHTUSERDATA && ty != lua::LUA_TUSERDATA {
-        return Err(format!("arg {idx} is not a MODIFY_FACTION script object (lua type {ty})"));
-    }
-    let world = rq(rq(faction + 0x288) + 0x78);
-    if world == 0 { return Err("could not derive the world from the faction".into()); }
-    let p = (api.touserdata)(l, idx) as usize;
-    let cands = [rq(rq(p) + 0x18), rq(rq(rq(p) + 8) + 0x18), rq(rq(p + 8) + 0x18), rq(p + 0x18)];
-    let mut why = Vec::new();
-    for (i, c) in cands.iter().enumerate() {
-        if *c == 0 { continue; }
-        match check_holder(*c, world) {
-            Ok(()) => {
-                log!("bundle holder: candidate {i} = {:#x} (faction {:#x}, delta {:#x})", c, faction, (*c as isize).wrapping_sub(faction as isize));
-                return Ok(*c);
-            }
-            Err(e) => why.push(format!("cand {i} {:#x}: {e}", c)),
-        }
-    }
-    Err(format!("no MODIFY_FACTION candidate passed the holder checks (faction {:#x}): {}", faction, why.join(" | ")))
+    Ok(count as u32)
 }
 
 unsafe fn bool_result(l: *mut LuaState, r: Result<String, String>, who: &str) -> c_int {
@@ -350,8 +322,7 @@ unsafe extern "C" fn se_effect_bundle_apply_custom(l: *mut LuaState) -> c_int {
         if key.is_empty() { return Err("bundle key is empty".into()); }
         if !(0..=10000).contains(&turns) { return Err(format!("turns {turns} is out of range (0 = permanent)")); }
         let (faction, db) = db_of(e, l, 1)?;
-        let holder = holder_from_modify_arg(l, 5, faction)?;
-        let before = rd(holder + OFF_HOLDER_BUNDLES + 4);
+        let before = check_faction_bundles(faction)?;
         let rec = bundle_record(e, l, 1, &key)?;
         let list = parse_spec(e, db, &spec)?;
         let mut w = [0u64; 8];
@@ -367,8 +338,8 @@ unsafe extern "C" fn se_effect_bundle_apply_custom(l: *mut LuaState) -> c_int {
         core::ptr::write_unaligned((wp + 0x30) as *mut usize, data);
         (e.instance_rebuild)(wp as *mut c_void, 0);
         let active = rd(wp + 0x14);
-        (e.faction_apply)(holder as *mut c_void, wp as *mut c_void);
-        let after = rd(holder + OFF_HOLDER_BUNDLES + 4);
+        (e.faction_apply)(faction as *mut c_void, wp as *mut c_void);
+        let after = rd(faction + OFF_FACTION_BUNDLES + 4);
         (e.custom_dtor)((wp + 0x28) as *mut c_void);
         (e.effects_dtor)((wp + 0x10) as *mut c_void);
         Ok(format!("'{key}' applied to faction {:#x} for {turns} turns with {} custom effects ({active} active after rebuild; faction bundles {before} -> {after})", faction, list.len()))
