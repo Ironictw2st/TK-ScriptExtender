@@ -176,7 +176,7 @@ pub fn apply_config() {
                 "build_number" => build = v.to_string(),
                 "build_number_short" => short = v.to_string(),
                 "build_modified" => modified = Some(v == "1" || v.eq_ignore_ascii_case("true")),
-                "autoresolve_hooks" => {}
+                "autoresolve_hooks" | "horde_income" => {}
                 _ => log!("config: unknown key '{k}' ignored"),
             }
         }

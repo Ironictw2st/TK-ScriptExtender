@@ -27,6 +27,7 @@ mod build;
 mod buildings;
 mod alliances;
 mod autoresolve;
+mod income;
 mod bundles;
 mod diplomacy;
 
@@ -86,6 +87,7 @@ fn bootstrap() {
     diplomacy::init(&table);
     build::apply_config();
     autoresolve::install_hooks(&table);
+    income::install(&table);
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }
