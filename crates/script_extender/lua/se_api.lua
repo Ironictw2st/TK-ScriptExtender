@@ -1176,7 +1176,9 @@ function se.modify.effect_bundle_apply_custom(faction_key, bundle_key, effects, 
 	local spec, e0 = effect_spec(effects)
 	if not spec then return false, e0 end
 	return bundle_call("effect_bundle_apply_custom(" .. str(faction_key) .. ", " .. str(bundle_key) .. ")", "se_effect_bundle_apply_custom", faction_key, function(fac)
-		return se_effect_bundle_apply_custom(fac, bundle_key, num(turns) or 0, spec)
+		local okm, mf = pcall(function() return cm_():modify_faction(faction_key) end)
+		if not okm or mf == nil then return false, "modify_faction(" .. str(faction_key) .. ") failed" end
+		return se_effect_bundle_apply_custom(fac, bundle_key, num(turns) or 0, spec, mf)
 	end)
 end
 
