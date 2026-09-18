@@ -1,0 +1,66 @@
+name: Release
+
+# Builds the script extender on a v* tag and publishes a GitHub Release with:
+#   script_extender.dll, injector.exe, manifest.json
+# manifest.json = { version, game_exe_version, exe_timestamp, exe_size_of_image, sha256 } —
+# TK Mod Manager compares exe_timestamp / exe_size_of_image with the installed game's PE header
+# and only injects a DLL whose fingerprint matches.
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches the workspace version
+        shell: pwsh
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { Write-Error "tag v$tag does not match Cargo.toml version $ver"; exit 1 }
+
+      - run: cargo build --release --locked
+
+      - name: Write manifest.json
+        shell: pwsh
+        run: |
+          $addrs = "crates/script_extender/src/addrs.rs"
+          $ver  = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $ts   = (Select-String -Path $addrs -Pattern 'BUILD_TIMESTAMP:\s*u32\s*=\s*(0x[0-9a-fA-F]+)').Matches[0].Groups[1].Value
+          $soi  = (Select-String -Path $addrs -Pattern 'BUILD_SIZE_OF_IMAGE:\s*usize\s*=\s*(0x[0-9a-fA-F]+)').Matches[0].Groups[1].Value
+          $game = (Select-String -Path $addrs -Pattern 'build\s+(\d+\.\d+\.\d+\.\d+)').Matches[0].Groups[1].Value
+          $sha  = (Get-FileHash target/release/script_extender.dll -Algorithm SHA256).Hash.ToLower()
+          $manifest = [ordered]@{
+            version = $ver
+            game_exe_version = $game
+            exe_timestamp = $ts
+            exe_size_of_image = $soi
+            sha256 = $sha
+          }
+          $manifest | ConvertTo-Json | Set-Content -Encoding ascii manifest.json
+          Get-Content manifest.json
+          Copy-Item target/release/script_extender.dll .
+          Copy-Item target/release/injector.exe .
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "Script extender ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            script_extender.dll
+            injector.exe
+            manifest.json

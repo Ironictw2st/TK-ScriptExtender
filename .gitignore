@@ -1,0 +1,14 @@
+*.log
+__pycache__/
+out/
+*.dmp
+*.ct
+target/
+Cargo.lock.bak
+
+# Local reverse-engineering workspace (machine-specific; not needed to build the DLL)
+.claude/
+.mcp.json
+CLAUDE.md
+notes/
+tools/

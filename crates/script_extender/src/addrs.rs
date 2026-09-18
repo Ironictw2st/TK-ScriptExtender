@@ -1,0 +1,192 @@
+//! Fixed RVAs for Three_Kingdoms.exe build 1.7.2.0 (Steam 2026-09-17), each guarded by the
+//! first 8 bytes of the function so a silently updated exe can never be patched at the wrong
+//! place. The build itself is fingerprinted by PE `TimeDateStamp` + `SizeOfImage`.
+//!
+//! Sources: Ghidra (Lua API recognised by FunctionID; engine routines from the recruitment-pool
+//! analysis in notes/character_pools.md); anchors read from the live process.
+
+use crate::log;
+use core::ffi::c_void;
+use std::collections::HashMap;
+
+const BUILD_TIMESTAMP: u32 = 0x69ce4c84;
+const BUILD_SIZE_OF_IMAGE: usize = 0x4836000;
+
+const ENTRIES: &[(&str, usize, [u8; 8])] = &[
+    ("lua_gettop", 0x75ce70, [0x48, 0x8b, 0x41, 0x10, 0x48, 0x2b, 0x41, 0x18]),
+    ("lua_pushcclosure", 0x75d2f0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74]),
+    ("lua_setfield", 0x75d9a0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
+    ("lua_pushstring", 0x75d500, [0x48, 0x85, 0xd2, 0x75, 0x0d, 0x48, 0x8b, 0x41]),
+    ("lua_pushboolean", 0x75d2d0, [0x4c, 0x8b, 0x41, 0x10, 0x33, 0xc0, 0x85, 0xd2]),
+    ("lua_pushinteger", 0x75d410, [0x48, 0x8b, 0x41, 0x10, 0x0f, 0x57, 0xc0, 0xf3]),
+    ("lua_tointeger", 0x75dcb0, [0x48, 0x83, 0xec, 0x38, 0xe8, 0xc7, 0xea, 0xff]),
+    ("lua_touserdata", 0x75de50, [0x48, 0x83, 0xec, 0x28, 0xe8, 0x27, 0xe9, 0xff]),
+    ("lua_type", 0x75de90, [0x48, 0x83, 0xec, 0x28, 0xe8, 0xe7, 0xe8, 0xff]),
+    ("lua_getfield", 0x75cd70, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
+    ("lua_settop", 0x75db00, [0x85, 0xd2, 0x78, 0x40, 0x4c, 0x63, 0xc2, 0x48]),
+    ("lua_tolstring", 0x75dce0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74]),
+    ("lua_topointer", 0x75ddc0, [0x48, 0x83, 0xec, 0x28, 0x44, 0x8b, 0xd2, 0x4c]),
+    ("lua_pushnil", 0x75d4c0, [0x48, 0x8b, 0x41, 0x10, 0xc7, 0x40, 0x08, 0x00]),
+    // 0.8: needed to run the embedded se_api.lua module and to build result tables
+    ("luaL_loadbuffer", 0x7611e0, [0x48, 0x83, 0xec, 0x38, 0x48, 0x89, 0x54, 0x24]),
+    ("lua_pcall", 0x75d240, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
+    ("lua_createtable", 0x75ca10, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    ("lua_rawseti", 0x75d740, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74]),
+    ("lua_pushnumber", 0x75d4e0, [0x48, 0x8b, 0x41, 0x10, 0xf3, 0x0f, 0x11, 0x08]),
+    ("lua_tonumber", 0x75dd80, [0x48, 0x83, 0xec, 0x38, 0xe8, 0xf7, 0xe9, 0xff]),
+    ("lua_pushlstring", 0x75d450, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    ("lua_toboolean", 0x75dc50, [0x48, 0x83, 0xec, 0x28, 0xe8, 0x27, 0xeb, 0xff]),
+    ("lua_pushvalue", 0x75d560, [0x48, 0x83, 0xec, 0x28, 0x4c, 0x8b, 0xd1, 0xe8]),
+    // FACTION_CHARACTER_MANAGER::release_to_pool(mgr = faction+0xd60, details, flag)
+    ("release_to_pool", 0x17c6130, [0x40, 0x53, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec]),
+    // character lookup by cqi in the model's table (*(model+0x3c18), &cqi)
+    ("char_by_cqi", 0x1457760, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x44, 0x8b, 0x1a]),
+    // CHARACTER::assignment(): non-null means the character holds a post
+    ("char_assignment", 0x1a6add0, [0x48, 0x8b, 0x81, 0x60, 0x02, 0x00, 0x00, 0x48]),
+    // CHARACTER::change_faction(char, faction, 0, 0): what Lua move_to_faction calls
+    ("change_faction", 0x1a791d0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    // FACTION_MANAGER::faction_by_key(*(model+0x3b68), &String)
+    ("faction_by_key", 0x19cc3b0, [0x40, 0x53, 0x48, 0x83, 0xec, 0x30, 0x48, 0x89]),
+    // pool -> recruited (what move_recruitment_pool_character_to_recruited_characters calls)
+    ("make_recruited", 0x17c60c0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
+    // engine operator delete / free (used to release item lists built by the engine)
+    ("engine_free", 0x670570, [0x48, 0x85, 0xc9, 0x74, 0x2a, 0x53, 0x48, 0x83]),
+    // database access, as used by the recruit executor FUN_141b47f00
+    ("db_get", 0x149df50, [0x48, 0x8b, 0x01, 0x48, 0x8b, 0x80, 0x88, 0x00]),
+    ("land_units_table", 0x939060, [0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x57, 0x48]),
+    ("record_base", 0x3e7570, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    // CA::String construction from a C string and destruction
+    ("string_from_cstr", 0x662df0, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    ("string_dtor", 0x2e4930, [0x48, 0x8b, 0x49, 0x08, 0x48, 0x8d, 0x05, 0xb3]),
+    // CCQ_DISBAND_UNIT executor: disband_units(&UnitVec, model); unit_is_valid(unit) -> bool
+    ("disband_units", 0x149ea70, [0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56]),
+    ("unit_is_valid", 0x1498860, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74]),
+    // 0.8 progression: FUN_1419f3310(faction) = unlock + process prestige (the engine side of
+    // MODIFY_FACTION:unlock_progression_level_changes); FUN_1419b1a20(world, id) campaign variable
+    ("progression_process", 0x19f3310, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    ("campaign_variable", 0x19b1a20, [0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x89, 0x58]),
+    // world-leader manager: FUN_1416901c0(mgr, faction, 0, 0) seats a faction (fires
+    // FactionBecomesWorldLeader); FUN_141690300(mgr, region, 0) adds its world-leader region
+    ("become_world_leader", 0x16901c0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    ("add_world_leader_region", 0x1690300, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    // 0.12 campaign AI personality (FUN_141b94700 path) and faction potential (FACTION+0xee0)
+    ("cai_faction_by_key", 0x18b20e0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
+    ("cai_personalities_table", 0x844730, [0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x57, 0x48]),
+    ("string_assign", 0x664020, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    ("cai_apply_personality", 0x1b94560, [0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83]),
+    ("potential_apply", 0x19f5aa0, [0x48, 0x8b, 0xc4, 0x41, 0x56, 0x48, 0x81, 0xec]),
+    ("potential_value", 0x17bf6a0, [0x48, 0x8b, 0x01, 0x80, 0xb8, 0xd0, 0x0c, 0x00]),
+    // 0.12 experience: FUN_141a36ae0(details, xp) scaled add + rank loop; FUN_141a36ff0(details,
+    // &entry) one-character flush; effect ctx FUN_141415530(holder) + FUN_140abcba0(ctx, id)
+    ("xp_add_scaled", 0x1a36ae0, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c]),
+    ("xp_flush_one", 0x1a36ff0, [0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4c]),
+    ("effect_ctx", 0x1415530, [0x40, 0x57, 0x48, 0x83, 0xec, 0x20, 0x80, 0x79]),
+    ("effect_value", 0xabcba0, [0x44, 0x0f, 0xb7, 0xca, 0x45, 0x33, 0xc0, 0xb2]),
+    // 0.14 CAI personality runtime objects: FUN_141d3e390(registry, record) -> personality
+    // object (registry = *(*(*(cai_faction+0xc0)+0xd8)+0xa70)); FUN_141d56520(component, cai_faction)
+    ("cai_personality_by_record", 0x1d3e390, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74]),
+    ("cai_apply_component", 0x1d56520, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x83, 0x79]),
+];
+
+/// Vtables live in .rdata and hold relocated pointers, so they are verified by the RVA of
+/// their first slot instead of raw bytes: (name, vtable rva, rva of slot 0).
+const VTABLES: &[(&str, usize, usize)] = &[
+    // PERSISTENT_RETINUE_SLOT_RECRUITMENT (captured live from the recruit executor)
+    ("recruit_iface_vtable", 0x349c270, 0x18fd850),
+    // recruitment item built by the interface's item-list virtual
+    ("recruit_item_vtable", 0x349c220, 0x18fd920),
+    // campaign UNIT (read live from a QUERY_UNIT script object: *(obj+0x18))
+    ("unit_vtable", 0x346e000, 0x148f400),
+];
+
+pub struct Table {
+    base: usize,
+    map: HashMap<&'static str, usize>,
+}
+
+impl Table {
+    /// Absolute address of a verified entry. Panics only on a programming error (unknown
+    /// name); every listed name is verified before the table is handed out.
+    pub fn get(&self, name: &str) -> usize {
+        *self.map.get(name).unwrap_or_else(|| panic!("no address entry '{name}'"))
+    }
+    #[allow(dead_code)]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+}
+
+extern "system" {
+    fn IsBadReadPtr(lp: *const c_void, ucb: usize) -> i32;
+}
+
+unsafe fn read8(addr: usize) -> Option<[u8; 8]> {
+    if IsBadReadPtr(addr as *const c_void, 8) != 0 {
+        return None;
+    }
+    Some(core::ptr::read_unaligned(addr as *const [u8; 8]))
+}
+
+/// Fingerprint the loaded image and verify every anchor. Returns None on any mismatch.
+pub fn resolve(base: usize, size: usize) -> Option<Table> {
+    if base == 0 {
+        return None;
+    }
+    let (ts, soi) = unsafe {
+        let e_lfanew = core::ptr::read_unaligned((base + 0x3c) as *const u32) as usize;
+        let nt = base + e_lfanew;
+        (
+            core::ptr::read_unaligned((nt + 8) as *const u32),
+            core::ptr::read_unaligned((nt + 0x18 + 0x38) as *const u32) as usize,
+        )
+    };
+    log!("exe fingerprint: timestamp=0x{ts:x} size_of_image=0x{soi:x} (module size 0x{size:x})");
+    if ts != BUILD_TIMESTAMP || soi != BUILD_SIZE_OF_IMAGE {
+        log!(
+            "fingerprint mismatch: expected timestamp=0x{BUILD_TIMESTAMP:x} size_of_image=0x{BUILD_SIZE_OF_IMAGE:x}"
+        );
+        return None;
+    }
+    let mut map = HashMap::new();
+    let mut bad = 0;
+    for (name, rva, anchor) in ENTRIES {
+        let addr = base + rva;
+        match unsafe { read8(addr) } {
+            Some(bytes) if &bytes == anchor => {
+                map.insert(*name, addr);
+            }
+            Some(bytes) => {
+                log!("anchor mismatch for {name} at 0x{addr:x}: got {bytes:02x?}, want {anchor:02x?}");
+                bad += 1;
+            }
+            None => {
+                log!("anchor unreadable for {name} at 0x{addr:x}");
+                bad += 1;
+            }
+        }
+    }
+    for (name, rva, slot0_rva) in VTABLES {
+        let addr = base + rva;
+        match unsafe { read8(addr) } {
+            Some(bytes) => {
+                let slot0 = usize::from_le_bytes(bytes);
+                if slot0.wrapping_sub(base) == *slot0_rva {
+                    map.insert(*name, addr);
+                } else {
+                    log!("vtable anchor mismatch for {name} at 0x{addr:x}: slot0=0x{slot0:x}, want base+0x{slot0_rva:x}");
+                    bad += 1;
+                }
+            }
+            None => {
+                log!("vtable unreadable for {name} at 0x{addr:x}");
+                bad += 1;
+            }
+        }
+    }
+    if bad > 0 {
+        log!("{bad} anchor(s) failed; refusing to run");
+        return None;
+    }
+    log!("all {} addresses and {} vtables verified", ENTRIES.len(), VTABLES.len());
+    Some(Table { base, map })
+}

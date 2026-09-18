@@ -1,0 +1,12 @@
+[package]
+name = "injector"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "injector"
+path = "src/main.rs"
+
+[dependencies]
+inject_core = { path = "../inject_core" }

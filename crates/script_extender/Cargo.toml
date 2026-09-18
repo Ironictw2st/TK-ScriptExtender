@@ -1,0 +1,14 @@
+[package]
+name = "script_extender"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "script_extender"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Trampoline hook on lua_gettop to learn the live lua_State*. Same crate/version that was
+# proven in-game on the July build.
+retour = "0.3"
