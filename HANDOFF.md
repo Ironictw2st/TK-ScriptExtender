@@ -1,9 +1,10 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current DLL: **0.23**, `Z:\RE\se_deploy\0.23\`
-(`script_extender.dll` + `injector.exe`). Source: `Z:\Claude\ScriptExtender` (Rust workspace).
-Deep RE notes: `notes/*.md`; day-to-day rules: `CLAUDE.md`.
+(Steam build 25370317) unless marked otherwise. Current DLL: **0.26.2**, `Z:\RE\se_deploy\0.26.2\`
+(`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
+`Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
+`CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
 
 ## 1. What the DLL is
 
@@ -92,7 +93,7 @@ a native is present. `se.version()` = DLL version.
 | Effect bundles (0.21 read, 0.23.3 write; define + apply_custom verified live, persistence pending) | `effect_bundle(key)` -> engine entries dump | `effect_bundle_define(bundle_key, {{effect=, scope=, value=}, ...})` rewrites an existing record's list for the session (any holder, stock apply; redo after each load), `effect_bundle_restore(bundle_key)`, `effect_bundle_apply_custom(faction, bundle_key, effects, turns)` = engine per-instance custom list | record +0x3c count / +0x40 entries (0x30: +0 effect, +8 scope, +0x10 f32 value, +0x18 bonus-value vector, +0x28 stage 7); entry ctor FUN_140e6e260(out, effect, scope, f32); instance (0x38) FUN_140e6ea50, custom entries vector at +0x28 used by FUN_140e87a50 when count != 0; faction apply FUN_1419a2f80(faction, instance), list at FACTION+0xc78, deep copies (six natives share the name apply_effect_bundle; FUN_141902ea0 belongs to another holder type); notes/income_effects.md |
 | Attitude (0.22, pending) | `attitude(a, b)` -> standing | `attitude(a, b, level)` level -3..3 = the engine's small/medium/large attitude events (values from DB) | FUN_141b965e0(mgr, A, B); FUN_141b7cf60(mgr, A, B, level) = the `diplomatic_attitude_change` payload; treaty-component bias not done |
 | Income lines (0.22, script-side) | `faction_income(key)` | `faction_income(key, amount, label)`, `se.load_income_lines()` after a load | paid at FactionTurnStart via increase_treasury; not in the engine breakdown; force-scoped gdp hook not done (region GDP code not reached) |
-| Auto-resolve (0.24: read + tunables + plan storage; winner 0.25, bias/casualties 0.26, duels 0.27 pending) | `pending_battle()` -> context, `autoresolve_prediction()`, `autoresolver_variable(key)`, `autoresolver_variables()`, `autoresolve_plan()` | `autoresolver_variable(key, value)`, `autoresolver_variables_reset()`, `autoresolve_plan(plan)`, `autoresolve_plan_clear()`, `se.autoresolve.set_handler(fn(ctx) -> plan)` (PendingBattle listener, local player battles only) | campaign variables = f32[774] at `*(world+0x3b58)` indexed by descriptor index (descriptor array RVA 0x3e33520, stride 0x78, name at +0x68); PB = `*(world+0x3b80)`, prediction in result `(*(PB+0xd0+night*0x10))[*(PB+0xe8)]`, side block +0x7c/+0x64, +8 casualties, +0xc enum; notes/autoresolve.md |
+| Auto-resolve (0.24 read + tunables + plan; 0.25 simulation hook; **0.26.2: plan.casualties and plan.winner applied and verified live**; plan.bias and plan.duels stored only) | `pending_battle()` -> context, `autoresolve_prediction()`, `autoresolver_variable(key)`, `autoresolver_variables()`, `autoresolve_plan()` | `autoresolver_variable(key, value)`, `autoresolver_variables_reset()`, `autoresolve_plan(plan)`, `autoresolve_plan_clear()`, `se.autoresolve.set_handler(fn(ctx) -> plan)` (PendingBattle listener, local player battles only) | campaign variables = f32[774] at `*(world+0x3b58)` indexed by descriptor index (descriptor array RVA 0x3e33520, stride 0x78, name at +0x68); PB = `*(world+0x3b80)`, prediction in result `(*(PB+0xd0+night*0x10))[*(PB+0xe8)]`, side block +0x7c/+0x64, +8 casualties, +0xc enum; notes/autoresolve.md |
 
 Raw natives (all `se_*` globals) are listed at the top of each `src/*.rs` file; treat them as
 internal. Test/console scripts for every feature live in
