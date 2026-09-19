@@ -106,3 +106,10 @@ fn bootstrap() {
 extern "system" {
     fn DisableThreadLibraryCalls(hmod: *mut c_void) -> i32;
 }
+
+/// Read-only natives are called thousands of times per turn by report scripts (0.36.1: a 70 MB
+/// log from one traced end turn). Their per-call log lines are for layout work only: true for
+/// the first `limit` calls of a session.
+pub(crate) fn chatty(counter: &std::sync::atomic::AtomicU32, limit: u32) -> bool {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < limit
+}

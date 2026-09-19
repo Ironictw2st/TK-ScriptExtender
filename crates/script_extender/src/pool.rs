@@ -161,7 +161,8 @@ pub unsafe fn character_from_arg(l: *mut LuaState, idx: c_int, cqi: u32) -> Resu
     candidates.push(("*(*p+0x18)".into(), rq(rq(p) + 0x18)));
     for (how, c) in &candidates {
         if *c != 0 && readable(*c, 0x300) && rd(*c + 0x240) == cqi && rd(*c + 0x278) <= 2 {
-            log!("character_from_arg: cqi {cqi} matched via {how} -> {:#x}", c);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if crate::chatty(&N, 10) { log!("character_from_arg: cqi {cqi} matched via {how} -> {:#x}", c); }
             return Ok(*c);
         }
     }
@@ -230,7 +231,8 @@ unsafe extern "C" fn se_char_info(l: *mut LuaState) -> c_int {
         Ok(ch) => {
             let v = view(ch);
             let s = describe(&v);
-            log!("se_char_info: {s}");
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if crate::chatty(&N, 10) { log!("se_char_info: {s}"); }
             lua::push_str(l, &s);
         }
         Err(e) => {

@@ -95,7 +95,11 @@ unsafe extern "C" fn se_unit_info(l: *mut LuaState) -> c_int {
         Ok(format!("unit={:#x} via {how} id@+8={} faction@+90={:#x} men={}/{} valid_flag={} vt={:#x}", u, rd(u + 8), rq(u + 0x90), rd(u + 0xac), rd(u + 0xa8), (e.unit_is_valid)(u as *mut c_void), rq(u)))
     })();
     match out {
-        Ok(s) => { log!("se_unit_info: {s}"); lua::push_str(l, &s); }
+        Ok(s) => {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if crate::chatty(&N, 10) { log!("se_unit_info: {s}"); }
+            lua::push_str(l, &s);
+        }
         Err(er) => { log!("se_unit_info: {er}"); lua::push_str(l, &format!("error: {er}")); }
     }
     1
@@ -170,7 +174,8 @@ unsafe fn object_from_arg(l: *mut LuaState, idx: c_int, want_vtable: usize) -> R
     ];
     for (how, c) in cands.iter() {
         if *c != 0 && readable(*c, 0x40) && rq(*c) == want_vtable {
-            log!("object_from_arg: matched via {how} -> {:#x}", c);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if crate::chatty(&N, 10) { log!("object_from_arg: matched via {how} -> {:#x}", c); }
             return Ok(*c);
         }
     }
@@ -322,7 +327,11 @@ unsafe extern "C" fn se_slot_items(l: *mut LuaState) -> c_int {
         Ok(s)
     })();
     match out {
-        Ok(s) => { log!("se_slot_items:\n{s}"); lua::push_str(l, &s); }
+        Ok(s) => {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if crate::chatty(&N, 2) { log!("se_slot_items:\n{s}"); }
+            lua::push_str(l, &s);
+        }
         Err(er) => { log!("se_slot_items: {er}"); lua::push_str(l, &format!("error: {er}")); }
     }
     1
