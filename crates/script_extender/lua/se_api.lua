@@ -2150,7 +2150,7 @@ local function faction_money(faction_key)
 end
 
 -- se.ai_recruit.plan(faction_key [, money]) -> orders, info        (changes nothing)
---   orders = { { op = "recruit" | "replace", force, character, slot, unit, cost, old, score,
+--   orders = { { op = "recruit" | "replace", force, character, general (element), slot, unit, cost, old, score,
 --   old_score, gain } } sorted by gain, already cut to the budget and the per-turn caps.
 --   money = { treasury, income } overrides the faction's own numbers (tests, what-if).
 function se.ai_recruit.plan(faction_key, money)
@@ -2204,7 +2204,7 @@ function se.ai_recruit.plan(faction_key, money)
 								end
 							end
 							if best and (empty or best.score >= old_score * cfg.min_gain) then
-								candidates[#candidates + 1] = { op = empty and "recruit" or "replace", force = force.cqi, character = ch.cqi, slot = s.index,
+								candidates[#candidates + 1] = { op = empty and "recruit" or "replace", force = force.cqi, character = ch.cqi, slot = s.index, general = ch.element,
 									unit = best.unit, cost = best.cost, old = (not empty) and s.unit_key or nil, score = best.score, old_score = old_score,
 									gain = empty and best.score or (best.score / old_score) }
 							end
@@ -2255,7 +2255,7 @@ function se.ai_recruit.execute(orders)
 		end
 		if ok then done = done + 1 else failed = failed + 1 end
 		if se.ai_recruit.config.log_orders then
-			log(string.format("ai_recruit %s: char %s slot %s %s%s (cost %s, score %.0f%s) -> %s %s", str(o.op), str(o.character), str(o.slot),
+			log(string.format("ai_recruit %s: char %s (%s general) slot %s %s%s (cost %s, score %.0f%s) -> %s %s", str(o.op), str(o.character), str(o.general or "?"), str(o.slot),
 				o.old and (o.old .. " -> ") or "", str(o.unit), str(o.cost), o.score or 0, o.old and string.format(", was %.0f, x%.2f", o.old_score or 0, o.gain or 0) or "", str(ok), str(msg or "")))
 		end
 	end
