@@ -5,7 +5,8 @@
 --   se.version()                       DLL version string
 --   se.available(native_name)          true when a se_* native exists in this state
 --   se.query.*                         read-only, return plain values / tables or nil, message
---   se.modify.*                        mutate; refuse in multiplayer; run on the model thread;
+--   se.modify.*                        mutate; run on the model thread (multiplayer: only inside
+--                                      model callbacks, never queued, see on_model);
 --                                      return ok, message (ok = true means queued or done)
 --
 -- Lua 5.1. Every engine call is pcall-guarded because null interfaces answer any method with
@@ -76,9 +77,16 @@ end
 local function on_model(what, f, cb)
 	local cm, err = cm_()
 	if not cm then return false, err end
+	-- Multiplayer campaigns are lockstep: a change has to happen on every machine at the same
+	-- model tick. Inside a model callback (event listeners, first tick, turn start ...) the same
+	-- script runs everywhere, so the call is executed. Outside of one (UI clicks, the console,
+	-- timers) only this machine would change its model, so the call is refused instead of
+	-- being queued (wait_for_model_sp is single-player only).
 	local ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
-	if ok_mp and mp == true then return false, "refused: multiplayer campaign" end
 	local ok_can, can = pcall(function() return cm:can_modify() end)
+	if ok_mp and mp == true and not (ok_can and can == true) then
+		return false, "refused in multiplayer: " .. what .. " was called outside a model callback (it would only run on this machine and desync)"
+	end
 	if ok_can and can == true then
 		local ok, msg = f()
 		log(what .. " -> " .. str(ok) .. " : " .. str(msg))
@@ -1360,9 +1368,9 @@ local function ar_vars_listener()
 	-- The engine rebuilds the variable array when its per-round overrides change; put the
 	-- script's values back at the start of every turn of the local player.
 	core:add_listener("se_ar_vars", "FactionTurnStart", true, function(context)
+		-- every faction's turn start, on every machine alike (multiplayer-safe)
 		local okf, fkey = pcall(function() return context:faction():name() end)
-		local cm = cm_()
-		if not okf or not cm or fkey ~= cm:get_local_faction() then return end
+		if not okf then return end
 		local f = se.faction(fkey)
 		if not f then return end
 		for k, v in pairs(se._ar_vars) do se_ar_variable_set(f, k, v) end
@@ -1464,6 +1472,10 @@ function se.query.pending_battle()
 	ctx.attacker.strength = num(try(pb, "attacker_strength"))
 	ctx.defender.strength = num(try(pb, "defender_strength"))
 	ctx.local_player_involved = ctx.attacker.is_local_player == true or ctx.defender.is_local_player == true
+	-- deterministic seed for chance-based rules: identical on every machine of a multiplayer game
+	local okt, turn = pcall(function() return cm:query_model():turn_number() end)
+	local af, df = ctx.attacker.forces[1], ctx.defender.forces[1]
+	ctx.seed = ((okt and num(turn) or 0) * 7919 + (af and af.cqi or 0) * 104729 + (df and df.cqi or 0) * 1299709) % 16777213
 	ctx.prediction = se.query.autoresolve_prediction()
 	return ctx
 end
@@ -1496,7 +1508,7 @@ end
 -- plan -> "k=v;..." for the DLL. Values are clamped here (bias 0.1-10, scales and chances 0-1).
 local function encode_plan(plan, ctx)
 	if type(plan) ~= "table" then return nil, "plan must be a table" end
-	local parts = { "v=1" }
+	local parts = { "v=1", "seed=" .. str(ctx and ctx.seed or 0) }
 	local function put(k, v) if v ~= nil then parts[#parts + 1] = k .. "=" .. str(v) end end
 	local af = ctx and ctx.attacker and ctx.attacker.forces[1]
 	local df = ctx and ctx.defender and ctx.defender.forces[1]
@@ -1551,10 +1563,8 @@ function se.modify.autoresolve_plan(plan, ctx)
 	if not okn then return false, err end
 	local cm, e0 = cm_()
 	if not cm then return false, e0 end
-	local ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
-	if ok_mp and mp == true then return false, "refused: multiplayer campaign" end
 	ctx = ctx or se.query.pending_battle()
-	if not ctx or not ctx.local_player_involved then return false, "refused: no pending battle with the local player" end
+	if not ctx or not ctx.human_involved then return false, "refused: no pending battle with a human player" end
 	local spec, e1 = encode_plan(plan, ctx)
 	if not spec then return false, e1 end
 	se._ar_plan = plan
@@ -1585,7 +1595,7 @@ function se.query.autoresolve_plan()
 end
 
 -- se.autoresolve.set_handler(function(ctx) return plan_or_nil end)
---   Called on every PendingBattle that involves the local player (single-player only), with
+--   Called on every PendingBattle that involves a human player, on every machine, with
 --   the table of se.query.pending_battle(). Return a plan table to steer that auto-resolve, or
 --   nil for vanilla behaviour. The plan is dropped again on BattleCompleted.
 function se.autoresolve.set_handler(fn)
@@ -1600,7 +1610,9 @@ function se.autoresolve.set_handler(fn)
 		if type(h) ~= "function" then return end
 		pcall(se.modify.autoresolve_plan_clear)
 		local ctx = se.query.pending_battle()
-		if not ctx or not ctx.local_player_involved then return end
+		-- human_involved is the same on every machine; is_local_player is NOT, so a handler
+		-- used in multiplayer must never branch on it (use is_human / faction keys instead)
+		if not ctx or not ctx.human_involved then return end
 		local okh, plan = pcall(h, ctx)
 		if not okh then log("autoresolve handler error: " .. str(plan)) return end
 		if plan == nil then log("autoresolve handler: vanilla (nil plan)") return end

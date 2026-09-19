@@ -27,18 +27,35 @@ A native DLL injected into the running `Three_Kingdoms.exe`. It:
 The natives (`se_recruit_unit`, `se_slot_construct`, ...) are internal. **Scripts use the `se`
 module only.**
 
-### Single player only
+### Multiplayer (DLL 0.30+)
 
-Every `se.modify.*` call that touches campaign state runs through a helper that refuses when
-`cm:is_multiplayer()` is true:
+Campaign multiplayer is lockstep: every machine runs the same scripts and must make the same
+change at the same model tick. The API follows three rules so that it can be used there:
 
-```
-false, "refused: multiplayer campaign"
-```
+1. **`se.modify.*` runs only inside a model callback in multiplayer** (event listeners,
+   first tick, turn start, dilemma choices: anything where `cm:can_modify()` is true). Called
+   from a UI click, a timer or the in-game console it returns
+   `false, "refused in multiplayer: ... called outside a model callback ..."` instead of being
+   queued: only that machine would change its model and the game would desync. In single player
+   such calls are still queued through `cm:wait_for_model_sp`.
+2. **Nothing a synced script does may depend on which machine it runs on.** Do not branch on
+   `cm:get_local_faction()` or on `ctx.*.is_local_player` in code that ends in a modify call;
+   use `is_human` and faction keys. The auto-resolve handler is called for every battle with a
+   human player, on every machine, and chance-based duel rules are seeded from `ctx.seed`
+   (turn number and force cqis), never from anything machine-specific. Do not use `math.random`
+   or `os.time` to decide a change; use the model's own random functions.
+3. **Both machines must run the same script extender with the same simulation settings.** The
+   DLL enforces this through the game's build string, which the multiplayer lobby compares:
+   it always ends up containing the DLL version and a fingerprint of `autoresolve_hooks`,
+   `horde_income` and `horde_income_category` (`script_extender.cfg` text may use `{version}`
+   and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
+   own string is extended; `se.modify.build_number` cannot remove it). A player without the
+   DLL, with another DLL version or with different hook settings shows a different build and
+   cannot join. This relies on the lobby's version check using that string: **not verified on
+   two machines yet.**
 
-The three exceptions are `se.modify.build_number` (a UI string inside the process, not campaign
-state), `se.modify.autoresolve_plan_clear` (drops a stored plan) and `se.modify.faction_income`
-(pure script-side bookkeeping); `se.modify.autoresolve_plan` performs its own multiplayer check.
+Session-only state (auto-resolver variables, redefined bundles, income lines, emperor policy)
+has to be re-applied by the mod after loading, from a callback that runs on every machine.
 
 Saves made after using `se.modify.*` carry the results — they are ordinary engine state, and the
 DLL is not required to load such a save, only to keep using the API.
@@ -815,7 +832,7 @@ Three separate mechanisms, in increasing order of intrusiveness:
 2. **Read-out** — the pending battle's context and the engine's prediction.
 3. **Plans** — a per-battle instruction the DLL applies to the freshly computed result.
 
-Everything here is single-player only and applies to battles the local player is involved in.
+Everything here applies to battles a human player is involved in (every machine of a multiplayer game evaluates the same handler; see the multiplayer rules).
 
 #### What each DLL version actually applies
 
@@ -1255,7 +1272,7 @@ end)
 | Message | Meaning |
 |---|---|
 | `native se_x is not available (DLL too old or not injected)` | this DLL predates the feature; gate with `se.available` |
-| `refused: multiplayer campaign` | `se.modify.*` is single-player only by design |
+| `refused in multiplayer: ... called outside a model callback` | multiplayer is lockstep: call `se.modify.*` from an event listener / turn-start callback that runs on every machine, not from UI code or the console |
 | `campaign manager (cm) is not available in this Lua state` | called from a state with no `cm` (for example the frontend) |
 | `core (event manager) is not available: set se.core = core ...` | assign `se.core = core` before `emperor_policy`, `faction_income`, `autoresolver_variable` or `set_handler` |
 | `<tag> queued on the model thread (result in the log / callback)` | not an error: the real result is in the log |

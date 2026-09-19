@@ -118,12 +118,19 @@ pub unsafe fn apply(build: &str, short: &str, modified: Option<bool>) -> Result<
     if build.len() > 200 || short.len() > 200 {
         return Err("build strings must be at most 200 characters".into());
     }
-    if !build.is_empty() {
-        assign(e, before.core + OFF_BUILD, build);
+    // The version lock is enforced here, so neither the cfg nor a script can set a build string
+    // without it: "" / "{game}" keep the current text, everything ends up version-locked.
+    let lock = |current: &str, text: &str| -> String {
+        let base = if text.is_empty() || text == "{game}" { current } else { text };
+        let base = match base.rfind(" [se ") { Some(i) if base.ends_with(']') => &base[..i], _ => base };
+        version_locked(base)
+    };
+    let (build, short) = (lock(&before.build, build), lock(&before.short, short));
+    if build.len() > 250 || short.len() > 250 {
+        return Err("build strings are too long".into());
     }
-    if !short.is_empty() {
-        assign(e, before.core + OFF_BUILD_SHORT, short);
-    }
+    assign(e, before.core + OFF_BUILD, &build);
+    assign(e, before.core + OFF_BUILD_SHORT, &short);
     if let Some(m) = modified {
         core::ptr::write_unaligned((before.core + OFF_MODIFIED) as *mut u8, m as u8);
     }
@@ -159,11 +166,33 @@ pub fn config_value(key: &str) -> Option<String> {
 /// Called from the bootstrap thread. The manager injects seconds after launch, before the game
 /// has composed its build strings, so the apply is retried in a background thread until
 /// GameCore holds plausible text (then done once), giving up after two minutes.
+/// Version lock for multiplayer: the game build string always carries the DLL version and a
+/// fingerprint of every setting that changes the simulation, so two machines only see the same
+/// build when they run the same script extender with the same simulation settings.
+/// `{version}` / `{sync}` in the cfg text are replaced; text without `{version}` gets
+/// " [se <version>.<sync>]" appended; without any cfg text the game's own string is extended.
+pub fn sync_tag() -> String {
+    let mut h: u32 = 0x811c9dc5;
+    let mut feed = |s: &str| for b in s.bytes() { h ^= b as u32; h = h.wrapping_mul(0x01000193); };
+    feed(env!("CARGO_PKG_VERSION"));
+    for key in ["autoresolve_hooks", "horde_income", "horde_income_category"] {
+        feed(key);
+        feed(&config_value(key).unwrap_or_default());
+    }
+    format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
+}
+
+fn version_locked(text: &str) -> String {
+    let (version, sync) = (env!("CARGO_PKG_VERSION"), sync_tag());
+    if text.contains("{version}") {
+        text.replace("{version}", version).replace("{sync}", &sync)
+    } else {
+        format!("{text} [se {version}.{sync}]")
+    }
+}
+
 pub fn apply_config() {
-    let Some((path, text)) = config_text() else {
-        log!("no script_extender.cfg next to the DLL or in its parent folder (build number left alone)");
-        return;
-    };
+    let (path, text) = config_text().unwrap_or_else(|| (std::path::PathBuf::from("(no script_extender.cfg)"), String::new()));
     let (mut build, mut short, mut modified) = (String::new(), String::new(), None);
     for line in text.lines() {
         let line = line.trim();
@@ -181,10 +210,11 @@ pub fn apply_config() {
             }
         }
     }
-    if build.is_empty() && short.is_empty() && modified.is_none() {
-        log!("config at {} sets nothing", path.display());
-        return;
-    }
+    // Always applied, cfg or not: the version lock.
+    if build.is_empty() { build = "{game}".to_string(); }
+    if short.is_empty() { short = "{game}".to_string(); }
+    if modified.is_none() { modified = Some(true); }
+    log!("version lock: se {} sync {}", env!("CARGO_PKG_VERSION"), sync_tag());
     log!("config at {}: build='{}' short='{}' modified={:?}; waiting for GameCore", path.display(), build, short, modified);
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);

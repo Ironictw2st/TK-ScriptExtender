@@ -1,7 +1,7 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current DLL: **0.26.2**, `Z:\RE\se_deploy\0.26.2\`
+(Steam build 25370317) unless marked otherwise. Current DLL: **0.30.0**, `Z:\RE\se_deploy\0.26.2\`
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -19,7 +19,7 @@ A native DLL injected into the running `Three_Kingdoms.exe` that:
    `se.modify.*` API (`src/hook.rs`);
 3. exposes named, high-level operations only (no generic peek/poke/call to Lua).
 
-Single-player only by design (`se.modify.*` refuses when `cm:is_multiplayer()` is true).
+**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (lobby check not yet verified on two machines). The manager must give both players the same DLL version and the same `autoresolve_hooks` / `horde_income*` cfg values.
 Saves that used `se.modify.*` carry the results (they are ordinary engine state); the DLL is
 not needed to load them, only to keep using the API.
 

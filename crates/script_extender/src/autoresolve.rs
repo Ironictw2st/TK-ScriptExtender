@@ -668,6 +668,10 @@ unsafe fn apply_duels(pb: usize, res: usize, spec: &str) -> Result<String, Strin
         return Err(format!("duel vector not plausible (cap {cap}, count {count}, data {:#x})", data));
     }
     let before = count;
+    // The roll is seeded from the plan (turn + force cqis), never from an address: both machines
+    // of a multiplayer game have to pick the same winner.
+    let _ = pb;
+    let seed = plan_value(spec, "seed").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as usize;
     let rule_for = |x: u32, y: u32| rules.iter().find(|r| (r.a == x && r.b == y) || (r.a == y && r.b == x));
     let mut report = Vec::new();
     // 1. removals: forbidden pairs, and everything without a rule when the default is "none"
@@ -681,7 +685,7 @@ unsafe fn apply_duels(pb: usize, res: usize, spec: &str) -> Result<String, Strin
     // 2. winners of the duels that stay, 3. forced duels the engine did not roll
     for r in rules.iter().filter(|r| r.happen) {
         let desired = if r.winner == r.a as i64 || r.winner == r.b as i64 { r.winner as u32 }
-            else if r.win_chance >= 0.0 { if pair_roll(pb, r.a, r.b) < r.win_chance { r.a } else { r.b } }
+            else if r.win_chance >= 0.0 { if pair_roll(seed, r.a, r.b) < r.win_chance { r.a } else { r.b } }
             else { 0 };
         let n = rd(res + 0x2c) as usize;
         let found = (0..n).map(|k| rq(res + 0x30) + k * DUEL_STRIDE).find(|rec| {
