@@ -803,6 +803,41 @@ stored.
 
 ---
 
+### 3.12a Horde income (DLL 0.28+, hook optional)
+
+`gdp_abs` effects (bonus value `region_gdp`) only reach the treasury through regions. With
+`horde_income=1` in `script_extender.cfg` the DLL hooks the engine routine that recomputes a
+faction's income categories and adds, 1:1, every `gdp_abs` value found on the **faction itself**
+(scopes such as `faction_to_faction_own`) and on **each military force it owns**
+(`force_to_force_own`, what horde building bundles use). `gdp_mod` values are ignored.
+`horde_income_category` selects the category: `0` TAXES, `1` MINING, `2` TRADE,
+`3` MILITARY_FORCE. **MINING is unused in 3K** (never computed, no row in the stock treasury
+panel, but part of the totals), so a UI mod can show it as its own line: bind a treasury row to
+`CcoFactionEconomy` / `VaryingRegIncomeDetailsSum("MINING")` and label it with
+`Loc("<your key>")` (= `campaign_localised_strings_string_<your key>`), which other mods can
+translate. Both settings are part of the multiplayer version lock. Verified live on 0.28.3 /
+0.29.1 (a 150 `gdp_abs` army bundle raised `projected_net_income` by 150); receiving it at turn
+end and a region-less faction are not yet confirmed.
+
+#### `se.query.horde_income_hook()` (0.30.1+)
+
+Returns `{ enabled = boolean, category = 0..3, category_name = "TAXES" | "MINING" | "TRADE" |
+"MILITARY_FORCE" }`, or `nil, message` on an older DLL. `enabled` is the state of the detour in
+this process (cfg flag set and the hook installed), not the cfg text. Read-only, no model
+access, usable anywhere.
+
+```lua
+local h = se.query.horde_income_hook()
+if not (h and h.enabled and h.category == 1) then
+	ModLog("horde income needs script_extender.cfg: horde_income=1, horde_income_category=1")
+end
+```
+
+#### `se.query.faction_force_gdp(faction_key)` (0.28+)
+
+Returns `{ total = number, entries = string }`: the `gdp_abs` total the hook would add for that
+faction and one line per contributing entry (`faction` or `force[i]`). Works with the hook off.
+
 ### 3.13 Menu build number
 
 The main menu's build-number strings. Process-local UI state, not campaign state: **no model
@@ -1382,6 +1417,8 @@ reporting.
 | `se.query.effect_bundle(bundle [, faction])` | engine dump of a bundle record |
 | `se.query.faction(key)` | progression level, world-leader state, seats |
 | `se.query.faction_effect_value(faction, effect_id)` | faction-level value of an effect id |
+| `se.query.faction_force_gdp(faction_key)` | gdp_abs total on the faction and its armies (what the horde income hook adds) |
+| `se.query.horde_income_hook()` | whether the horde income hook is installed, and its income category |
 | `se.query.faction_income(faction)` | script-side income lines and their total |
 | `se.query.faction_potential(key)` | potential value, base, bonus, roll |
 | `se.query.faction_xp_gain_percent(key)` | faction character-experience-gain percentage |

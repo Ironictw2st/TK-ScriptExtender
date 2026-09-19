@@ -23,6 +23,7 @@
 //! `VaryingRegIncomeDetailsSum("MINING")` and its own `Loc("...")` label.
 //!
 //! se_faction_gdp_bonus(q_faction) -> sum, dump:string | nil, msg   (works without the hook)
+//! se_horde_income_hook() -> enabled, category                        (state of the detour)
 
 use crate::addrs::Table;
 use crate::log;
@@ -251,6 +252,18 @@ pub fn install(t: &Table) {
 
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_faction_gdp_bonus", se_faction_gdp_bonus);
+    lua::set_global_fn(l, "se_horde_income_hook", se_horde_income_hook);
+}
+
+/// se_horde_income_hook() -> enabled:boolean, category:integer
+/// State of the detour itself (HOOK is only set once the hook is installed and enabled), not of
+/// the cfg text, plus the income category it writes to (0 TAXES, 1 MINING, 2 TRADE,
+/// 3 MILITARY_FORCE).
+unsafe extern "C" fn se_horde_income_hook(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    (api.pushboolean)(l, HOOK.get().is_some() as c_int);
+    (api.pushinteger)(l, CATEGORY.load(std::sync::atomic::Ordering::Relaxed) as isize);
+    2
 }
 
 unsafe extern "C" fn se_faction_gdp_bonus(l: *mut LuaState) -> c_int {

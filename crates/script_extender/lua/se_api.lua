@@ -1297,6 +1297,21 @@ function se.modify.attitude(a, b, level)
 	end)
 end
 
+-- se.query.horde_income_hook() -> { enabled = boolean, category = 0..3, category_name = string }
+--   | nil, message
+--   Whether the DLL's horde income hook is actually installed in this process (cfg
+--   horde_income=1 and the detour went in) and which income category receives the gdp_abs
+--   total: 0 TAXES, 1 MINING (unused in 3K, the own-line route), 2 TRADE, 3 MILITARY_FORCE.
+--   Read-only, no model access, safe anywhere (also in multiplayer).
+local HORDE_CATEGORIES = { [0] = "TAXES", [1] = "MINING", [2] = "TRADE", [3] = "MILITARY_FORCE" }
+function se.query.horde_income_hook()
+	local okn, err = need("se_horde_income_hook")
+	if not okn then return nil, err end
+	local enabled, category = se_horde_income_hook()
+	category = num(category) or 0
+	return { enabled = enabled == true, category = category, category_name = HORDE_CATEGORIES[category] or "?" }
+end
+
 -- se.query.faction_force_gdp(faction_key) -> { total = n, entries = "..." } | nil, message
 --   Sum of the gdp_abs ("region_gdp") values that effects put on the FACTION itself (scopes
 --   force_to_faction_own*, faction_to_faction_own) or on its MILITARY FORCES (force_to_force_own,
