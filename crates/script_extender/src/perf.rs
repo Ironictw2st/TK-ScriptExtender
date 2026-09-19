@@ -13,11 +13,10 @@
 //! Only those UI callers are served from the cache (a thread-local depth counter is raised while
 //! one of the two getters runs); the campaign AI and every other caller always get the engine's
 //! own computation, so the simulation is untouched and nothing here belongs in the multiplayer
-//! sync tag. An entry is served while no change of the UI's command buffer has been observed
-//! (player actions) and for at most `ui_recruit_cache_ms` (script_extender.cfg, default 5000,
-//! 0 = off), which bounds how long the panel can lag behind anything else; commands still
-//! validate on the model. (0.32.0 used a bare 250 ms time-to-live: the UI re-queries a slot when
-//! a panel is (re)built, seconds apart, so only 9% of the queries hit.)
+//! sync tag. An entry is served while the owning faction's treasury and the turn number are
+//! unchanged (`state_stamp`) and for at most `ui_recruit_cache_ms` (script_extender.cfg, default
+//! 5000, 0 = off), which bounds how long the panel can lag behind anything else (a disband, a
+//! free recruitment, a script change); commands still validate on the model.
 //!
 //! Item = 0x98 bytes, vtable RVA 0x349c220 (the same class `recruit.rs` reads): +8 record,
 //! +0x10 cost, +0x14 turns, +0x18, +0x1c, +0x20 vector of 16-byte PODs, +0x30 u32, +0x38 u8,
@@ -54,30 +53,28 @@ struct Engine {
     base: usize,
 }
 
-struct Entry { at: Instant, generation: u32, items: Vec<usize> }
+struct Entry { at: Instant, generation: u64, ident: usize, items: Vec<usize> }
 
-/// Player actions reach the model as commands serialised into a byte buffer owned by
-/// `*(*(ui + 0x2188) + 0x80)` (ui = the global at RVA 0x43cfa50 the CCO code uses, e.g.
-/// CcoCampaignBattle.AutoResolve); its senders (FUN_142e6eab0 and template siblings) advance the
-/// write offset at owner+0x5008, and a flush rewinds it. The offset is therefore not monotonic:
-/// every observed CHANGE bumps our own epoch, and a cached list is only served within the epoch
-/// it was built in. A write and flush between two observations can be missed, which is why the
-/// time-to-live stays in place as the upper bound on staleness. Returns 0 when unavailable.
-const RVA_UI_ROOT: usize = 0x43cfa50;
-static LAST_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
-static EPOCH: AtomicU64 = AtomicU64::new(1);
-unsafe fn command_generation(base: usize) -> u32 {
-    let ui = rq(base + RVA_UI_ROOT);
-    if !readable(ui + 0x2188, 8) { return 0; }
-    let owner = rq(ui + 0x2188);
-    if !readable(owner + 0x80, 8) { return 0; }
-    let queue = rq(owner + 0x80);
-    if !readable(queue + 0x5008, 4) { return 0; }
-    let offset = rd(queue + 0x5008) as u64;
-    if LAST_OFFSET.swap(offset, Ordering::Relaxed) != offset {
-        EPOCH.fetch_add(1, Ordering::Relaxed);
-    }
-    (EPOCH.load(Ordering::Relaxed) & 0x7fff_ffff) as u32 | 1 << 31 // never 0 when available
+/// State stamp of a query: the owning faction's treasury and the turn number. Those are what a
+/// recruitment changes (cost) and what a new turn changes; selection / camera commands, which
+/// made a command-buffer based invalidation useless (0.32.1: every panel open invalidated
+/// everything), do not touch them. Chain, from FUN_141934b40: character =
+/// `*(*(*(iface+8)+0x48)+0x48)`, details = `**(character+0x260)`, owner = `**(details+0x68)`,
+/// faction = `**(owner+0x270)` (checked by its progression back-pointer at +0x2290), treasury =
+/// i32 at faction+0x2a8+0x880 (FUN_141461c80), turn = `*(*(world+0x3b78)+0x5c)`.
+/// Returns 0 when any link is missing (then only a 250 ms time-to-live is used).
+unsafe fn state_stamp(iface: usize) -> u64 {
+    let ptr = |p: usize, off: usize| -> usize { if p != 0 && readable(p + off, 8) { rq(p + off) } else { 0 } };
+    let character = ptr(ptr(ptr(iface, 8), 0x48), 0x48);
+    let details = ptr(ptr(character, 0x260), 0);
+    let owner = ptr(ptr(details, 0x68), 0);
+    let faction = ptr(ptr(owner, 0x270), 0);
+    if faction == 0 || !readable(faction, 0x2298) || rq(faction + 0x2290) != faction { return 0; }
+    let treasury = rd(faction + 0x2a8 + 0x880) as u64;
+    let world = ptr(ptr(faction, 0x288), 0x78);
+    let turn_obj = ptr(world, 0x3b78);
+    let turn = if turn_obj != 0 && readable(turn_obj + 0x5c, 4) { rd(turn_obj + 0x5c) as u64 } else { 0 };
+    (turn << 32 | treasury) | 1 << 63 // never 0 when available
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
@@ -90,6 +87,12 @@ static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static PASSED: AtomicU64 = AtomicU64::new(0);
+// why a query missed: never seen, time-to-live over, state stamp / slot identity changed, and
+// how often the stamp chain could not be followed
+static MISS_NEW: AtomicU64 = AtomicU64::new(0);
+static MISS_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static MISS_STATE: AtomicU64 = AtomicU64::new(0);
+static STAMP_FAILED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static UI_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -181,15 +184,21 @@ unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8
     let key = (iface as usize, flag);
     let vec = out as usize;
     let now = Instant::now();
-    let generation = command_generation(e.base);
-    LAST_GENERATION.store(generation as u64, Ordering::Relaxed);
-    // without the command counter only a short time-to-live is safe
-    let ttl = if generation == 0 { ttl.min(250) } else { ttl };
+    let generation = state_stamp(iface as usize);
+    LAST_GENERATION.store(generation & 0xffff_ffff, Ordering::Relaxed);
+    // without the state stamp only a short time-to-live is safe
+    let ttl = if generation == 0 { STAMP_FAILED.fetch_add(1, Ordering::Relaxed); ttl.min(250) } else { ttl };
+    // the interface address is the key; what it points at guards against an address reused by
+    // another slot's interface
+    let ident = if readable(iface as usize + 8, 8) { rq(iface as usize + 8) } else { 0 };
     // hit: hand out clones
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
-        if let Some(entry) = map.get(&key) {
-            if entry.generation == generation && now.duration_since(entry.at) < Duration::from_millis(ttl) {
+        match map.get(&key) {
+            None => { MISS_NEW.fetch_add(1, Ordering::Relaxed); }
+            Some(entry) if entry.generation != generation || entry.ident != ident => { MISS_STATE.fetch_add(1, Ordering::Relaxed); }
+            Some(entry) if now.duration_since(entry.at) >= Duration::from_millis(ttl) => { MISS_EXPIRED.fetch_add(1, Ordering::Relaxed); }
+            Some(entry) => {
                 let mut ok = true;
                 for item in &entry.items {
                     match clone_item(e, *item) {
@@ -225,7 +234,7 @@ unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8
             for k in old { if let Some(v) = map.remove(&k) { for c in v.items { delete_item(c); } } }
             if map.len() >= MAX_ENTRIES { for c in clones { delete_item(c); } return; }
         }
-        if let Some(v) = map.insert(key, Entry { at: now, generation, items: clones }) { for c in v.items { delete_item(c); } }
+        if let Some(v) = map.insert(key, Entry { at: now, generation, ident, items: clones }) { for c in v.items { delete_item(c); } }
     }
 }
 
@@ -273,8 +282,9 @@ pub unsafe fn register(l: *mut LuaState) {
 /// se_perf_stats() -> "k=v;..." counters of the UI recruit cache
 unsafe extern "C" fn se_perf_stats(l: *mut LuaState) -> c_int {
     let entries = CACHE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    let s = format!("installed={};ttl_ms={};command_counter={};hits={};misses={};passed_through={};entries={entries}",
-        BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed));
+    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={}",
+        BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed),
+        MISS_NEW.load(Ordering::Relaxed), MISS_EXPIRED.load(Ordering::Relaxed), MISS_STATE.load(Ordering::Relaxed), STAMP_FAILED.load(Ordering::Relaxed));
     lua::push_str(l, &s);
     1
 }

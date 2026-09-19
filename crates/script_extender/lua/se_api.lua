@@ -1651,7 +1651,7 @@ end
 
 se.profile = se.profile or {}
 
--- se.query.perf() -> { installed, ttl_ms, hits, misses, passed_through, entries }
+-- se.query.perf() -> { installed, ttl_ms, hits, misses, passed_through, entries, miss_new, miss_expired, miss_state, stamp_failed }
 --   Counters of the UI recruit-list cache (script_extender.cfg: ui_recruit_cache_ms, default
 --   250, 0 = off). hits = UI queries answered from the cache, misses = UI queries the engine
 --   computed, passed_through = calls from the AI and other non-UI callers (never cached).
