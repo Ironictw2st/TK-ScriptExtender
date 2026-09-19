@@ -35,6 +35,8 @@ const GDP_TYPES: [&str; 22] = [
     "spice", "subsistence",
 ];
 const ID_REGION_GDP: u32 = 0;
+const KIND_REGION_GDP_TYPE: u32 = 31;
+const RVA_GDP_TYPE_RECORD_VTABLE: usize = 0x32f54f0;
 
 type UpdateIncome = unsafe extern "C" fn(*mut c_void, u32);
 type EffectCtx = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
@@ -166,7 +168,12 @@ unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>
         if DIAG.load(std::sync::atomic::Ordering::Relaxed) && with_record <= 60 {
             log!("    entry kind {} id {} record {:#x} key '{}' raw {:#010x} words {:016x} {:016x}", (rd(en) >> 16) & 0xff, rd(en) & 0xffff, rec, key, rd(en + 4), rq(rec), rq(rec + 8));
         }
-        if !GDP_TYPES.contains(&key.as_str()) { continue; }
+        // A GDP type record: bonus kind 31 and the campaign_region_gdp_types record class
+        // (vtable RVA 0x32f54f0). Its key is not at the usual +8, so the class identifies it
+        // (seen live: gdp_abs_banditry 150 -> kind 31, id 0, f32 150.0).
+        let (base, _) = crate::process::main_module();
+        if ((rd(en) >> 16) & 0xff) != KIND_REGION_GDP_TYPE { continue; }
+        if rq(rec).wrapping_sub(base) != RVA_GDP_TYPE_RECORD_VTABLE && !GDP_TYPES.contains(&key.as_str()) { continue; }
         let (id, kind, v) = (rd(en) & 0xffff, (rd(en) >> 16) & 0xff, entry_value(rd(en + 4)));
         rows.push(format!("{who}: kind {kind} id {id} {key} = {v} (raw {:#010x})", rd(en + 4)));
         if id == ID_REGION_GDP { sum += v; }
