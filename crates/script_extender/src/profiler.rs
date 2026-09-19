@@ -11,7 +11,7 @@
 //! outside the exe (system DLLs, drivers) are skipped by scanning up to the first return address
 //! into the exe that follows a call instruction.
 //!
-//! Output next to the DLL:
+//! Output in `<dll folder>\..\profiles\` (kept when the mod manager removes old version folders):
 //!   profile_<label>.txt         per thread: self % and inclusive % per function (Ghidra addresses)
 //!   profile_<label>.folded.txt  folded call stacks `thread;root;...;leaf count` (flame-graph input,
 //!                               read by tools/profile_tree.py)
@@ -372,7 +372,12 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
         format!("t{};{} {}", tid, names.join(";"), c)
     }).collect();
     lines.sort();
-    let dir = crate::process::self_dir();
+    // The mod manager deletes old version folders (the 0.31.2 reports were lost that way), so
+    // reports go to <dll folder>\..\profiles when the DLL sits in a version folder.
+    let dir = crate::process::self_dir().map(|d| {
+        let target = d.parent().map(|p| p.join("profiles")).unwrap_or_else(|| d.clone());
+        if std::fs::create_dir_all(&target).is_ok() { target } else { d }
+    });
     for (name, text) in [(format!("profile_{label}.txt"), report), (format!("profile_{label}.folded.txt"), lines.join("\n"))] {
         match dir.as_ref().map(|d| d.join(&name)) {
             Some(p) => match std::fs::write(&p, text) {
