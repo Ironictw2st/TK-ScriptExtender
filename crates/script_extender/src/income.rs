@@ -94,20 +94,23 @@ fn entry_value(bits: u32) -> f32 {
 /// force+0x698, FUN_14140c700). A force is only read when its owner is this faction and its
 /// +0x18 sub-object has the same vtable as the faction's effect holder.
 unsafe fn faction_gdp_bonus(faction: usize) -> Result<(f32, Vec<String>), String> {
-    let (mut sum, mut rows) = holder_gdp_bonus(faction, "faction")?;
+    let (mut sum, mut rows) = holder_gdp_bonus(faction + 0x18, "faction")?;
     let (n, arr) = (rd(faction + 0xdfc) as usize, rq(faction + 0xe00));
     if n > 0 && n <= 256 && readable(arr, n * 8) {
         let holder_vt = rq(faction + 0x18);
         for i in 0..n {
             let force = rq(rq(arr + i * 8));
             if force == 0 || !readable(force, 0x6a0) { continue; }
-            if rq(rq(force + 0xd8)) != faction || rq(force + 0x18) != holder_vt {
+            let _ = holder_vt; // the force's holder is a sibling class with its own vtable
+            // the engine passes holders at +0x18 (most types) or +0x60
+            let off = [0x18usize, 0x60].into_iter().find(|o| holder_looks_valid(force + o));
+            let (true, Some(off)) = (rq(rq(force + 0xd8)) == faction, off) else {
                 if DIAG.load(std::sync::atomic::Ordering::Relaxed) {
-                    log!("    force[{i}] {:#x} skipped: owner {:#x}, holder vtable {:#x} (faction's {:#x})", force, rq(rq(force + 0xd8)), rq(force + 0x18), holder_vt);
+                    log!("    force[{i}] {:#x} skipped: owner {:#x}, valid holder offset: {:?}", force, rq(rq(force + 0xd8)), off);
                 }
                 continue;
-            }
-            if let Ok((s, r)) = holder_gdp_bonus(force, &format!("force[{i}]")) {
+            };
+            if let Ok((s, r)) = holder_gdp_bonus(force + off, &format!("force[{i}]+{off:#x}")) {
                 sum += s;
                 rows.extend(r);
             }
@@ -116,10 +119,37 @@ unsafe fn faction_gdp_bonus(faction: usize) -> Result<(f32, Vec<String>), String
     Ok((sum, rows))
 }
 
+/// Structural check of an effect holder before the engine getter is called on it
+/// (FUN_141415530: +0x39 dirty byte, +0x2c source count, +0x30 sources {ptr, u32 version},
+/// values vector at +8 {cap, count @+0xc, data @+0x10} of 0x18-byte entries sorted by
+/// (kind, id, record)).
+unsafe fn holder_looks_valid(h: usize) -> bool {
+    let (base, size) = crate::process::main_module();
+    if !readable(h, 0x40) { return false; }
+    let vt = rq(h);
+    if vt < base || vt >= base + size { return false; }
+    let (sources, sdata) = (rd(h + 0x2c) as usize, rq(h + 0x30));
+    if sources > 256 || (sources > 0 && !readable(sdata, sources * 0x10)) { return false; }
+    for k in 0..sources {
+        if !readable(rq(sdata + k * 0x10), 8) { return false; }
+    }
+    let (cap, count, data) = (rd(h + 8) as usize, rd(h + 0xc) as usize, rq(h + 0x10));
+    if count > cap || cap > 20_000 || (count > 0 && !readable(data, count * 0x18)) { return false; }
+    let mut prev = (0u32, 0u32);
+    for k in 0..count {
+        let w = rd(data + k * 0x18);
+        let cur = ((w >> 16) & 0xff, w & 0xffff);
+        if cur < prev { return false; }
+        prev = cur;
+    }
+    true
+}
+
 /// (sum of one holder's region_gdp values on GDP type records, per-entry description)
-unsafe fn holder_gdp_bonus(faction: usize, who: &str) -> Result<(f32, Vec<String>), String> {
+unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>), String> {
+    let faction = holder;
     let f: EffectCtx = core::mem::transmute(*EFFECT_CTX.get().ok_or("engine table missing")?);
-    let ctx = f((faction + 0x18) as *mut c_void) as usize;
+    let ctx = f(holder as *mut c_void) as usize;
     if ctx == 0 || !readable(ctx, 0x10) { return Err("effect values not available".into()); }
     let (count, data) = (rd(ctx + 4) as usize, rq(ctx + 8));
     if count > 20_000 || (count > 0 && !readable(data, count * 0x18)) {
