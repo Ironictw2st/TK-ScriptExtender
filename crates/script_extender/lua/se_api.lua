@@ -2170,6 +2170,14 @@ function se.ai_recruit.plan(faction_key, money)
 		for _, ch in ipairs(force.characters) do
 			local retinue = se.query.retinue(ch.cqi)
 			if retinue then
+				-- captains (and other leaders whose subtype key names no element) take the element
+				-- of their own bodyguard unit in slot 0 ("..._wood_ji_infantry_captain"): in a
+				-- 50-turn run it matched the subtype's element for 266 of 266 generals
+				if not ch.element then
+					for _, s in ipairs(retinue) do
+						if s.index == 0 and s.unit_key and s.unit_key ~= "" then ch.element = se.ai_recruit.element_of(s.unit_key) end
+					end
+				end
 				local copies = {}
 				for _, s in ipairs(retinue) do
 					local k = (s.is_recruiting and s.recruiting ~= "" and s.recruiting) or s.unit_key
