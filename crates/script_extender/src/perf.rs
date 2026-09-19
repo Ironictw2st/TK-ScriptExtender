@@ -13,9 +13,11 @@
 //! Only those UI callers are served from the cache (a thread-local depth counter is raised while
 //! one of the two getters runs); the campaign AI and every other caller always get the engine's
 //! own computation, so the simulation is untouched and nothing here belongs in the multiplayer
-//! sync tag. An entry lives for `ui_recruit_cache_ms` (script_extender.cfg, default 250, 0 =
-//! off): the panel can lag a quarter of a second behind a change; commands still validate on
-//! the model.
+//! sync tag. An entry is served while no change of the UI's command buffer has been observed
+//! (player actions) and for at most `ui_recruit_cache_ms` (script_extender.cfg, default 5000,
+//! 0 = off), which bounds how long the panel can lag behind anything else; commands still
+//! validate on the model. (0.32.0 used a bare 250 ms time-to-live: the UI re-queries a slot when
+//! a panel is (re)built, seconds apart, so only 9% of the queries hit.)
 //!
 //! Item = 0x98 bytes, vtable RVA 0x349c220 (the same class `recruit.rs` reads): +8 record,
 //! +0x10 cost, +0x14 turns, +0x18, +0x1c, +0x20 vector of 16-byte PODs, +0x30 u32, +0x38 u8,
@@ -52,14 +54,39 @@ struct Engine {
     base: usize,
 }
 
-struct Entry { at: Instant, items: Vec<usize> }
+struct Entry { at: Instant, generation: u32, items: Vec<usize> }
+
+/// Player actions reach the model as commands serialised into a byte buffer owned by
+/// `*(*(ui + 0x2188) + 0x80)` (ui = the global at RVA 0x43cfa50 the CCO code uses, e.g.
+/// CcoCampaignBattle.AutoResolve); its senders (FUN_142e6eab0 and template siblings) advance the
+/// write offset at owner+0x5008, and a flush rewinds it. The offset is therefore not monotonic:
+/// every observed CHANGE bumps our own epoch, and a cached list is only served within the epoch
+/// it was built in. A write and flush between two observations can be missed, which is why the
+/// time-to-live stays in place as the upper bound on staleness. Returns 0 when unavailable.
+const RVA_UI_ROOT: usize = 0x43cfa50;
+static LAST_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
+static EPOCH: AtomicU64 = AtomicU64::new(1);
+unsafe fn command_generation(base: usize) -> u32 {
+    let ui = rq(base + RVA_UI_ROOT);
+    if !readable(ui + 0x2188, 8) { return 0; }
+    let owner = rq(ui + 0x2188);
+    if !readable(owner + 0x80, 8) { return 0; }
+    let queue = rq(owner + 0x80);
+    if !readable(queue + 0x5008, 4) { return 0; }
+    let offset = rd(queue + 0x5008) as u64;
+    if LAST_OFFSET.swap(offset, Ordering::Relaxed) != offset {
+        EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+    (EPOCH.load(Ordering::Relaxed) & 0x7fff_ffff) as u32 | 1 << 31 // never 0 when available
+}
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 static BUILD: OnceLock<GenericDetour<BuildList>> = OnceLock::new();
 static GET2: OnceLock<GenericDetour<Getter2>> = OnceLock::new();
 static GET3: OnceLock<GenericDetour<Getter3>> = OnceLock::new();
 static CACHE: Mutex<Option<HashMap<(usize, u8), Entry>>> = Mutex::new(None);
-static TTL_MS: AtomicU64 = AtomicU64::new(250);
+static TTL_MS: AtomicU64 = AtomicU64::new(5000);
+static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static PASSED: AtomicU64 = AtomicU64::new(0);
@@ -154,11 +181,15 @@ unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8
     let key = (iface as usize, flag);
     let vec = out as usize;
     let now = Instant::now();
+    let generation = command_generation(e.base);
+    LAST_GENERATION.store(generation as u64, Ordering::Relaxed);
+    // without the command counter only a short time-to-live is safe
+    let ttl = if generation == 0 { ttl.min(250) } else { ttl };
     // hit: hand out clones
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
         if let Some(entry) = map.get(&key) {
-            if now.duration_since(entry.at) < Duration::from_millis(ttl) {
+            if entry.generation == generation && now.duration_since(entry.at) < Duration::from_millis(ttl) {
                 let mut ok = true;
                 for item in &entry.items {
                     match clone_item(e, *item) {
@@ -194,12 +225,12 @@ unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8
             for k in old { if let Some(v) = map.remove(&k) { for c in v.items { delete_item(c); } } }
             if map.len() >= MAX_ENTRIES { for c in clones { delete_item(c); } return; }
         }
-        if let Some(v) = map.insert(key, Entry { at: now, items: clones }) { for c in v.items { delete_item(c); } }
+        if let Some(v) = map.insert(key, Entry { at: now, generation, items: clones }) { for c in v.items { delete_item(c); } }
     }
 }
 
 pub fn install(t: &Table) {
-    let ttl = crate::build::config_value("ui_recruit_cache_ms").and_then(|v| v.parse::<u64>().ok()).unwrap_or(250).min(5000);
+    let ttl = crate::build::config_value("ui_recruit_cache_ms").and_then(|v| v.parse::<u64>().ok()).unwrap_or(5000).min(30000);
     TTL_MS.store(ttl, Ordering::Relaxed);
     if ttl == 0 {
         log!("ui recruit cache off (ui_recruit_cache_ms=0)");
@@ -242,8 +273,8 @@ pub unsafe fn register(l: *mut LuaState) {
 /// se_perf_stats() -> "k=v;..." counters of the UI recruit cache
 unsafe extern "C" fn se_perf_stats(l: *mut LuaState) -> c_int {
     let entries = CACHE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    let s = format!("installed={};ttl_ms={};hits={};misses={};passed_through={};entries={entries}",
-        BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed));
+    let s = format!("installed={};ttl_ms={};command_counter={};hits={};misses={};passed_through={};entries={entries}",
+        BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed));
     lua::push_str(l, &s);
     1
 }
