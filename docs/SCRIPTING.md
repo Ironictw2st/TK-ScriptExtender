@@ -1349,6 +1349,53 @@ bought. The console script `se_ai_trace.lua` logs all three per AI faction turn.
 
 ---
 
+## 4d. AI recruitment policy: better armies that fit their general (DLL 0.37, pre-release)
+
+The engine fills empty retinue slots with the cheapest unit and never replaces a unit. This pass
+runs at the start of every AI faction's turn, inside the model callback (the same on every
+multiplayer machine), at normal recruitment cost:
+
+```lua
+se.core = core
+se.ai_recruit.element_order.wood = { "wood", "metal", "water", "earth", "fire" }  -- best first, per general element
+se.ai_recruit.element_weight = { 1.30, 1.15, 1.00, 0.90, 0.80 }                  -- multiplier by rank in that list
+se.ai_recruit.unit_element["my_unit"] = "metal"       -- keys that do not name their element
+se.ai_recruit.quality_override["my_unit"] = 2400      -- units the game's quality table lacks
+se.ai_recruit.config.min_gain = 1.5                   -- see the table below
+se.ai_recruit.enable()                                -- once per Lua state (again after a load)
+se.ai_recruit.disable()
+
+local orders, info = se.ai_recruit.plan("3k_main_faction_cao_cao")   -- what it would do; changes nothing
+se.ai_recruit.execute(orders)                                        -- carry orders out
+se.ai_recruit.set_policy(function(faction_key)                       -- your own decision maker
+	local orders, info = se.ai_recruit.plan(faction_key)
+	-- edit / filter / replace the orders: { op = "recruit" | "replace", character, slot, unit, cost, ... }
+	return orders, info
+end)
+```
+
+score = the game's AI quality of the unit (`se.query.unit_quality`, the old unit's scaled up with
+its experience) x element weight (the general's element comes from `character_subtype_key()`,
+the unit's from its key: the first `_`-separated word that names an element) x
+`duplicate_penalty` per copy already in the retinue. Empty slots take the best score; an occupied
+slot is replaced when the best score is at least `min_gain` times the old one.
+
+| config key | default | meaning |
+|---|---|---|
+| `fill_empty` / `replace` | true / true | which of the two jobs run |
+| `min_gain` | 1.5 | replacement threshold (new score / old score) |
+| `same_role_only` | false | replacements must share a role group with the old unit |
+| `min_strength` | 50 | leave units below this strength % alone |
+| `max_per_character` / `max_per_force` / `max_per_faction` | 2 / 3 / 8 | orders per turn |
+| `reserve` | 1500 | treasury never touched |
+| `income_turns`, `max_spend` | 3, 4000 | per-turn budget = min(treasury - reserve, income x income_turns, max_spend) |
+| `min_income` | 0 | factions with a lower projected income do nothing |
+| `duplicate_penalty` | 0.92 | score multiplier per copy of the same unit in the retinue |
+
+Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `tools/test_lua_aipolicy.py`.
+
+---
+
 ## 5. Troubleshooting
 
 ### The API is not there at all

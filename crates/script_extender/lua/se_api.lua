@@ -2007,4 +2007,262 @@ function se.ai_recruit.report(faction_key, opts)
 	return report
 end
 
+----------------------------------------------------------------------------------------------
+-- AI recruitment policy: better armies that fit their general (DLL 0.37+)
+--
+-- The engine only ever fills EMPTY retinue slots with the cheapest unit it can pay for. This
+-- pass runs at the start of every AI faction's turn (inside the model callback) and
+--   * fills empty slots with the best-scoring unit the slot can recruit, and
+--   * replaces the unit of an occupied slot when another unit scores clearly higher,
+-- at normal cost, within a budget. score = quality x element weight: a Wood general prefers
+-- Wood units, then Metal, ... (se.ai_recruit.element_order). Everything is a plain table that a
+-- script may edit before or after se.ai_recruit.enable().
+----------------------------------------------------------------------------------------------
+
+-- best to worst unit element per general element
+se.ai_recruit.element_order = se.ai_recruit.element_order or {
+	wood  = { "wood", "metal", "water", "earth", "fire" },
+	metal = { "metal", "wood", "water", "earth", "fire" },
+	water = { "water", "earth", "metal", "wood", "fire" },
+	fire  = { "fire", "earth", "metal", "wood", "water" },
+	earth = { "earth", "fire", "water", "metal", "wood" },
+}
+-- score multiplier by rank in that list (1 = the general's favourite element)
+se.ai_recruit.element_weight = se.ai_recruit.element_weight or { 1.30, 1.15, 1.00, 0.90, 0.80 }
+-- unit_element[unit_key] = "wood" ... for keys that do not carry their element
+se.ai_recruit.unit_element = se.ai_recruit.unit_element or {}
+
+se.ai_recruit.config = se.ai_recruit.config or {
+	fill_empty = true,          -- choose the unit for empty slots (else the engine's cheapest pick stays)
+	replace = true,             -- replace units in occupied slots
+	min_gain = 1.5,             -- replace only when new score >= old score x this
+	same_role_only = false,     -- true: a replacement must share a role group with the old unit
+	min_strength = 50,          -- do not replace a unit below this strength % (let it replenish or die)
+	max_per_character = 2,      -- orders per character per turn
+	max_per_force = 3,          -- orders per army per turn
+	max_per_faction = 8,        -- orders per faction per turn
+	reserve = 1500,             -- treasury the pass never touches
+	income_turns = 3,           -- and it spends at most projected income x this per turn ...
+	max_spend = 4000,           -- ... and at most this much per turn
+	min_income = 0,             -- a faction whose projected income is below this does nothing
+	duplicate_penalty = 0.92,   -- score multiplier per copy of the same unit already in the retinue
+	log_orders = true,
+}
+
+local ELEMENTS = { wood = true, metal = true, water = true, earth = true, fire = true }
+
+-- se.ai_recruit.element_of(key) -> "wood" | "metal" | "water" | "earth" | "fire" | nil
+--   From a unit key or a character subtype key ("3k_general_wood", "3k_main_unit_wood_ji_militia",
+--   "rew_iro_regional_yang_wood_yang_guardians"): the first "_"-separated word that names an
+--   element. se.ai_recruit.unit_element overrides it.
+function se.ai_recruit.element_of(key)
+	key = str(key)
+	local forced = se.ai_recruit.unit_element[key]
+	if forced then return forced end
+	for word in key:gmatch("[^_]+") do
+		if ELEMENTS[word] then return word end
+	end
+	return nil
+end
+
+-- se.ai_recruit.element_factor(general_element, unit_element) -> multiplier (1 when unknown)
+function se.ai_recruit.element_factor(general_element, unit_element)
+	local order = general_element and se.ai_recruit.element_order[general_element]
+	if not order or not unit_element then return 1 end
+	for rank, e in ipairs(order) do
+		if e == unit_element then return num(se.ai_recruit.element_weight[rank]) or 1 end
+	end
+	return 1
+end
+
+-- forces of a faction as plain data: { { cqi, characters = { { cqi, element } } } }
+-- (kept separate so a test, or another script, can replace it)
+function se.ai_recruit.forces_of(faction_key)
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local okf, faction = pcall(function() return cm:query_faction(str(faction_key)) end)
+	if not okf or is_null(faction) then return nil, "unknown faction " .. str(faction_key) end
+	local out = {}
+	local okl, forces = pcall(function() return faction:military_force_list() end)
+	if not okl or not forces then return out end
+	for i = 0, forces:num_items() - 1 do
+		local force = forces:item_at(i)
+		local okq, fcqi = pcall(function() return force:command_queue_index() end)
+		local row = { cqi = okq and num(fcqi) or 0, characters = {} }
+		local okc, chars = pcall(function() return force:character_list() end)
+		if okc and chars then
+			for j = 0, chars:num_items() - 1 do
+				local c = chars:item_at(j)
+				local okx, cqi = pcall(function() return c:command_queue_index() end)
+				local oks, subtype = pcall(function() return c:character_subtype_key() end)
+				if okx then row.characters[#row.characters + 1] = { cqi = num(cqi), element = oks and se.ai_recruit.element_of(subtype) or nil } end
+			end
+		end
+		out[#out + 1] = row
+	end
+	return out
+end
+
+local function faction_money(faction_key)
+	local cm = cm_()
+	if not cm then return 0, 0 end
+	local ok, f = pcall(function() return cm:query_faction(str(faction_key)) end)
+	if not ok or is_null(f) then return 0, 0 end
+	local okt, t = pcall(function() return f:treasury() end)
+	local oki, inc = pcall(function() return f:projected_net_income() end)
+	return okt and num(t) or 0, oki and num(inc) or 0
+end
+
+-- se.ai_recruit.plan(faction_key [, money]) -> orders, info        (changes nothing)
+--   orders = { { op = "recruit" | "replace", force, character, slot, unit, cost, old, score,
+--   old_score, gain } } sorted by gain, already cut to the budget and the per-turn caps.
+--   money = { treasury, income } overrides the faction's own numbers (tests, what-if).
+function se.ai_recruit.plan(faction_key, money)
+	local cfg = se.ai_recruit.config
+	local forces, err = se.ai_recruit.forces_of(faction_key)
+	if not forces then return nil, err end
+	local treasury, income
+	if money then treasury, income = num(money.treasury) or 0, num(money.income) or 0 else treasury, income = faction_money(faction_key) end
+	local info = { faction = str(faction_key), treasury = treasury, income = income, candidates = 0, budget = 0 }
+	if income < cfg.min_income then info.skipped = "income below min_income" return {}, info end
+	local budget = math.min(treasury - cfg.reserve, math.max(0, income) * cfg.income_turns, cfg.max_spend)
+	info.budget = math.max(0, budget)
+	if budget <= 0 then info.skipped = "no budget" return {}, info end
+
+	local candidates = {}
+	for _, force in ipairs(forces) do
+		for _, ch in ipairs(force.characters) do
+			local retinue = se.query.retinue(ch.cqi)
+			if retinue then
+				local copies = {}
+				for _, s in ipairs(retinue) do
+					local k = (s.is_recruiting and s.recruiting ~= "" and s.recruiting) or s.unit_key
+					if k and k ~= "" then copies[k] = (copies[k] or 0) + 1 end
+				end
+				for _, s in ipairs(retinue) do
+					local empty = not s.unit_key or s.unit_key == ""
+					local wanted = (empty and cfg.fill_empty) or (not empty and cfg.replace and (num(s.strength) or 100) >= cfg.min_strength)
+					if wanted and not s.is_recruiting and s.can_recruit ~= false then
+						local old_rows, old_q, old_score = {}, 0, 0
+						if not empty then
+							old_rows, old_q = se.query.unit_quality(s.unit_key)
+							old_rows, old_q = old_rows or {}, old_q or 0
+							local top = 0
+							for _, r in ipairs(old_rows) do if r.quality_at_max_xp > top then top = r.quality_at_max_xp end end
+							local xp = math.min(num(s.experience) or 0, se.ai_recruit.max_experience) / se.ai_recruit.max_experience
+							old_score = (old_q + math.max(0, top - old_q) * xp) * se.ai_recruit.element_factor(ch.element, se.ai_recruit.element_of(s.unit_key))
+						end
+						-- an occupied slot whose unit has no known quality cannot be judged: leave it
+						if empty or old_score > 0 then
+							local best
+							for _, o in ipairs(se.query.recruitable(ch.cqi, s.index) or {}) do
+								if num(o.reasons) == 0 and o.key ~= "" and o.key ~= s.unit_key and (num(o.cost) or 0) <= budget then
+									local q
+									if not empty and cfg.same_role_only then q = shared_quality(old_rows, o.key) else local _, b = se.query.unit_quality(o.key) q = b end
+									if q and q > 0 then
+										local score = q * se.ai_recruit.element_factor(ch.element, se.ai_recruit.element_of(o.key)) * (cfg.duplicate_penalty ^ (copies[o.key] or 0))
+										if not best or score > best.score or (score == best.score and o.key < best.unit) then
+											best = { unit = o.key, cost = num(o.cost) or 0, score = score }
+										end
+									end
+								end
+							end
+							if best and (empty or best.score >= old_score * cfg.min_gain) then
+								candidates[#candidates + 1] = { op = empty and "recruit" or "replace", force = force.cqi, character = ch.cqi, slot = s.index,
+									unit = best.unit, cost = best.cost, old = (not empty) and s.unit_key or nil, score = best.score, old_score = old_score,
+									gain = empty and best.score or (best.score / old_score) }
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	info.candidates = #candidates
+	-- replacements with the biggest gain first, then the empty slots by score; ties by ids so
+	-- every machine of a multiplayer game takes the same orders
+	table.sort(candidates, function(a, b)
+		if a.op ~= b.op then return a.op == "replace" end
+		if a.gain ~= b.gain then return a.gain > b.gain end
+		if a.character ~= b.character then return a.character < b.character end
+		return a.slot < b.slot
+	end)
+	local orders, per_char, per_force, picked = {}, {}, {}, {}
+	for _, c in ipairs(candidates) do
+		if #orders >= cfg.max_per_faction then break end
+		if c.cost <= budget and (per_char[c.character] or 0) < cfg.max_per_character and (per_force[c.force] or 0) < cfg.max_per_force then
+			-- the duplicate penalty was computed per slot: do not hand one character the same
+			-- new unit more than once per turn beyond what the penalty allowed for
+			local tag = c.character .. "|" .. c.unit
+			picked[tag] = (picked[tag] or 0) + 1
+			if picked[tag] <= 2 then
+				budget = budget - c.cost
+				per_char[c.character] = (per_char[c.character] or 0) + 1
+				per_force[c.force] = (per_force[c.force] or 0) + 1
+				orders[#orders + 1] = c
+			end
+		end
+	end
+	info.spent = info.budget - math.max(0, budget)
+	return orders, info
+end
+
+-- se.ai_recruit.execute(orders) -> done, failed : carries the orders out at normal cost
+function se.ai_recruit.execute(orders)
+	local done, failed = 0, 0
+	for _, o in ipairs(orders or {}) do
+		local ok, msg
+		if o.op == "replace" then
+			ok, msg = se.modify.replace(o.character, o.slot, o.unit, {})
+		else
+			ok, msg = se.modify.recruit(o.character, o.unit, { slot = o.slot })
+		end
+		if ok then done = done + 1 else failed = failed + 1 end
+		if se.ai_recruit.config.log_orders then
+			log(string.format("ai_recruit %s: char %s slot %s %s%s (cost %s, score %.0f%s) -> %s %s", str(o.op), str(o.character), str(o.slot),
+				o.old and (o.old .. " -> ") or "", str(o.unit), str(o.cost), o.score or 0, o.old and string.format(", was %.0f, x%.2f", o.old_score or 0, o.gain or 0) or "", str(ok), str(msg or "")))
+		end
+	end
+	return done, failed
+end
+
+-- se.ai_recruit.set_policy(fn) : fn(faction_key) -> orders replaces se.ai_recruit.plan as the
+--   decision maker of the turn-start pass (it may call plan() and edit the result). nil = default.
+function se.ai_recruit.set_policy(fn)
+	se.ai_recruit.policy = fn
+	return true
+end
+
+-- se.ai_recruit.enable() -> ok, message : install the turn-start pass for AI factions (once per
+--   Lua state; call it again after a load). Runs inside the model callback, the same on every
+--   machine of a multiplayer game: no local-player branching, no randomness.
+-- se.ai_recruit.disable() : the listener stays registered but does nothing.
+function se.ai_recruit.enable()
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	se.ai_recruit.enabled = true
+	if se.ai_recruit.listening then return true, "already listening; enabled" end
+	se.ai_recruit.listening = true
+	core:add_listener("se_ai_recruit_turn_start", "FactionTurnStart", function(context)
+		if not se.ai_recruit.enabled then return false end
+		local ok, r = pcall(function() local f = context:faction() return not f:is_human() and not f:is_dead() end)
+		return ok and r
+	end, function(context)
+		local key = context:faction():name()
+		local okp, orders, info = pcall(se.ai_recruit.policy or se.ai_recruit.plan, key)
+		if not okp then log("ai_recruit " .. key .. ": policy error: " .. str(orders)) return end
+		if orders and #orders > 0 then
+			local done, failed = se.ai_recruit.execute(orders)
+			log(string.format("ai_recruit %s: %d orders done, %d failed (budget %s, spent %s, %s candidates)", key, done, failed,
+				str(info and info.budget), str(info and info.spent), str(info and info.candidates)))
+		end
+	end, true)
+	return true, "listening"
+end
+
+function se.ai_recruit.disable()
+	se.ai_recruit.enabled = false
+	return true
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")

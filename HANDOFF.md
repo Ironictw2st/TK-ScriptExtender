@@ -137,6 +137,9 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   timing (`se.diag.listeners_*`), `diag_diplomacy` (measurement).
 - 0.36 AI recruitment trace (read-only): `se.ai_recruit.trace/report`, `se.query.ai_recruitment`,
   `se.query.unit_quality`; details `notes/ai_recruitment.md`.
+- 0.37.0-beta.1 (PRE-RELEASE channel from here on, tags `vX.Y.Z-beta.N`): AI recruitment policy
+  `se.ai_recruit.enable/plan/execute/set_policy` (element-weighted quality score; fills empty
+  slots, replaces weak units at normal cost). Lua only; no new hook, no cfg key.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 
