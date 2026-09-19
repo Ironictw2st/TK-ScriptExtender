@@ -236,10 +236,21 @@ unsafe fn unwind(base: usize, size: usize, rfs: &[(u32, u32, u32)], ctx: &Ctx, s
         // from the first return address into the exe that follows a call instruction.
         out.frames[0] = 0;
         out.n = 1;
+        // A stale return address can sit near the top of the stack (0.31.x blamed a tiny faction
+        // check for 19% of an end turn that way): a candidate is only accepted when unwinding
+        // from it yields at least three more frames inside the exe.
         let mut found = None;
         let mut a = regs[4];
         while let Some(v) = st.read(a) {
-            if in_exe(v) && follows_call(v) { found = Some((v, a + 8)); break; }
+            if in_exe(v) && follows_call(v) {
+                let mut trial = regs;
+                trial[4] = a + 8;
+                let (mut r, mut depth) = (v, 0);
+                while depth < 3 {
+                    match unwind_step(base, rfs, r, &mut trial, &st) { Some(n) if in_exe(n) => { r = n; depth += 1; } _ => break }
+                }
+                if depth >= 3 { found = Some((v, a + 8)); break; }
+            }
             a += 8;
         }
         let Some((v, sp)) = found else { return };

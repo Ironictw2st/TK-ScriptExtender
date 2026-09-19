@@ -1651,6 +1651,19 @@ end
 
 se.profile = se.profile or {}
 
+-- se.query.perf() -> { installed, ttl_ms, hits, misses, passed_through, entries }
+--   Counters of the UI recruit-list cache (script_extender.cfg: ui_recruit_cache_ms, default
+--   250, 0 = off). hits = UI queries answered from the cache, misses = UI queries the engine
+--   computed, passed_through = calls from the AI and other non-UI callers (never cached).
+function se.query.perf()
+	local okn, err = need("se_perf_stats")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in str(se_perf_stats()):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) or v end
+	t.installed = t.installed == 1
+	return t
+end
+
 -- se.profile.start(seconds [, delay_seconds [, label]]) -> ok, message
 --   Sampling profiler of the game process (1 ms, the six busiest threads, re-picked every
 --   second). Waits `delay_seconds` (default 3) so the console can be closed, samples for
