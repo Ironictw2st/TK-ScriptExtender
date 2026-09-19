@@ -29,6 +29,7 @@ mod alliances;
 mod autoresolve;
 mod income;
 mod perf;
+mod permcache;
 mod profiler;
 mod bundles;
 mod diplomacy;
@@ -91,6 +92,7 @@ fn bootstrap() {
     autoresolve::install_hooks(&table);
     income::install(&table);
     perf::install(&table);
+    permcache::install(&table);
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }

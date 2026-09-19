@@ -175,7 +175,7 @@ pub fn sync_tag() -> String {
     let mut h: u32 = 0x811c9dc5;
     let mut feed = |s: &str| for b in s.bytes() { h ^= b as u32; h = h.wrapping_mul(0x01000193); };
     feed(env!("CARGO_PKG_VERSION"));
-    for key in ["autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_cache"] {
+    for key in ["autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_cache", "recruit_perm_cache"] {
         feed(key);
         feed(&config_value(key).unwrap_or_default());
     }
@@ -205,7 +205,7 @@ pub fn apply_config() {
                 "build_number" => build = v.to_string(),
                 "build_number_short" => short = v.to_string(),
                 "build_modified" => modified = Some(v == "1" || v.eq_ignore_ascii_case("true")),
-                "autoresolve_hooks" | "horde_income" | "horde_income_category" | "ui_recruit_cache_ms" | "ai_recruit_cache" => {}
+                "autoresolve_hooks" | "horde_income" | "horde_income_category" | "ui_recruit_cache_ms" | "ai_recruit_cache" | "recruit_perm_cache" => {}
                 _ => log!("config: unknown key '{k}' ignored"),
             }
         }

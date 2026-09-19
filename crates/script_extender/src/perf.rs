@@ -216,7 +216,18 @@ unsafe extern "C" fn planner_detour(planner: *mut c_void, ctx: *mut c_void) -> u
     if outer { ai_clear(); AI_SCOPES.fetch_add(1, Ordering::Relaxed); }
     let r = h.call(planner, ctx);
     AI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    if outer { ai_clear(); }
+    if outer {
+        ai_clear();
+        // the counters also go to the DLL log (at most every 15 s), so a run needs no script
+        static LAST_REPORT: Mutex<Option<Instant>> = Mutex::new(None);
+        if let Ok(mut last) = LAST_REPORT.lock() {
+            if last.map_or(true, |t| t.elapsed() > Duration::from_secs(15)) {
+                *last = Some(Instant::now());
+                log!("ai recruit cache: scopes {} calls {} same {} diff {} served {}", AI_SCOPES.load(Ordering::Relaxed), AI_CALLS.load(Ordering::Relaxed),
+                    AI_SAME.load(Ordering::Relaxed), AI_DIFF.load(Ordering::Relaxed), AI_SERVED.load(Ordering::Relaxed));
+            }
+        }
+    }
     r
 }
 
@@ -428,10 +439,12 @@ pub unsafe fn register(l: *mut LuaState) {
 /// se_perf_stats() -> "k=v;..." counters of the UI recruit cache
 unsafe extern "C" fn se_perf_stats(l: *mut LuaState) -> c_int {
     let entries = CACHE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={};ai_mode={};ai_scopes={};ai_calls={};ai_same={};ai_diff={};ai_served={}",
+    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={};ai_mode={};ai_scopes={};ai_calls={};ai_same={};ai_diff={};ai_served={};perm_mode={};perm_built={};perm_shared={};perm_same={};perm_diff={};perm_unscoped={}",
         BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed),
         MISS_NEW.load(Ordering::Relaxed), MISS_EXPIRED.load(Ordering::Relaxed), MISS_STATE.load(Ordering::Relaxed), STAMP_FAILED.load(Ordering::Relaxed),
-        AI_MODE.load(Ordering::Relaxed), AI_SCOPES.load(Ordering::Relaxed), AI_CALLS.load(Ordering::Relaxed), AI_SAME.load(Ordering::Relaxed), AI_DIFF.load(Ordering::Relaxed), AI_SERVED.load(Ordering::Relaxed));
+        AI_MODE.load(Ordering::Relaxed), AI_SCOPES.load(Ordering::Relaxed), AI_CALLS.load(Ordering::Relaxed), AI_SAME.load(Ordering::Relaxed), AI_DIFF.load(Ordering::Relaxed), AI_SERVED.load(Ordering::Relaxed),
+        crate::permcache::MODE.load(Ordering::Relaxed), crate::permcache::BUILT.load(Ordering::Relaxed), crate::permcache::SHARED.load(Ordering::Relaxed),
+        crate::permcache::SAME.load(Ordering::Relaxed), crate::permcache::DIFF.load(Ordering::Relaxed), crate::permcache::UNSCOPED.load(Ordering::Relaxed));
     lua::push_str(l, &s);
     1
 }
