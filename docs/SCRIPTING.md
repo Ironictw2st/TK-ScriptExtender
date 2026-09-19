@@ -46,7 +46,7 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of `autoresolve_hooks`,
+   it always ends up containing the DLL version and a fingerprint of `autoresolve_hooks`, `ai_recruit_cache`,
    `horde_income` and `horde_income_category` (`script_extender.cfg` text may use `{version}`
    and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the

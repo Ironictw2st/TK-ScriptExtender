@@ -18,6 +18,20 @@
 //! 5000, 0 = off), which bounds how long the panel can lag behind anything else (a disband, a
 //! free recruitment, a script change); commands still validate on the model.
 //!
+//! The campaign AI (0.33, `ai_recruit_cache`, default 0 = off): the recruitment budget planner
+//! FUN_141cf8fe0(planner, ctx) runs five evaluators in a row (FUN_141ce96b0, ..8800, ..6070,
+//! ..77a0, ..6700); each walks the faction's forces and asks FUN_141ced9a0 / FUN_141cecf30 "what
+//! could this character's empty slots recruit for the remaining budget", which builds the full
+//! list per slot again (20% of the main thread during an end turn). The planner only allocates
+//! budgets, it does not recruit, so inside ONE planner call a slot's list cannot change. The AI
+//! cache therefore lives exactly as long as one planner call (cleared on entry and exit) and is
+//! additionally guarded by the state stamp and the slot identity.
+//!   ai_recruit_cache=1  verify: the engine still builds every list; a repeated query is
+//!                       compared with the remembered list (counters `ai_same` / `ai_diff`).
+//!                       Changes nothing, proves (or disproves) exactness on a real campaign.
+//!   ai_recruit_cache=2  serve repeated queries from the cache.
+//! The key is part of `build::sync_tag` (multiplayer: both machines must agree).
+//!
 //! Item = 0x98 bytes, vtable RVA 0x349c220 (the same class `recruit.rs` reads): +8 record,
 //! +0x10 cost, +0x14 turns, +0x18, +0x1c, +0x20 vector of 16-byte PODs, +0x30 u32, +0x38 u8,
 //! +0x40 / +0x50 vectors of 8-byte PODs, +0x60 / +0x61 u8, +0x68 / +0x78 vectors of 16-byte PODs,
@@ -44,6 +58,7 @@ const MAX_ITEMS: usize = 600;
 const MAX_ENTRIES: usize = 512;
 
 type BuildList = unsafe extern "C" fn(*mut c_void, *mut c_void, u8);
+type Planner = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
 type Getter2 = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type Getter3 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 
@@ -81,6 +96,16 @@ static ENGINE: OnceLock<Engine> = OnceLock::new();
 static BUILD: OnceLock<GenericDetour<BuildList>> = OnceLock::new();
 static GET2: OnceLock<GenericDetour<Getter2>> = OnceLock::new();
 static GET3: OnceLock<GenericDetour<Getter3>> = OnceLock::new();
+struct AiEntry { stamp: u64, ident: usize, items: Vec<usize> }
+static AI_CACHE: Mutex<Option<HashMap<(usize, u8), AiEntry>>> = Mutex::new(None);
+static AI_MODE: AtomicU64 = AtomicU64::new(0);
+static AI_SCOPES: AtomicU64 = AtomicU64::new(0);
+static AI_CALLS: AtomicU64 = AtomicU64::new(0);
+static AI_SAME: AtomicU64 = AtomicU64::new(0);
+static AI_DIFF: AtomicU64 = AtomicU64::new(0);
+static AI_SERVED: AtomicU64 = AtomicU64::new(0);
+static AI_DIFF_LOGGED: AtomicU64 = AtomicU64::new(0);
+static PLANNER: OnceLock<GenericDetour<Planner>> = OnceLock::new();
 static CACHE: Mutex<Option<HashMap<(usize, u8), Entry>>> = Mutex::new(None);
 static TTL_MS: AtomicU64 = AtomicU64::new(5000);
 static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -96,6 +121,7 @@ static STAMP_FAILED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static UI_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static AI_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 extern "system" {
@@ -158,6 +184,109 @@ unsafe fn push_item(e: &Engine, vec: usize, item: usize) -> bool {
     true
 }
 
+/// Field-wise comparison of two items: everything except the vectors' capacity and data pointer,
+/// plus the vectors' contents. Returns the first differing offset.
+unsafe fn item_diff(a: usize, b: usize) -> Option<usize> {
+    // the known fields only (offset, size): padding after the u8 fields is never initialised
+    const FIELDS: [(usize, usize); 16] = [(0, 8), (8, 8), (0x10, 4), (0x14, 4), (0x18, 4), (0x1c, 4), (0x24, 4), (0x30, 4),
+        (0x38, 1), (0x44, 4), (0x54, 4), (0x60, 2), (0x6c, 4), (0x7c, 4), (0x88, 8), (0x90, 8)];
+    for (o, n) in FIELDS {
+        if core::slice::from_raw_parts((a + o) as *const u8, n) != core::slice::from_raw_parts((b + o) as *const u8, n) { return Some(o); }
+    }
+    for (off, size) in ITEM_VECTORS {
+        let n = rd(a + off + 4) as usize * size; // counts are equal here
+        if n != 0 && core::slice::from_raw_parts(rq(a + off + 8) as *const u8, n) != core::slice::from_raw_parts(rq(b + off + 8) as *const u8, n) {
+            return Some(off + 8);
+        }
+    }
+    None
+}
+
+unsafe fn ai_clear() {
+    if let Ok(mut guard) = AI_CACHE.lock() {
+        if let Some(map) = guard.as_mut() {
+            for (_, v) in map.drain() { for c in v.items { delete_item(c); } }
+        }
+    }
+}
+
+unsafe extern "C" fn planner_detour(planner: *mut c_void, ctx: *mut c_void) -> u64 {
+    let Some(h) = PLANNER.get() else { return 1 };
+    let outer = AI_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v == 0 });
+    if outer { ai_clear(); AI_SCOPES.fetch_add(1, Ordering::Relaxed); }
+    let r = h.call(planner, ctx);
+    AI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    if outer { ai_clear(); }
+    r
+}
+
+/// Clones of what the engine appended to `vec` after index `before`; None when the result is
+/// not something this module understands.
+unsafe fn clone_appended(e: &Engine, vec: usize, before: usize) -> Option<Vec<usize>> {
+    let (after, data) = (rd(vec + 4) as usize, rq(vec + 8));
+    if after < before || after - before > MAX_ITEMS || (after > 0 && !readable(data, after * 8)) { return None; }
+    let mut clones = Vec::with_capacity(after - before);
+    for i in before..after {
+        let item = rq(data + i * 8);
+        let cloned = if is_plain_item(e, item) { clone_item(e, item) } else { None };
+        match cloned {
+            Some(c) => clones.push(c),
+            None => { for c in clones { delete_item(c); } return None; }
+        }
+    }
+    Some(clones)
+}
+
+/// A query made by the AI's recruitment budget planner (see the module comment).
+unsafe fn ai_query(e: &Engine, h: &GenericDetour<BuildList>, iface: *mut c_void, out: *mut c_void, flag: u8, mode: u64) {
+    AI_CALLS.fetch_add(1, Ordering::Relaxed);
+    let (key, vec) = ((iface as usize, flag), out as usize);
+    let stamp = state_stamp(iface as usize);
+    let ident = if readable(iface as usize + 8, 8) { rq(iface as usize + 8) } else { 0 };
+    let before = rd(vec + 4) as usize;
+    if stamp == 0 || ident == 0 { h.call(iface, out, flag); return; }
+    if mode >= 2 {
+        if let Ok(guard) = AI_CACHE.lock() {
+            if let Some(entry) = guard.as_ref().and_then(|m| m.get(&key)).filter(|en| en.stamp == stamp && en.ident == ident) {
+                let mut ok = true;
+                for item in &entry.items {
+                    match clone_item(e, *item) {
+                        Some(c) => if !push_item(e, vec, c) { delete_item(c); ok = false; break; },
+                        None => { ok = false; break; }
+                    }
+                }
+                if ok { AI_SERVED.fetch_add(1, Ordering::Relaxed); return; }
+                // allocation failed mid-way: the engine appends after what was pushed; the
+                // planner only takes minima and counts over affordable items
+            }
+        }
+    }
+    h.call(iface, out, flag);
+    let Some(clones) = clone_appended(e, vec, before) else { return };
+    let Ok(mut guard) = AI_CACHE.lock() else { for c in clones { delete_item(c); } return };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(entry) = map.get(&key).filter(|en| en.stamp == stamp && en.ident == ident) {
+        // verify mode: the same query again inside one planner call
+        let mut diff = if entry.items.len() != clones.len() { Some((usize::MAX, 0)) } else { None };
+        if diff.is_none() {
+            for (i, (a, b)) in entry.items.iter().zip(clones.iter()).enumerate() {
+                if let Some(o) = item_diff(*a, *b) { diff = Some((i, o)); break; }
+            }
+        }
+        match diff {
+            None => { AI_SAME.fetch_add(1, Ordering::Relaxed); }
+            Some((i, o)) => {
+                AI_DIFF.fetch_add(1, Ordering::Relaxed);
+                if AI_DIFF_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                    log!("ai recruit cache: repeated query differs: iface {:#x} flag {flag} items {} -> {} first difference item {i} offset {o:#x}", iface as usize, entry.items.len(), clones.len());
+                }
+            }
+        }
+    }
+    if map.len() >= 4096 { for c in clones { delete_item(c); } return; }
+    if let Some(v) = map.insert(key, AiEntry { stamp, ident, items: clones }) { for c in v.items { delete_item(c); } }
+}
+
 unsafe extern "C" fn get2_detour(cco: *mut c_void, out: *mut c_void) {
     let Some(h) = GET2.get() else { return };
     UI_DEPTH.with(|d| d.set(d.get() + 1));
@@ -175,6 +304,10 @@ unsafe extern "C" fn get3_detour(cco: *mut c_void, out: *mut c_void, arg: *mut c
 
 unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8) {
     let Some(h) = BUILD.get() else { return };
+    let ai_mode = AI_MODE.load(Ordering::Relaxed);
+    if ai_mode > 0 && AI_DEPTH.with(|d| d.get()) > 0 && UI_DEPTH.with(|d| d.get()) == 0 && readable(out as usize, 16) {
+        if let Some(e) = ENGINE.get() { ai_query(e, h, iface, out, flag, ai_mode); return; }
+    }
     let ttl = TTL_MS.load(Ordering::Relaxed);
     let (Some(e), true) = (ENGINE.get(), ttl > 0 && UI_DEPTH.with(|d| d.get()) > 0 && readable(out as usize, 16)) else {
         PASSED.fetch_add(1, Ordering::Relaxed);
@@ -241,8 +374,9 @@ unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8
 pub fn install(t: &Table) {
     let ttl = crate::build::config_value("ui_recruit_cache_ms").and_then(|v| v.parse::<u64>().ok()).unwrap_or(5000).min(30000);
     TTL_MS.store(ttl, Ordering::Relaxed);
-    if ttl == 0 {
-        log!("ui recruit cache off (ui_recruit_cache_ms=0)");
+    let ai_mode = crate::build::config_value("ai_recruit_cache").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(2);
+    if ttl == 0 && ai_mode == 0 {
+        log!("recruit caches off (ui_recruit_cache_ms=0, ai_recruit_cache=0)");
         return;
     }
     let (base, _) = crate::process::main_module();
@@ -271,6 +405,18 @@ pub fn install(t: &Table) {
             return;
         }
         let _ = BUILD.set(b);
+        if ai_mode > 0 {
+            // prologue: mov rax,rsp / two stack stores / pushes (nothing RIP-relative)
+            let planner: Planner = core::mem::transmute(t.get("cai_recruit_budget"));
+            match GenericDetour::new(planner, planner_detour) {
+                Ok(p) if crate::freeze::with_threads_frozen(planner as usize, 16, || p.enable()).is_ok() => {
+                    let _ = PLANNER.set(p);
+                    AI_MODE.store(ai_mode, Ordering::Relaxed);
+                    log!("ai recruit cache installed (mode {ai_mode}: {})", if ai_mode == 1 { "verify only" } else { "serve" });
+                }
+                _ => log!("ai recruit cache: could not hook the planner; off"),
+            }
+        }
     }
     log!("ui recruit cache installed (ttl {ttl} ms)");
 }
@@ -282,9 +428,10 @@ pub unsafe fn register(l: *mut LuaState) {
 /// se_perf_stats() -> "k=v;..." counters of the UI recruit cache
 unsafe extern "C" fn se_perf_stats(l: *mut LuaState) -> c_int {
     let entries = CACHE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={}",
+    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={};ai_mode={};ai_scopes={};ai_calls={};ai_same={};ai_diff={};ai_served={}",
         BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed),
-        MISS_NEW.load(Ordering::Relaxed), MISS_EXPIRED.load(Ordering::Relaxed), MISS_STATE.load(Ordering::Relaxed), STAMP_FAILED.load(Ordering::Relaxed));
+        MISS_NEW.load(Ordering::Relaxed), MISS_EXPIRED.load(Ordering::Relaxed), MISS_STATE.load(Ordering::Relaxed), STAMP_FAILED.load(Ordering::Relaxed),
+        AI_MODE.load(Ordering::Relaxed), AI_SCOPES.load(Ordering::Relaxed), AI_CALLS.load(Ordering::Relaxed), AI_SAME.load(Ordering::Relaxed), AI_DIFF.load(Ordering::Relaxed), AI_SERVED.load(Ordering::Relaxed));
     lua::push_str(l, &s);
     1
 }
