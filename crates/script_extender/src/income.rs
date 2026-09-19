@@ -61,6 +61,11 @@ unsafe fn readable(p: usize, n: usize) -> bool {
 unsafe fn rq(p: usize) -> usize {
     if readable(p, 8) { core::ptr::read_unaligned(p as *const usize) } else { 0 }
 }
+// Unchecked reads, only for addresses inside a block that was validated as a whole: the checked
+// readers cost one IsBadReadPtr each, and this code runs on every income recompute of every
+// faction (0.32.3 end-turn profile: 35% of the main thread).
+unsafe fn raw_q(p: usize) -> usize { core::ptr::read_unaligned(p as *const usize) }
+unsafe fn raw_d(p: usize) -> u32 { core::ptr::read_unaligned(p as *const u32) }
 unsafe fn rd(p: usize) -> u32 {
     if readable(p, 4) { core::ptr::read_unaligned(p as *const u32) } else { 0 }
 }
@@ -117,7 +122,7 @@ unsafe fn faction_gdp_bonus(faction: usize) -> Result<(f32, Vec<String>), String
                 }
                 continue;
             };
-            if let Ok((s, r)) = holder_gdp_bonus(force + off, &format!("force[{i}]+{off:#x}")) {
+            if let Ok((s, r)) = holder_gdp_bonus(force + off, "force") {
                 sum += s;
                 rows.extend(r);
             }
@@ -133,18 +138,18 @@ unsafe fn faction_gdp_bonus(faction: usize) -> Result<(f32, Vec<String>), String
 unsafe fn holder_looks_valid(h: usize) -> bool {
     let (base, size) = crate::process::main_module();
     if !readable(h, 0x40) { return false; }
-    let vt = rq(h);
+    let vt = raw_q(h);
     if vt < base || vt >= base + size { return false; }
-    let (sources, sdata) = (rd(h + 0x2c) as usize, rq(h + 0x30));
+    let (sources, sdata) = (raw_d(h + 0x2c) as usize, raw_q(h + 0x30));
     if sources > 256 || (sources > 0 && !readable(sdata, sources * 0x10)) { return false; }
     for k in 0..sources {
-        if !readable(rq(sdata + k * 0x10), 8) { return false; }
+        if !readable(raw_q(sdata + k * 0x10), 8) { return false; }
     }
-    let (cap, count, data) = (rd(h + 8) as usize, rd(h + 0xc) as usize, rq(h + 0x10));
+    let (cap, count, data) = (raw_d(h + 8) as usize, raw_d(h + 0xc) as usize, raw_q(h + 0x10));
     if count > cap || cap > 20_000 || (count > 0 && !readable(data, count * 0x18)) { return false; }
     let mut prev = (0u32, 0u32);
     for k in 0..count {
-        let w = rd(data + k * 0x18);
+        let w = raw_d(data + k * 0x18);
         let cur = ((w >> 16) & 0xff, w & 0xffff);
         if cur < prev { return false; }
         prev = cur;
@@ -164,26 +169,32 @@ unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>
     }
     let (mut sum, mut rows) = (0.0f32, Vec::new());
     let mut with_record = 0usize;
+    let diag = DIAG.load(std::sync::atomic::Ordering::Relaxed);
+    let (base, _) = crate::process::main_module();
     for i in 0..count {
-        let en = data + i * 0x18;
-        let rec = rq(en + 0x10);
+        let en = data + i * 0x18; // inside the block validated above
+        let (head, rec) = (raw_d(en), raw_q(en + 0x10));
         if rec == 0 { continue; }
         with_record += 1;
-        let key = record_key(rec);
-        if DIAG.load(std::sync::atomic::Ordering::Relaxed) && with_record <= 60 {
-            log!("    entry kind {} id {} record {:#x} key '{}' raw {:#010x} words {:016x} {:016x}", (rd(en) >> 16) & 0xff, rd(en) & 0xffff, rec, key, rd(en + 4), rq(rec), rq(rec + 8));
+        if diag && with_record <= 60 {
+            log!("    entry kind {} id {} record {:#x} key '{}' raw {:#010x} words {:016x} {:016x}", (head >> 16) & 0xff, head & 0xffff, rec, record_key(rec), raw_d(en + 4), rq(rec), rq(rec + 8));
         }
         // A GDP type record: bonus kind 31 and the campaign_region_gdp_types record class
         // (vtable RVA 0x32f54f0). Its key is not at the usual +8, so the class identifies it
-        // (seen live: gdp_abs_banditry 150 -> kind 31, id 0, f32 150.0).
-        let (base, _) = crate::process::main_module();
-        if ((rd(en) >> 16) & 0xff) != KIND_REGION_GDP_TYPE { continue; }
-        if rq(rec).wrapping_sub(base) != RVA_GDP_TYPE_RECORD_VTABLE && !GDP_TYPES.contains(&key.as_str()) { continue; }
-        let (id, kind, v) = (rd(en) & 0xffff, (rd(en) >> 16) & 0xff, entry_value(rd(en + 4)));
-        rows.push(format!("{who}: kind {kind} id {id} {key} = {v} (raw {:#010x})", rd(en + 4)));
+        // (seen live: gdp_abs_banditry 150 -> kind 31, id 0, f32 150.0). Kind first: it is the
+        // only test most entries need; the key is read only when the class does not match.
+        let (id, kind) = (head & 0xffff, (head >> 16) & 0xff);
+        if kind != KIND_REGION_GDP_TYPE { continue; }
+        let mut key = String::new();
+        if rq(rec).wrapping_sub(base) != RVA_GDP_TYPE_RECORD_VTABLE {
+            key = record_key(rec);
+            if !GDP_TYPES.contains(&key.as_str()) { continue; }
+        }
+        let v = entry_value(raw_d(en + 4));
+        rows.push(format!("{who}: kind {kind} id {id} {key} = {v} (raw {:#010x})", raw_d(en + 4)));
         if id == ID_REGION_GDP { sum += v; }
     }
-    if DIAG.load(std::sync::atomic::Ordering::Relaxed) {
+    if diag {
         log!("    {who} {:#x} ctx {:#x}: {count} effect values, {with_record} with a record", faction, ctx);
     }
     Ok((sum, rows))

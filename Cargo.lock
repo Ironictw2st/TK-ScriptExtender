@@ -42,11 +42,11 @@ dependencies = [
 
 [[package]]
 name = "inject_core"
-version = "0.32.3"
+version = "0.32.4"
 
 [[package]]
 name = "injector"
-version = "0.32.3"
+version = "0.32.4"
 dependencies = [
  "inject_core",
 ]
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "script_extender"
-version = "0.32.3"
+version = "0.32.4"
 dependencies = [
  "retour",
 ]

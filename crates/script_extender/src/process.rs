@@ -6,10 +6,12 @@ use std::path::PathBuf;
 
 /// Base address and `SizeOfImage` of the main executable (the module with a NULL name).
 pub fn main_module() -> (usize, usize) {
-    unsafe {
+    // hot callers (income hook, caches) ask on every call; the exe never moves
+    static MAIN: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *MAIN.get_or_init(|| unsafe {
         let base = GetModuleHandleW(core::ptr::null()) as usize;
         (base, image_size(base))
-    }
+    })
 }
 
 /// Reads `OptionalHeader.SizeOfImage` (PE32+). Assumes a valid loaded image at `base`.
