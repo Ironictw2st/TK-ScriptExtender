@@ -95,26 +95,40 @@ unsafe fn copy_array(e: &Engine, master: usize, view: usize, off: usize) -> bool
 }
 
 /// Node-by-node comparison of two maps built from the same list (same insertion order).
-unsafe fn maps_equal(a: usize, b: usize) -> bool {
-    if rd(a) != rd(b) || rd(a + 0x1c) != rd(b + 0x1c) || rd(a + 0x34) != rd(b + 0x34) || rd(a + 0x44) != rd(b + 0x44) { return false; }
+/// Returns what differs first. The 16-byte requirement entries are {requirement*, i32 result,
+/// u32 never initialised by the engine (a stack leftover)}: only their first 12 bytes count.
+unsafe fn maps_differ(a: usize, b: usize) -> Option<String> {
+    for off in [0usize, 0x1c, 0x34, 0x44] {
+        if rd(a + off) != rd(b + off) { return Some(format!("map +{off:#x}: {} / {}", rd(a + off), rd(b + off))); }
+    }
     for off in [0x30usize, 0x40] {
         let n = rd(a + off + 4) as usize * 8;
-        if n != 0 && core::slice::from_raw_parts(rq(a + off + 8) as *const u8, n) != core::slice::from_raw_parts(rq(b + off + 8) as *const u8, n) { return false; }
+        if n != 0 && core::slice::from_raw_parts(rq(a + off + 8) as *const u8, n) != core::slice::from_raw_parts(rq(b + off + 8) as *const u8, n) {
+            return Some(format!("record list +{off:#x}"));
+        }
     }
-    let (mut x, mut y, mut left) = (rq(a + 0x10), rq(b + 0x10), rd(a) as usize + 1);
-    while x != a + 8 && y != b + 8 && left > 0 {
-        if rq(x + 0x10) != rq(y + 0x10) || *((x + 0x18) as *const u8) != *((y + 0x18) as *const u8)
-            || core::ptr::read_unaligned((x + 0x40) as *const u16) != core::ptr::read_unaligned((y + 0x40) as *const u16) { return false; }
-        for (off, size) in [(0x20usize, 8usize), (0x30, 8), (0x48, 16), (0x58, 16)] {
+    let (mut x, mut y, mut index) = (rq(a + 0x10), rq(b + 0x10), 0usize);
+    while x != a + 8 && y != b + 8 && index <= rd(a) as usize {
+        if rq(x + 0x10) != rq(y + 0x10) { return Some(format!("node {index}: key {:#x} / {:#x}", rq(x + 0x10), rq(y + 0x10))); }
+        for off in [0x18usize, 0x40, 0x41] {
+            let (p, q) = (*((x + off) as *const u8), *((y + off) as *const u8));
+            if p != q { return Some(format!("node {index} +{off:#x}: {p} / {q}")); }
+        }
+        for (off, size, used) in [(0x20usize, 8usize, 8usize), (0x30, 8, 8), (0x48, 16, 12), (0x58, 16, 12)] {
             let n = rd(x + off + 4) as usize;
-            if n != rd(y + off + 4) as usize { return false; }
-            if n != 0 && core::slice::from_raw_parts(rq(x + off + 8) as *const u8, n * size) != core::slice::from_raw_parts(rq(y + off + 8) as *const u8, n * size) { return false; }
+            if n != rd(y + off + 4) as usize { return Some(format!("node {index} vector +{off:#x}: {n} / {} entries", rd(y + off + 4))); }
+            let (p, q) = (rq(x + off + 8), rq(y + off + 8));
+            for k in 0..n {
+                if core::slice::from_raw_parts((p + k * size) as *const u8, used) != core::slice::from_raw_parts((q + k * size) as *const u8, used) {
+                    return Some(format!("node {index} vector +{off:#x} entry {k}: {:016x} {:08x} / {:016x} {:08x}", rq(p + k * size), rd(p + k * size + 8), rq(q + k * size), rd(q + k * size + 8)));
+                }
+            }
         }
         x = rq(x + 8);
         y = rq(y + 8);
-        left -= 1;
+        index += 1;
     }
-    x == a + 8 && y == b + 8
+    if x == a + 8 && y == b + 8 { None } else { Some(format!("list length (stopped at node {index})")) }
 }
 
 unsafe fn destroy_master(e: &Engine, clear: &GenericDetour<MapClear>, m: Master) {
@@ -158,9 +172,12 @@ unsafe extern "C" fn build_detour(out: *mut c_void, desc: *mut c_void, list: *mu
         // the engine build the map and compare. One difference ends sharing for the session.
         Some(a) if MODE.load(Ordering::Relaxed) == 2 || SAME.load(Ordering::Relaxed) < VERIFY_FIRST => {
             let r = h.call(out, desc, list);
-            if maps_equal(a, out as usize) { SAME.fetch_add(1, Ordering::Relaxed); } else {
-                MODE.store(2, Ordering::Relaxed);
-                if DIFF.fetch_add(1, Ordering::Relaxed) < 8 { log!("recruit permission cache: a rebuilt map differs from the first one (desc {:#x}, list {:#x}); sharing is off for this session", key.0, key.1); }
+            match maps_differ(a, out as usize) {
+                None => { SAME.fetch_add(1, Ordering::Relaxed); }
+                Some(what) => {
+                    MODE.store(2, Ordering::Relaxed);
+                    if DIFF.fetch_add(1, Ordering::Relaxed) < 8 { log!("recruit permission cache: a rebuilt map differs from the first one ({what}; desc {:#x}, list {:#x}); sharing is off for this session", key.0, key.1); }
+                }
             }
             return r;
         }
