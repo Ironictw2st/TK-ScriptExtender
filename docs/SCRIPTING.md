@@ -1377,7 +1377,7 @@ end)
 ```
 
 score = the game's AI quality of the unit (`se.query.unit_quality`, the old unit's scaled up with
-its experience) x element weight (the general's element comes from `character_subtype_key()`,
+its experience) x element weight (the general's element comes from `character_subtype_key()`, or, for captains and other leaders whose subtype names none, from their bodyguard unit in slot 0;
 the unit's from its key: the first `_`-separated word that names an element) x
 `duplicate_penalty` per copy already in the retinue. Empty slots take the best score; an occupied
 slot is replaced when the best score is at least `min_gain` times the old one.
@@ -1393,6 +1393,7 @@ slot is replaced when the best score is at least `min_gain` times the old one.
 | `income_turns`, `max_spend` | 3, 4000 | per-turn budget = min(treasury - reserve, income x income_turns, max_spend) |
 | `min_income` | 0 | factions with a lower projected income do nothing |
 | `duplicate_penalty` | 0.92 | score multiplier per copy of the same unit in the retinue |
+| `max_copies` | 0 | hard limit of copies of one unit per retinue (0 = none) |
 
 Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `tools/test_lua_aipolicy.py`.
 

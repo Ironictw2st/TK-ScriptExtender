@@ -2052,6 +2052,7 @@ se.ai_recruit.config = se.ai_recruit.config or {
 	max_spend = 4000,           -- ... and at most this much per turn
 	min_income = 0,             -- a faction whose projected income is below this does nothing
 	duplicate_penalty = 0.92,   -- score multiplier per copy of the same unit already in the retinue
+	max_copies = 0,             -- hard limit of copies of one unit per retinue (0 = no limit)
 	log_orders = true,
 }
 
@@ -2200,7 +2201,9 @@ function se.ai_recruit.plan(faction_key, money)
 						if empty or old_score > 0 then
 							local best
 							for _, o in ipairs(se.query.recruitable(ch.cqi, s.index) or {}) do
-								if num(o.reasons) == 0 and o.key ~= "" and o.key ~= s.unit_key and (num(o.cost) or 0) <= budget then
+								local limit = num(cfg.max_copies) or 0
+								if num(o.reasons) == 0 and o.key ~= "" and o.key ~= s.unit_key and (num(o.cost) or 0) <= budget
+									and (limit <= 0 or (copies[o.key] or 0) < limit) then
 									local q
 									if not empty and cfg.same_role_only then q = shared_quality(old_rows, o.key) else local _, b = se.query.unit_quality(o.key) q = b end
 									if q and q > 0 then
@@ -2213,7 +2216,7 @@ function se.ai_recruit.plan(faction_key, money)
 							end
 							if best and (empty or best.score >= old_score * cfg.min_gain) then
 								candidates[#candidates + 1] = { op = empty and "recruit" or "replace", force = force.cqi, character = ch.cqi, slot = s.index, general = ch.element,
-									unit = best.unit, cost = best.cost, old = (not empty) and s.unit_key or nil, score = best.score, old_score = old_score,
+									unit = best.unit, cost = best.cost, copies = copies[best.unit] or 0, old = (not empty) and s.unit_key or nil, score = best.score, old_score = old_score,
 									gain = empty and best.score or (best.score / old_score) }
 							end
 						end
@@ -2239,7 +2242,8 @@ function se.ai_recruit.plan(faction_key, money)
 			-- new unit more than once per turn beyond what the penalty allowed for
 			local tag = c.character .. "|" .. c.unit
 			picked[tag] = (picked[tag] or 0) + 1
-			if picked[tag] <= 2 then
+			local limit = num(cfg.max_copies) or 0
+			if picked[tag] <= 2 and (limit <= 0 or (c.copies or 0) + picked[tag] <= limit) then
 				budget = budget - c.cost
 				per_char[c.character] = (per_char[c.character] or 0) + 1
 				per_force[c.force] = (per_force[c.force] or 0) + 1
