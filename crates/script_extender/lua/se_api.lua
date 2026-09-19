@@ -1663,6 +1663,13 @@ function se.profile.start(seconds, delay_seconds, label)
 	return se_profile_start(num(seconds) or 20, num(delay_seconds) or 3, str(label or "run"))
 end
 
+-- se.profile.stop() -> ok, message : end the running profile now (its reports are still written).
+function se.profile.stop()
+	local okn, err = need("se_profile_stop")
+	if not okn then return false, err end
+	return se_profile_stop()
+end
+
 -- Pretty-print helper for console use: se.dump(se.query.retinue(1))
 function se.dump(v, indent)
 	indent = indent or ""

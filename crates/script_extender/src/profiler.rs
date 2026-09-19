@@ -56,10 +56,28 @@ extern "system" {
     fn Sleep(ms: u32);
 }
 
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
+}
+
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static STOP: AtomicBool = AtomicBool::new(false);
 
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_profile_start", se_profile_start);
+    lua::set_global_fn(l, "se_profile_stop", se_profile_stop);
+}
+
+/// se_profile_stop() -> ok, msg : end the running profile now; its reports are still written.
+unsafe extern "C" fn se_profile_stop(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let running = RUNNING.load(Ordering::SeqCst);
+    if running { STOP.store(true, Ordering::SeqCst); }
+    (api.pushboolean)(l, running as c_int);
+    lua::push_str(l, if running { "stopping; the reports are written in a moment" } else { "no profile is running" });
+    2
 }
 
 /// Unwound sample: frames[0] = the function RIP was in (0 when outside the exe), then callers.
@@ -256,14 +274,21 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
     repick(&mut last, &mut picked);
     log!("profiler '{label}': {} threads, {} unwind entries, sampling the {MAX_THREADS} busiest (re-picked every second) for {seconds} s", all.len(), rfs.len());
 
+    // The run is bounded by wall-clock time, not by a tick count: Sleep(1) lasts ~15 ms unless
+    // the timer resolution is raised, which is done for the duration of the run.
     let ticks = seconds as usize * 1000;
     let mut samples: Vec<Sample> = Vec::with_capacity(ticks * MAX_THREADS + 16);
+    timeBeginPeriod(1);
+    let deadline = std::time::Duration::from_secs(seconds as u64);
+    let mut next_repick = std::time::Duration::from_secs(1);
     let mut ctx = Ctx([0u8; 1232]);
     let mut stack = vec![0u8; STACK_BYTES];
     let me = GetCurrentProcess();
     let started = std::time::Instant::now();
-    for tick in 0..ticks {
-        if tick % 1000 == 999 { repick(&mut last, &mut picked); }
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= deadline || STOP.load(Ordering::SeqCst) { break; }
+        if elapsed >= next_repick { repick(&mut last, &mut picked); next_repick += std::time::Duration::from_secs(1); }
         for ti in picked.iter() {
             let h = &all[*ti].1;
             if samples.len() == samples.capacity() { break; }
@@ -290,6 +315,8 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
         }
         Sleep(1);
     }
+    timeEndPeriod(1);
+    STOP.store(false, Ordering::SeqCst);
     let wall = started.elapsed().as_secs_f32();
 
     // aggregate
