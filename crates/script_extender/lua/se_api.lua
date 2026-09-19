@@ -1651,7 +1651,7 @@ end
 
 se.profile = se.profile or {}
 
--- se.query.perf() -> { installed, ttl_ms, hits, misses, passed_through, entries, miss_new, miss_expired, miss_state, stamp_failed }
+-- se.query.perf() -> { installed, ttl_ms, hits, misses, passed_through, entries, miss_*, stamp_failed, ai_*, perm_*, file_probes, file_probes_skipped }
 --   Counters of the UI recruit-list cache (script_extender.cfg: ui_recruit_cache_ms, default
 --   250, 0 = off). hits = UI queries answered from the cache, misses = UI queries the engine
 --   computed, passed_through = calls from the AI and other non-UI callers (never cached).
@@ -1700,6 +1700,137 @@ function se.dump(v, indent)
 		end
 	end
 	return table.concat(parts, "\n")
+end
+
+----------------------------------------------------------------------------------------------
+-- diagnostics: which script listeners cost the time (DLL 0.35+)
+----------------------------------------------------------------------------------------------
+
+se.diag = se.diag or {}
+
+-- se.diag.listeners_start() -> ok, message
+--   Wraps the condition and the callback of every listener registered with core:add_listener
+--   (existing ones and those added later) in a stopwatch. Behaviour is unchanged: same
+--   arguments, same return value, errors pass through to the game's own pcall. Times are
+--   inclusive (a callback that triggers other events includes their listeners). Read-only
+--   towards the game; not saved; lasts until the Lua state is rebuilt (load / restart).
+-- se.diag.listeners_report([top]) -> array of rows, also written to the log
+--   rows sorted by total time: { event, name, calls, fired, total_ms, condition_ms, callback_ms }
+-- se.diag.listeners_reset() : zero the numbers (e.g. right before End Turn)
+local diag_rows, diag_on, diag_level = {}, false, 0
+
+local function diag_row(listener)
+	local key = str(listener.event) .. "|" .. str(listener.name)
+	local row = diag_rows[key]
+	if not row then
+		row = { event = str(listener.event), name = str(listener.name), calls = 0, fired = 0, condition_us = 0, callback_us = 0 }
+		diag_rows[key] = row
+	end
+	return row
+end
+
+local function diag_wrap(listener, push, pop)
+	if type(listener) ~= "table" or listener.__se_timed then return end
+	listener.__se_timed = true
+	local row = diag_row(listener)
+	local condition, callback = listener.condition, listener.callback
+	if type(condition) == "function" then
+		listener.condition = function(context)
+			local level = diag_level + 1
+			diag_level = level
+			local d = push(level)
+			local r = condition(context)
+			row.condition_us = row.condition_us + pop(d)
+			row.calls = row.calls + 1
+			diag_level = level - 1
+			return r
+		end
+	end
+	if type(callback) == "function" then
+		listener.callback = function(context)
+			local level = diag_level + 1
+			diag_level = level
+			local d = push(level)
+			local r = callback(context)
+			row.callback_us = row.callback_us + pop(d)
+			row.fired = row.fired + 1
+			diag_level = level - 1
+			return r
+		end
+	end
+end
+
+function se.diag.listeners_start()
+	local okn, err = need("se_timer_push", "se_timer_pop")
+	if not okn then return false, err end
+	local core = se.core or G("core")
+	if type(core) ~= "table" or type(core.event_listeners) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	local push, pop = G("se_timer_push"), G("se_timer_pop")
+	local wrapped = 0
+	for _, list in pairs(core.event_listeners) do
+		if type(list) == "table" then
+			for i = 1, #list do
+				if type(list[i]) == "table" and not list[i].__se_timed then wrapped = wrapped + 1 end
+				diag_wrap(list[i], push, pop)
+			end
+		end
+	end
+	if not diag_on then
+		diag_on = true
+		local add = core.add_listener
+		core.add_listener = function(self, name, event, condition, callback, persistent)
+			local r = add(self, name, event, condition, callback, persistent)
+			local list = self.event_listeners and self.event_listeners[event]
+			if type(list) == "table" and list[#list] and list[#list].name == name then diag_wrap(list[#list], push, pop) end
+			return r
+		end
+		-- a listener that raises an error never reaches its own bookkeeping: the dispatcher
+		-- (which pcalls every listener) restores the nesting level afterwards
+		local dispatch = core.event_callback
+		if type(dispatch) == "function" then
+			core.event_callback = function(self, eventname, context)
+				local level = diag_level
+				local r = dispatch(self, eventname, context)
+				diag_level = level
+				return r
+			end
+		end
+	end
+	return true, "timing " .. wrapped .. " listeners (new ones are added as they register)"
+end
+
+function se.diag.listeners_reset()
+	for _, row in pairs(diag_rows) do
+		row.calls, row.fired, row.condition_us, row.callback_us = 0, 0, 0, 0
+	end
+	return true
+end
+
+function se.diag.listeners_report(top)
+	local rows, events = {}, {}
+	for _, row in pairs(diag_rows) do
+		local total = row.condition_us + row.callback_us
+		if row.calls > 0 or row.fired > 0 then
+			rows[#rows + 1] = { event = row.event, name = row.name, calls = row.calls, fired = row.fired,
+				total_ms = total / 1000, condition_ms = row.condition_us / 1000, callback_ms = row.callback_us / 1000 }
+			events[row.event] = (events[row.event] or 0) + total / 1000
+		end
+	end
+	table.sort(rows, function(a, b) return a.total_ms > b.total_ms end)
+	local sum = 0
+	for _, r in ipairs(rows) do sum = sum + r.total_ms end
+	log(string.format("listener timing: %d active listeners, %.0f ms in total (inclusive times)", #rows, sum))
+	local by_event = {}
+	for e, ms in pairs(events) do by_event[#by_event + 1] = { e, ms } end
+	table.sort(by_event, function(a, b) return a[2] > b[2] end)
+	for i = 1, math.min(#by_event, 12) do
+		log(string.format("  event %-44s %9.1f ms", by_event[i][1], by_event[i][2]))
+	end
+	for i = 1, math.min(#rows, num(top) or 30) do
+		local r = rows[i]
+		log(string.format("  %9.1f ms  cond %8.1f  cb %8.1f  calls %6d fired %6d  %s / %s", r.total_ms, r.condition_ms, r.callback_ms, r.calls, r.fired, r.event, r.name))
+	end
+	return rows
 end
 
 log("se_api loaded (dll " .. se.version() .. ")")

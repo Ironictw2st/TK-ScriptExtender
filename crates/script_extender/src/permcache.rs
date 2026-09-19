@@ -246,21 +246,21 @@ pub fn install(t: &Table) {
             log!("recruit permission cache: could not create the detours");
             return;
         };
+        // stored before they are enabled: a detour must never run without its trampoline
+        let (_, _, _) = (CLEAR.set(x), BUILD.set(b), CORE.set(c));
+        let (Some(x), Some(b), Some(c)) = (CLEAR.get(), BUILD.get(), CORE.get()) else { return };
         if crate::freeze::with_threads_frozen(clear as usize, 16, || x.enable()).is_err() {
             log!("recruit permission cache: could not hook the map destructor; off");
             return;
         }
-        let _ = CLEAR.set(x);
         if crate::freeze::with_threads_frozen(build as usize, 16, || b.enable()).is_err() {
             log!("recruit permission cache: could not hook the map builder; off");
             return;
         }
-        let _ = BUILD.set(b);
         if crate::freeze::with_threads_frozen(core_fn as usize, 16, || c.enable()).is_err() {
             log!("recruit permission cache: could not hook the list routine; off");
             return;
         }
-        let _ = CORE.set(c);
     }
     log!("recruit permission cache installed (mode {mode}: {})", if mode == 2 { "verify only" } else { "share" });
 }

@@ -133,6 +133,8 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   permission hash map per candidate unit; now one per list call, shared as views, self-checked
   for the first 3000 reuses per session. Measured on a modded late campaign: end turn 76 s ->
   45 s (income hook) -> ~30 s (permission maps). Details: `notes/performance.md`.
+- 0.35 `file_probe_cache_ms` (missing-directory cache for loose-file lookups), Lua listener
+  timing (`se.diag.listeners_*`), `diag_diplomacy` (measurement).
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 

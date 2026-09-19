@@ -439,12 +439,15 @@ pub unsafe fn register(l: *mut LuaState) {
 /// se_perf_stats() -> "k=v;..." counters of the UI recruit cache
 unsafe extern "C" fn se_perf_stats(l: *mut LuaState) -> c_int {
     let entries = CACHE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={};ai_mode={};ai_scopes={};ai_calls={};ai_same={};ai_diff={};ai_served={};perm_mode={};perm_built={};perm_shared={};perm_same={};perm_diff={};perm_unscoped={}",
+    let s = format!("installed={};ttl_ms={};last_treasury_seen={};hits={};misses={};passed_through={};entries={entries};miss_new={};miss_expired={};miss_state={};stamp_failed={};ai_mode={};ai_scopes={};ai_calls={};ai_same={};ai_diff={};ai_served={};perm_mode={};perm_built={};perm_shared={};perm_same={};perm_diff={};perm_unscoped={};file_probes={};file_probes_skipped={};dip_scans={};dip_calls={};dip_distinct={};dip_distinct_params={};dip_unscoped={}",
         BUILD.get().is_some() as u8, TTL_MS.load(Ordering::Relaxed), LAST_GENERATION.load(Ordering::Relaxed), HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed), PASSED.load(Ordering::Relaxed),
         MISS_NEW.load(Ordering::Relaxed), MISS_EXPIRED.load(Ordering::Relaxed), MISS_STATE.load(Ordering::Relaxed), STAMP_FAILED.load(Ordering::Relaxed),
         AI_MODE.load(Ordering::Relaxed), AI_SCOPES.load(Ordering::Relaxed), AI_CALLS.load(Ordering::Relaxed), AI_SAME.load(Ordering::Relaxed), AI_DIFF.load(Ordering::Relaxed), AI_SERVED.load(Ordering::Relaxed),
         crate::permcache::MODE.load(Ordering::Relaxed), crate::permcache::BUILT.load(Ordering::Relaxed), crate::permcache::SHARED.load(Ordering::Relaxed),
-        crate::permcache::SAME.load(Ordering::Relaxed), crate::permcache::DIFF.load(Ordering::Relaxed), crate::permcache::UNSCOPED.load(Ordering::Relaxed));
+        crate::permcache::SAME.load(Ordering::Relaxed), crate::permcache::DIFF.load(Ordering::Relaxed), crate::permcache::UNSCOPED.load(Ordering::Relaxed),
+        crate::fileprobe::CALLS.load(Ordering::Relaxed), crate::fileprobe::SKIPPED.load(Ordering::Relaxed),
+        crate::diag::DIP_SCANS.load(Ordering::Relaxed), crate::diag::DIP_CALLS.load(Ordering::Relaxed), crate::diag::DIP_DISTINCT.load(Ordering::Relaxed),
+        crate::diag::DIP_DISTINCT_PARAMS.load(Ordering::Relaxed), crate::diag::DIP_UNSCOPED.load(Ordering::Relaxed));
     lua::push_str(l, &s);
     1
 }

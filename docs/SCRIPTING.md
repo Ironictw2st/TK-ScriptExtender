@@ -1296,6 +1296,8 @@ folders). None of them changes what the game computes.
 |---|---|---|
 | `recruit_perm_cache` | `1` | The engine's "what can this retinue slot recruit" routine rebuilt a complete table of the faction's unit permissions **for every candidate unit** (units x permissions per list; with a large unit roster this was the biggest single cost of an AI turn and of an open character panel). The DLL lets the engine build each table once per list and reuses it. The first 3000 reuses of a session are checked against the engine's own rebuild; one difference turns the feature off for the session (DLL log). `0` = off, `2` = check only. |
 | `ui_recruit_cache_ms` | `5000` | UI only: a recruitable-unit list asked for again by the panels is served from memory while the faction's treasury and the turn are unchanged, for at most this long. `0` = off. |
+| `file_probe_cache_ms` | `10000` | Before reading a file from a pack the engine looks for a loose copy in every search root (each subscribed mod folder, `data`, ...) and remembers nothing: zooming the camera in fired 1316 failed lookups in one burst. The DLL remembers for this long that a *directory* does not exist and answers lookups into it without a system call. A folder created while the game runs is seen after at most this time. `0` = off. |
+| `diag_diplomacy` | `0` | Measurement only (`dip_*` counters). |
 | `ai_recruit_cache` | `0` | Diagnostic (whole-list cache inside the AI's recruitment budget planner). Measured as not worth it; leave off. |
 
 `recruit_perm_cache` and `ai_recruit_cache` are part of the multiplayer sync fingerprint: both
@@ -1306,6 +1308,13 @@ se.query.perf()              -- counters: hits / misses (UI cache), perm_built /
                              -- perm_same / perm_diff (permission tables), ai_* (diagnostic)
 se.profile.start(50, 4, "endturn")  -- CPU sampling: 50 s after a 4 s delay; report
                                     -- profile_endturn.txt + .folded.txt in <dll folder>\profilesse.profile.stop()            -- end the run now; the report is written when a run ends
+
+se.core = core                      -- hand over the event manager once
+se.diag.listeners_start()           -- time every core:add_listener listener from now on
+se.diag.listeners_reset()           -- zero the numbers (e.g. right before End Turn)
+se.diag.listeners_report(40)        -- log totals per event and the 40 most expensive listeners;
+                                    -- returns rows { event, name, calls, fired, total_ms,
+                                    -- condition_ms, callback_ms } (inclusive times)
 ```
 
 `tools/profile_tree.py <folded.txt> [--min 2] [--depth 14] [--callers <fn>] [--minus <baseline>]`

@@ -28,6 +28,8 @@ mod buildings;
 mod alliances;
 mod autoresolve;
 mod income;
+mod diag;
+mod fileprobe;
 mod perf;
 mod permcache;
 mod profiler;
@@ -93,6 +95,8 @@ fn bootstrap() {
     income::install(&table);
     perf::install(&table);
     permcache::install(&table);
+    fileprobe::install(&table);
+    diag::install(&table);
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }

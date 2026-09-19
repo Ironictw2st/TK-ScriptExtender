@@ -205,7 +205,7 @@ pub fn apply_config() {
                 "build_number" => build = v.to_string(),
                 "build_number_short" => short = v.to_string(),
                 "build_modified" => modified = Some(v == "1" || v.eq_ignore_ascii_case("true")),
-                "autoresolve_hooks" | "horde_income" | "horde_income_category" | "ui_recruit_cache_ms" | "ai_recruit_cache" | "recruit_perm_cache" => {}
+                "autoresolve_hooks" | "horde_income" | "horde_income_category" | "ui_recruit_cache_ms" | "ai_recruit_cache" | "recruit_perm_cache" | "file_probe_cache_ms" | "diag_diplomacy" => {}
                 _ => log!("config: unknown key '{k}' ignored"),
             }
         }
