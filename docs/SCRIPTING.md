@@ -1358,6 +1358,8 @@ multiplayer machine), at normal recruitment cost:
 ```lua
 se.core = core
 se.ai_recruit.element_order.wood = { "wood", "metal", "water", "earth", "fire" }  -- best first, per general element
+se.ai_recruit.element_order.fire = { "fire", "earth", "water:cavalry", "metal", "wood", "water" }  -- "element:cavalry" / "element:infantry" entries: a unit takes the best entry it matches
+se.ai_recruit.unit_class["my_unit"] = "cavalry"       -- class of units the quality table does not know (cavalry = a role group naming cavalry)
 se.ai_recruit.element_weight = { 1.30, 1.15, 1.00, 0.90, 0.80 }                  -- multiplier by rank in that list
 se.ai_recruit.unit_element["my_unit"] = "metal"       -- keys that do not name their element
 se.ai_recruit.quality_override["my_unit"] = 2400      -- units the game's quality table lacks

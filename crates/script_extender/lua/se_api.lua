@@ -2019,16 +2019,22 @@ end
 -- script may edit before or after se.ai_recruit.enable().
 ----------------------------------------------------------------------------------------------
 
--- best to worst unit element per general element
+-- best to worst per general element. An entry is "element" or "element:class" with class =
+-- "cavalry" | "infantry" (se.ai_recruit.class_of); a unit takes the best entry it matches, so
+-- Earth and Fire generals rank Water CAVALRY (horse archers) above the infantry elements while
+-- Water infantry stays where the plain "water" entry puts it.
 se.ai_recruit.element_order = se.ai_recruit.element_order or {
 	wood  = { "wood", "metal", "water", "earth", "fire" },
 	metal = { "metal", "wood", "water", "earth", "fire" },
 	water = { "water", "earth", "metal", "wood", "fire" },
-	fire  = { "fire", "earth", "metal", "wood", "water" },
-	earth = { "earth", "fire", "water", "metal", "wood" },
+	fire  = { "fire", "earth", "water:cavalry", "metal", "wood", "water" },
+	earth = { "earth", "fire", "water:cavalry", "water", "metal", "wood" },
 }
--- score multiplier by rank in that list (1 = the general's favourite element)
+-- score multiplier by rank in that list (1 = the general's favourite). A list longer than this
+-- table is spread evenly between the table's first and last value.
 se.ai_recruit.element_weight = se.ai_recruit.element_weight or { 1.30, 1.15, 1.00, 0.90, 0.80 }
+-- unit_class[unit_key] = "cavalry" | "infantry" for units the quality table does not know
+se.ai_recruit.unit_class = se.ai_recruit.unit_class or {}
 -- unit_element[unit_key] = "wood" ... for keys that do not carry their element
 se.ai_recruit.unit_element = se.ai_recruit.unit_element or {}
 
@@ -2065,12 +2071,42 @@ function se.ai_recruit.element_of(key)
 	return nil
 end
 
--- se.ai_recruit.element_factor(general_element, unit_element) -> multiplier (1 when unknown)
-function se.ai_recruit.element_factor(general_element, unit_element)
+-- se.ai_recruit.class_of(unit_key) -> "cavalry" | "infantry"
+--   cavalry = any of the unit's role groups in the game's quality table names cavalry
+--   (Default_land_cavalry_melee / _shock / _missile ...); everything else counts as infantry.
+function se.ai_recruit.class_of(unit_key)
+	unit_key = str(unit_key)
+	local forced = se.ai_recruit.unit_class[unit_key]
+	if forced then return forced end
+	for _, r in ipairs(se.query.unit_quality(unit_key) or {}) do
+		if str(r.group):lower():match("cavalry") then return "cavalry" end
+	end
+	return "infantry"
+end
+
+local function rank_weight(rank, count)
+	local w = se.ai_recruit.element_weight
+	if #w >= count then return num(w[rank]) or 1 end
+	if #w == 0 then return 1 end
+	if count <= 1 then return num(w[1]) or 1 end
+	local first, last = num(w[1]) or 1, num(w[#w]) or 1
+	return first + (last - first) * (rank - 1) / (count - 1)
+end
+
+-- se.ai_recruit.element_factor(general_element, unit_key) -> multiplier (1 when unknown)
+--   The weight of the best entry of the general's list that the unit matches.
+function se.ai_recruit.element_factor(general_element, unit_key)
 	local order = general_element and se.ai_recruit.element_order[general_element]
-	if not order or not unit_element then return 1 end
-	for rank, e in ipairs(order) do
-		if e == unit_element then return num(se.ai_recruit.element_weight[rank]) or 1 end
+	local element = se.ai_recruit.element_of(unit_key)
+	if not order or not element then return 1 end
+	local class
+	for rank, entry in ipairs(order) do
+		local e, c = str(entry):match("^([^:]+):?(.*)$")
+		if e == element then
+			if c == "" then return rank_weight(rank, #order) end
+			class = class or se.ai_recruit.class_of(unit_key)
+			if c == class then return rank_weight(rank, #order) end
+		end
 	end
 	return 1
 end
@@ -2150,7 +2186,7 @@ function se.ai_recruit.plan(faction_key, money)
 							local top = 0
 							for _, r in ipairs(old_rows) do if r.quality_at_max_xp > top then top = r.quality_at_max_xp end end
 							local xp = math.min(num(s.experience) or 0, se.ai_recruit.max_experience) / se.ai_recruit.max_experience
-							old_score = (old_q + math.max(0, top - old_q) * xp) * se.ai_recruit.element_factor(ch.element, se.ai_recruit.element_of(s.unit_key))
+							old_score = (old_q + math.max(0, top - old_q) * xp) * se.ai_recruit.element_factor(ch.element, s.unit_key)
 						end
 						-- an occupied slot whose unit has no known quality cannot be judged: leave it
 						if empty or old_score > 0 then
@@ -2160,7 +2196,7 @@ function se.ai_recruit.plan(faction_key, money)
 									local q
 									if not empty and cfg.same_role_only then q = shared_quality(old_rows, o.key) else local _, b = se.query.unit_quality(o.key) q = b end
 									if q and q > 0 then
-										local score = q * se.ai_recruit.element_factor(ch.element, se.ai_recruit.element_of(o.key)) * (cfg.duplicate_penalty ^ (copies[o.key] or 0))
+										local score = q * se.ai_recruit.element_factor(ch.element, o.key) * (cfg.duplicate_penalty ^ (copies[o.key] or 0))
 										if not best or score > best.score or (score == best.score and o.key < best.unit) then
 											best = { unit = o.key, cost = num(o.cost) or 0, score = score }
 										end
