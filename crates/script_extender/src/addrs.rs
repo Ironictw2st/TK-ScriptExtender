@@ -9,8 +9,23 @@ use crate::log;
 use core::ffi::c_void;
 use std::collections::HashMap;
 
+/// The first supported build, kept because the release workflow writes it as the manifest's
+/// top-level fingerprint (what older TK Mod Manager versions read). `BUILDS` is what the
+/// bootstrap checks.
+#[allow(dead_code)]
 const BUILD_TIMESTAMP: u32 = 0x69ce4c84;
+#[allow(dead_code)]
 const BUILD_SIZE_OF_IMAGE: usize = 0x4836000;
+
+/// Every build these RVAs are valid for: (timestamp, size of image, store). The Epic build of
+/// 1.7.2.0 is byte-identical to the Steam one in `.text` and `.data` (only build stamps in
+/// `.rdata` / `.rsrc` differ), so the same table applies; the anchors still verify it.
+/// `tools/port_addrs.py` compares two exes and reports whether that still holds.
+/// The release workflow reads these literals, so keep the `(0x…, 0x…, "Store")` shape.
+const BUILDS: &[(u32, usize, &str)] = &[
+    (0x69ce4c84, 0x4836000, "Steam"),
+    (0x69ce4df8, 0x4836000, "Epic"),
+];
 
 const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     ("lua_gettop", 0x75ce70, [0x48, 0x8b, 0x41, 0x10, 0x48, 0x2b, 0x41, 0x18]),
@@ -182,11 +197,12 @@ pub fn resolve(base: usize, size: usize) -> Option<Table> {
         )
     };
     log!("exe fingerprint: timestamp=0x{ts:x} size_of_image=0x{soi:x} (module size 0x{size:x})");
-    if ts != BUILD_TIMESTAMP || soi != BUILD_SIZE_OF_IMAGE {
-        log!(
-            "fingerprint mismatch: expected timestamp=0x{BUILD_TIMESTAMP:x} size_of_image=0x{BUILD_SIZE_OF_IMAGE:x}"
-        );
-        return None;
+    match BUILDS.iter().find(|(t, s, _)| *t == ts && *s == soi) {
+        Some((_, _, store)) => log!("known build ({store})"),
+        None => {
+            log!("fingerprint mismatch: known builds are {BUILDS:x?}");
+            return None;
+        }
     }
     let mut map = HashMap::new();
     let mut bad = 0;

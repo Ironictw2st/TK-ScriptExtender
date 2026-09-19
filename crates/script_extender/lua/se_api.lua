@@ -293,7 +293,7 @@ local function parse_items(s)
 	return items
 end
 
--- se.query.retinue(cqi) -> { {index, unit_key, strength, experience, can_recruit, is_recruiting, recruiting}, ... }
+-- se.query.retinue(cqi) -> { {index, slot_cqi, unit_key, strength, experience, can_recruit, is_recruiting, recruiting}, ... }
 function se.query.retinue(cqi)
 	local q, err = se.character(cqi)
 	if not q then return nil, err end
@@ -302,6 +302,9 @@ function se.query.retinue(cqi)
 	local out = {}
 	for _, e in ipairs(list) do
 		local row = { index = e.index, unit_key = e.unit_key }
+		-- cqi of the persistent slot = what UnitRecruitmentInitiated reports as context:cqi()
+		local okq, scqi = pcall(function() return e.slot:command_queue_index() end)
+		row.slot_cqi = okq and num(scqi) or nil
 		local u = unit_of_slot(e)
 		if u then
 			local oks, st = pcall(function() return u:percentage_proportion_of_full_strength() end)
@@ -1965,7 +1968,7 @@ function se.ai_recruit.report(faction_key, opts)
 					local crow = { cqi = num(cqi), slots = {} }
 					for _, slot in ipairs(retinue) do
 						report.slots = report.slots + 1
-						local srow = { index = slot.index, unit = slot.unit_key, experience = slot.experience, strength = slot.strength, recruiting = slot.is_recruiting and slot.recruiting or nil }
+						local srow = { index = slot.index, slot_cqi = slot.slot_cqi, unit = slot.unit_key, experience = slot.experience, strength = slot.strength, recruiting = slot.is_recruiting and slot.recruiting or nil }
 						if not slot.unit_key or slot.unit_key == "" then
 							report.empty = report.empty + 1
 						elseif not slot.is_recruiting then

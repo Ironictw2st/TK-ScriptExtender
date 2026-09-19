@@ -21,10 +21,9 @@
 //! se_unit_quality(q_faction, unit_key) -> string "group=quality,quality_at_max_xp;..." from the
 //!     live `cdir_military_generator_unit_qualities` table (the AI's own unit ranking): accessor
 //!     FUN_1408cad20(db) -> I_DATABASE_TABLE with 0x20-byte records in the vector at table+0x10
-//!     {cap, count @+0x14, data @+0x18}; a record holds the group record, the land unit record
-//!     and two numbers. The record layout is detected per call (pointer slots whose record key
-//!     reads as text, numbers from the remaining words) and the first records are dumped to the
-//!     DLL log once, so the layout can be pinned down from a live session.
+//!     {cap, count @+0x14, data @+0x18} of POINTERS to the records {vtable, group record*, land
+//!     unit record*, u32 quality, u32 quality_at_max_xp} (verified live); indexed once per
+//!     session.
 
 use crate::addrs::Table;
 use crate::log;
@@ -52,7 +51,6 @@ static HOOK: OnceLock<GenericDetour<Planner>> = OnceLock::new();
 static TRACE: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static PASSES: Mutex<VecDeque<Pass>> = Mutex::new(VecDeque::new());
-static DUMPED: AtomicBool = AtomicBool::new(false);
 
 const MAX_PASSES: usize = 512;
 
@@ -161,54 +159,65 @@ unsafe extern "C" fn se_ai_recruit_passes(l: *mut LuaState) -> c_int {
     1
 }
 
-/// A number stored either as f32 or as integer (the engine has both kinds of columns).
-fn number(bits: u32) -> f32 {
-    let f = f32::from_bits(bits);
-    if f.is_finite() && (f == 0.0 || (f.abs() >= 1.0e-3 && f.abs() < 1.0e9)) { f } else { bits as i32 as f32 }
+/// Key of a unit-group record: a CA::String embedded at record+8 {u32 len, u32 cap, char* @+8},
+/// short strings inline (top nibble of the pointer word = 8). Verified live 2026-09-19.
+unsafe fn group_key(rec: usize) -> String {
+    if !readable(rec, 0x18) { return "?".into(); }
+    let (len, word) = (rd(rec + 8) as usize, rq(rec + 0x10));
+    let (ptr, len) = if word >> 60 == 8 { (rec + 8, (word >> 56) & 0xf) } else { (word, len) };
+    if len == 0 || len > 96 || !readable(ptr, len) { return "?".into(); }
+    String::from_utf8_lossy(core::slice::from_raw_parts(ptr as *const u8, len)).into_owned()
+}
+
+/// unit key -> [(group key, quality, quality_at_max_xp)], built once per session: the table is
+/// static data. Verified live 2026-09-19 (925 rows with the user's mods): the vector holds
+/// POINTERS to 0x20-byte records {vtable, group record*, land unit record*, u32 quality,
+/// u32 quality_at_max_xp}.
+static QUALITIES: OnceLock<std::collections::HashMap<String, Vec<(String, u32, u32)>>> = OnceLock::new();
+
+unsafe fn build_index(table: usize) -> Result<std::collections::HashMap<String, Vec<(String, u32, u32)>>, String> {
+    let (count, data) = (rd(table + 0x14) as usize, rq(table + 0x18));
+    if count == 0 || count > 50_000 || !readable(data, count * 8) {
+        return Err(format!("unit qualities table layout not as expected (count {count}, data {:#x})", data));
+    }
+    let vt = rq(rq(data));
+    let mut map: std::collections::HashMap<String, Vec<(String, u32, u32)>> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut skipped = 0usize;
+    for i in 0..count {
+        let r = rq(data + i * 8);
+        if !readable(r, 0x20) || rq(r) != vt { skipped += 1; continue; }
+        let (g, u) = (rq(r + 8), rq(r + 0x10));
+        let unit = crate::recruit::record_key(u);
+        if unit == "?" { skipped += 1; continue; }
+        let group = groups.entry(g).or_insert_with(|| group_key(g)).clone();
+        map.entry(unit).or_default().push((group, rd(r + 0x18), rd(r + 0x1c)));
+    }
+    log!("unit qualities: {count} rows, {} units indexed, {skipped} rows skipped", map.len());
+    if map.is_empty() { return Err("no row of the unit qualities table could be read".into()); }
+    Ok(map)
 }
 
 unsafe extern "C" fn se_unit_quality(l: *mut LuaState) -> c_int {
     let fail = |l: *mut LuaState, msg: &str| -> c_int { lua::push_str(l, ""); lua::push_str(l, msg); 2 };
     let Some(e) = ENGINE.get() else { return fail(l, "engine table missing") };
-    let faction = match crate::progression::faction_from_arg(l, 1) { Ok(f) => f, Err(m) => return fail(l, &m) };
     let key = lua::to_str(l, 2);
-    let world = rq(rq(faction + 0x288) + 0x78);
-    if world == 0 || !readable(world + 0x3b38, 8) { return fail(l, "campaign model not reachable from the faction") }
-    let db = (e.db_get)((world + 0x3b38) as *mut c_void);
-    if db.is_null() { return fail(l, "database not available") }
-    let table = (e.qualities_table)(db) as usize;
-    if !readable(table, 0x30) { return fail(l, "unit qualities table not available") }
-    let (count, data) = (rd(table + 0x14) as usize, rq(table + 0x18));
-    if count == 0 || count > 50_000 || !readable(data, count * 0x20) {
-        return fail(l, &format!("unit qualities table layout not as expected (count {count}, data {:#x})", data));
-    }
-    if !DUMPED.swap(true, Ordering::Relaxed) {
-        log!("unit qualities table {:#x}: {count} records of 0x20 bytes at {:#x}", table, data);
-        for i in 0..count.min(3) {
-            let r = data + i * 0x20;
-            log!("  record {i}: {:016x} {:016x} {:016x} {:016x} keys '{}' '{}' '{}'", rq(r), rq(r + 8), rq(r + 0x10), rq(r + 0x18),
-                crate::recruit::record_key(rq(r)), crate::recruit::record_key(rq(r + 8)), crate::recruit::record_key(rq(r + 0x10)));
+    if QUALITIES.get().is_none() {
+        let faction = match crate::progression::faction_from_arg(l, 1) { Ok(f) => f, Err(m) => return fail(l, &m) };
+        let world = rq(rq(faction + 0x288) + 0x78);
+        if world == 0 || !readable(world + 0x3b38, 8) { return fail(l, "campaign model not reachable from the faction") }
+        let db = (e.db_get)((world + 0x3b38) as *mut c_void);
+        if db.is_null() { return fail(l, "database not available") }
+        let table = (e.qualities_table)(db) as usize;
+        if !readable(table, 0x30) { return fail(l, "unit qualities table not available") }
+        match build_index(table) {
+            Ok(map) => { let _ = QUALITIES.set(map); }
+            Err(m) => return fail(l, &m),
         }
     }
     let mut out = String::new();
-    for i in 0..count {
-        let r = data + i * 0x20;
-        let mut keys: Vec<String> = Vec::new();
-        let mut numbers: Vec<f32> = Vec::new();
-        for slot in 0..4 {
-            let v = core::ptr::read_unaligned((r + slot * 8) as *const usize);
-            let k = if v > 0x10000 && v % 8 == 0 { crate::recruit::record_key(v) } else { "?".into() };
-            if k != "?" { keys.push(k); } else if v < 0x10000 || v % 8 != 0 || !readable(v, 8) {
-                numbers.push(number(v as u32));
-                numbers.push(number((v >> 32) as u32));
-            }
-        }
-        if let Some(pos) = keys.iter().position(|k| *k == key) {
-            let group = keys.iter().enumerate().find(|(j, _)| *j != pos).map(|(_, k)| k.clone()).unwrap_or_else(|| "?".into());
-            let mut it = numbers.into_iter().filter(|n| *n != 0.0);
-            let (q, qmax) = (it.next().unwrap_or(0.0), it.next().unwrap_or(0.0));
-            out.push_str(&format!("{group}={q},{qmax};"));
-        }
+    if let Some(rows) = QUALITIES.get().and_then(|m| m.get(&key)) {
+        for (group, q, qmax) in rows { out.push_str(&format!("{group}={q},{qmax};")); }
     }
     lua::push_str(l, &out);
     1
