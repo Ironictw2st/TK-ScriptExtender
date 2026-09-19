@@ -17,9 +17,10 @@
 //! scope the entries sit on the faction, where the region income code never looks.
 //!
 //! Hook (cfg `horde_income=1`, off by default): after the original recomputed the configured
-//! category (cfg `horde_income_category=0..3`, default 0 = the region / taxation line; 3 = the
-//! line computed from the faction's military forces, FUN_141775690), the sum of the `region_gdp`
-//! values on the faction and its armies is added to that slot, 1:1.
+//! category (cfg `horde_income_category`: 0 TAXES, **1 MINING = unused in 3K, the recommended
+//! own line**, 2 TRADE, 3 MILITARY_FORCE), the sum of the `region_gdp` values on the faction and
+//! its armies is added to that slot, 1:1. A UI mod shows the MINING slot with
+//! `VaryingRegIncomeDetailsSum("MINING")` and its own `Loc("...")` label.
 //!
 //! se_faction_gdp_bonus(q_faction) -> sum, dump:string | nil, msg   (works without the hook)
 
@@ -190,21 +191,32 @@ unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>
 unsafe extern "C" fn update_income_detour(finance: *mut c_void, category: u32) {
     let Some(hook) = HOOK.get() else { return };
     hook.call(finance, category);
+    // Category names (exe table at 0x143308c..): 0 TAXES, 1 MINING, 2 TRADE, 3 MILITARY_FORCE.
+    // MINING is unused in 3K: the engine never computes it (this routine writes 0 for it), the
+    // stock treasury panel does not show it, but CcoFactionEconomy still serves it as
+    // VaryingRegIncomeDetailsSum("MINING") and the totals include it. For that slot the amount
+    // is written absolutely on every recompute of any category; the others are added after
+    // the engine recomputed them.
     let target = CATEGORY.load(std::sync::atomic::Ordering::Relaxed);
-    if category != target { return; }
+    if target != 1 && category != target { return; }
     let fin = finance as usize;
     if !readable(fin, 0x890) { return; }
     let faction = rq(fin + 0x888);
     if faction == 0 || !readable(faction, 0x2b0) || faction + 0x2a8 != fin { return; }
     let Ok((sum, rows)) = faction_gdp_bonus(faction) else { return };
     let extra = sum.round() as i32;
-    if extra == 0 { return; }
+    if extra == 0 && target != 1 { return; }
     let cur = rd(fin + 0x87c) as i32;
     if !(0..=10).contains(&cur) { return; }
     let idx = if cur - 1 < 0 { cur + 9 } else { cur - 1 } as usize;
     let slot = fin + 0x5c + idx * 0xd8 + target as usize * 4;
     let before = rd(slot) as i32;
-    core::ptr::write_unaligned(slot as *mut i32, before.saturating_add(extra));
+    if target == 1 {
+        if before == extra { return; }
+        core::ptr::write_unaligned(slot as *mut i32, extra);
+    } else {
+        core::ptr::write_unaligned(slot as *mut i32, before.saturating_add(extra));
+    }
     if LOGGED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
         log!("horde income: faction {:#x} income category {target}: {before} + gdp_abs {extra} ({})", faction, rows.join("; "));
     }
