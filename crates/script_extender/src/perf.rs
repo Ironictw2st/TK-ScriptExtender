@@ -58,7 +58,6 @@ const MAX_ITEMS: usize = 600;
 const MAX_ENTRIES: usize = 512;
 
 type BuildList = unsafe extern "C" fn(*mut c_void, *mut c_void, u8);
-type Planner = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
 type Getter2 = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type Getter3 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 
@@ -105,7 +104,6 @@ static AI_SAME: AtomicU64 = AtomicU64::new(0);
 static AI_DIFF: AtomicU64 = AtomicU64::new(0);
 static AI_SERVED: AtomicU64 = AtomicU64::new(0);
 static AI_DIFF_LOGGED: AtomicU64 = AtomicU64::new(0);
-static PLANNER: OnceLock<GenericDetour<Planner>> = OnceLock::new();
 static CACHE: Mutex<Option<HashMap<(usize, u8), Entry>>> = Mutex::new(None);
 static TTL_MS: AtomicU64 = AtomicU64::new(5000);
 static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -210,11 +208,18 @@ unsafe fn ai_clear() {
     }
 }
 
-unsafe extern "C" fn planner_detour(planner: *mut c_void, ctx: *mut c_void) -> u64 {
-    let Some(h) = PLANNER.get() else { return 1 };
+/// The AI scope = one call of the recruitment budget planner FUN_141cf8fe0. The detour itself
+/// belongs to `airecruit.rs` (one owner per hooked function); it brackets the engine's call with
+/// these two. Both are no-ops while `ai_recruit_cache` is 0.
+pub unsafe fn ai_scope_enter() -> bool {
+    if AI_MODE.load(Ordering::Relaxed) == 0 { return false; }
     let outer = AI_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v == 0 });
     if outer { ai_clear(); AI_SCOPES.fetch_add(1, Ordering::Relaxed); }
-    let r = h.call(planner, ctx);
+    outer
+}
+
+pub unsafe fn ai_scope_exit(outer: bool) {
+    if AI_MODE.load(Ordering::Relaxed) == 0 { return; }
     AI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     if outer {
         ai_clear();
@@ -228,7 +233,6 @@ unsafe extern "C" fn planner_detour(planner: *mut c_void, ctx: *mut c_void) -> u
             }
         }
     }
-    r
 }
 
 /// Clones of what the engine appended to `vec` after index `before`; None when the result is
@@ -403,30 +407,23 @@ pub fn install(t: &Table) {
             return;
         };
         // the list builder last, so it never sees a UI depth the getters are not maintaining yet
+        // stored before they are enabled: a detour must never run without its trampoline
+        let (_, _, _) = (GET2.set(g2), GET3.set(g3), BUILD.set(b));
+        let (Some(g2), Some(g3), Some(b)) = (GET2.get(), GET3.get(), BUILD.get()) else { return };
         let r2 = crate::freeze::with_threads_frozen(get2 as usize, 16, || g2.enable());
         let r3 = crate::freeze::with_threads_frozen(get3 as usize, 16, || g3.enable());
         if r2.is_err() || r3.is_err() {
             log!("ui recruit cache: could not enable the getter detours; cache stays off");
             return;
         }
-        let _ = GET2.set(g2);
-        let _ = GET3.set(g3);
         if crate::freeze::with_threads_frozen(build as usize, 16, || b.enable()).is_err() {
             log!("ui recruit cache: could not enable the list detour; cache stays off");
             return;
         }
-        let _ = BUILD.set(b);
         if ai_mode > 0 {
-            // prologue: mov rax,rsp / two stack stores / pushes (nothing RIP-relative)
-            let planner: Planner = core::mem::transmute(t.get("cai_recruit_budget"));
-            match GenericDetour::new(planner, planner_detour) {
-                Ok(p) if crate::freeze::with_threads_frozen(planner as usize, 16, || p.enable()).is_ok() => {
-                    let _ = PLANNER.set(p);
-                    AI_MODE.store(ai_mode, Ordering::Relaxed);
-                    log!("ai recruit cache installed (mode {ai_mode}: {})", if ai_mode == 1 { "verify only" } else { "serve" });
-                }
-                _ => log!("ai recruit cache: could not hook the planner; off"),
-            }
+            // the scope comes from the planner detour in airecruit.rs
+            AI_MODE.store(ai_mode, Ordering::Relaxed);
+            log!("ai recruit cache on (mode {ai_mode}: {})", if ai_mode == 1 { "verify only" } else { "serve" });
         }
     }
     log!("ui recruit cache installed (ttl {ttl} ms)");

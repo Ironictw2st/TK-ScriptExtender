@@ -219,7 +219,7 @@ fn ascii(bytes: &[u8]) -> Option<String> {
 }
 
 /// Best-effort key of a DB record: try a few plausible layouts, return "?" otherwise.
-unsafe fn record_key(rec: usize) -> String {
+pub(crate) unsafe fn record_key(rec: usize) -> String {
     if rec == 0 || !readable(rec, 0x30) {
         return "?".into();
     }

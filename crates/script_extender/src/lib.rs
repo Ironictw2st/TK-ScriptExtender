@@ -28,6 +28,7 @@ mod buildings;
 mod alliances;
 mod autoresolve;
 mod income;
+mod airecruit;
 mod diag;
 mod fileprobe;
 mod perf;
@@ -94,6 +95,7 @@ fn bootstrap() {
     autoresolve::install_hooks(&table);
     income::install(&table);
     perf::install(&table);
+    airecruit::install(&table);
     permcache::install(&table);
     fileprobe::install(&table);
     diag::install(&table);

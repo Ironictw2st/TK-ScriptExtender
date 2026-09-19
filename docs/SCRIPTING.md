@@ -1322,6 +1322,33 @@ turns the folded stacks into a call tree (addresses are Ghidra function starts).
 
 ---
 
+## 4c. Watching the campaign AI recruit (DLL 0.36, read-only)
+
+The AI's recruitment planner only ever prices **empty** retinue slots (at most three per
+character per pass, cheapest first); nothing in the engine replaces a unit that is already in a
+slot. These calls show what it budgets, what it buys and what each slot could have had.
+
+```lua
+se.ai_recruit.trace(true)                 -- let the DLL copy the planner's requests (off by default)
+local passes = se.query.ai_recruitment()  -- drains them: { { seq, faction_id, pending, requests = {
+                                          --   { money, budget2, turn, target, rows = { { id, cost, cost2, kind } } } } } }
+local rows, best = se.query.unit_quality("3k_main_unit_metal_jian_sword_guards")
+                                          -- the AI's own ranking (cdir_military_generator_unit_qualities,
+                                          -- read live): { { group, quality, quality_at_max_xp } }, best
+se.ai_recruit.quality_override["my_mod_unit"] = 2400   -- units the table does not know, or a rebalance
+local r = se.ai_recruit.report("3k_main_faction_cao_cao", { min_gap = 1.25 })
+-- r = { faction, treasury, slots, empty, upgradable, affordable, forces = { { cqi, characters = { {
+--   cqi, slots = { { index, unit, experience, strength, recruiting, quality, effective,
+--   best = { key, quality, cost, turns }, gap, affordable } } } } } } }
+```
+
+`effective` scales a unit's quality towards `quality_at_max_xp` with its experience, the way the
+AI's own table values a veteran; `gap` = best option / effective. Stock event
+`UnitRecruitmentInitiated` (`context:faction()`, `context:unit_key()`) tells what was really
+bought. The console script `se_ai_trace.lua` logs all three per AI faction turn.
+
+---
+
 ## 5. Troubleshooting
 
 ### The API is not there at all

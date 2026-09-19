@@ -1833,4 +1833,175 @@ function se.diag.listeners_report(top)
 	return rows
 end
 
+----------------------------------------------------------------------------------------------
+-- AI recruitment: what the campaign AI budgets, what it buys, what it could have bought
+-- (DLL 0.36+, read-only; notes/ai_recruitment.md)
+----------------------------------------------------------------------------------------------
+
+se.ai_recruit = se.ai_recruit or {}
+-- se.ai_recruit.quality_override[unit_key] = number : replaces the game's quality for that unit
+-- in every group (mod units missing from cdir_military_generator_unit_qualities, or a rebalance)
+se.ai_recruit.quality_override = se.ai_recruit.quality_override or {}
+se.ai_recruit.max_experience = se.ai_recruit.max_experience or 9
+
+local quality_cache = {}
+
+local function any_faction()
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local ok, f = pcall(function() return cm:query_model():world():faction_list():item_at(0) end)
+	if not ok or is_null(f) then return nil, "no faction to reach the database through" end
+	return f
+end
+
+-- se.query.unit_quality(unit_key) -> rows, best
+--   rows = { { group, quality, quality_at_max_xp }, ... } from the game's live
+--   cdir_military_generator_unit_qualities table (the campaign AI's own unit ranking; one row per
+--   role group the unit belongs to). best = the highest quality over the groups, or the value in
+--   se.ai_recruit.quality_override. Unknown unit: {}, 0. Cached per unit key.
+function se.query.unit_quality(unit_key)
+	unit_key = str(unit_key)
+	local hit = quality_cache[unit_key]
+	if not hit then
+		local okn, err = need("se_unit_quality")
+		if not okn then return nil, err end
+		local f, e2 = any_faction()
+		if not f then return nil, e2 end
+		local s, msg = se_unit_quality(f, unit_key)
+		if msg then return nil, msg end
+		hit = {}
+		for group, q, qmax in str(s):gmatch("([^=;]+)=([^,;]+),([^;]*);") do
+			hit[#hit + 1] = { group = group, quality = tonumber(q) or 0, quality_at_max_xp = tonumber(qmax) or 0 }
+		end
+		quality_cache[unit_key] = hit
+	end
+	local override = se.ai_recruit.quality_override[unit_key]
+	local best = 0
+	for _, r in ipairs(hit) do if r.quality > best then best = r.quality end end
+	if override then best = num(override) or best end
+	return hit, best
+end
+
+-- quality of `candidate` in a role group it shares with `current` (nil when they share none)
+local function shared_quality(current_rows, candidate_key)
+	local rows = se.query.unit_quality(candidate_key)
+	if not rows then return nil end
+	local override = se.ai_recruit.quality_override[candidate_key]
+	local best
+	for _, c in ipairs(rows) do
+		for _, r in ipairs(current_rows) do
+			if r.group == c.group then
+				local q = override and num(override) or c.quality
+				if not best or q > best then best = q end
+			end
+		end
+	end
+	return best
+end
+
+-- se.ai_recruit.trace(on) -> was_on : let the DLL copy the AI's recruitment requests after every
+--   planning pass (FUN_141cf8fe0). Off by default; switching it off drops what was collected.
+function se.ai_recruit.trace(on)
+	local okn, err = need("se_ai_recruit_trace")
+	if not okn then return nil, err end
+	return se_ai_recruit_trace(on and true or false)
+end
+
+-- se.query.ai_recruitment() -> passes (drains what was collected since the last call)
+--   pass = { seq, faction_id, pending, requests = { { money, budget2, turn, target, rows = {
+--   { id, cost, cost2, kind } } } } }. money / budget2 = what the planner set aside for that
+--   request; rows = the purchases it priced; target = class of the request's target object (hex
+--   rva of its vtable); faction_id = engine id of the planning faction (0 when not resolved).
+function se.query.ai_recruitment()
+	local okn, err = need("se_ai_recruit_passes")
+	if not okn then return nil, err end
+	local passes, pass, request = {}, nil, nil
+	for rec in str(se_ai_recruit_passes()):gmatch("([^;]+);") do
+		local f = {}
+		for v in rec:gmatch("([^,]+)") do f[#f + 1] = v end
+		if f[1] == "P" then
+			pass = { seq = tonumber(f[2]), faction_id = tonumber(f[3]), pending = tonumber(f[4]), requests = {} }
+			passes[#passes + 1] = pass
+		elseif f[1] == "R" and pass then
+			request = { money = tonumber(f[2]), budget2 = tonumber(f[3]), turn = tonumber(f[4]), target = f[5], rows = {} }
+			pass.requests[#pass.requests + 1] = request
+		elseif f[1] == "W" and request then
+			request.rows[#request.rows + 1] = { id = tonumber(f[2]), cost = tonumber(f[3]), cost2 = tonumber(f[4]), kind = tonumber(f[5]) }
+		end
+	end
+	return passes
+end
+
+-- se.ai_recruit.report(faction_key [, opts]) -> report
+--   report = { faction, treasury, forces = { { cqi, characters = { { cqi, slots = { {
+--     index, unit, experience, strength, recruiting, quality, effective,
+--     best = { key, quality, cost, turns } | nil, gap, affordable } } } } } },
+--     slots, empty, upgradable, affordable }
+--   For every retinue slot of every army: the unit in it, its quality (effective = scaled towards
+--   quality_at_max_xp by experience, which is how the AI's own table values a veteran) and the
+--   best unit of the same role group the slot could recruit right now with no lock reason.
+--   gap = best.quality / effective (> 1 means a better unit is available).
+--   opts.min_gap (default 1.0) only fills `best` when the gap is at least that.
+function se.ai_recruit.report(faction_key, opts)
+	opts = opts or {}
+	local cm, err = cm_()
+	if not cm then return nil, err end
+	local okf, faction = pcall(function() return cm:query_faction(str(faction_key)) end)
+	if not okf or is_null(faction) then return nil, "unknown faction " .. str(faction_key) end
+	local okt, treasury = pcall(function() return faction:treasury() end)
+	local report = { faction = str(faction_key), treasury = okt and num(treasury) or 0, forces = {}, slots = 0, empty = 0, upgradable = 0, affordable = 0 }
+	local okl, forces = pcall(function() return faction:military_force_list() end)
+	if not okl or not forces then return report end
+	for i = 0, forces:num_items() - 1 do
+		local force = forces:item_at(i)
+		local okc, chars = pcall(function() return force:character_list() end)
+		local okq, fcqi = pcall(function() return force:command_queue_index() end)
+		local frow = { cqi = okq and num(fcqi) or 0, characters = {} }
+		if okc and chars then
+			for j = 0, chars:num_items() - 1 do
+				local okx, cqi = pcall(function() return chars:item_at(j):command_queue_index() end)
+				local retinue = okx and se.query.retinue(cqi) or nil
+				if retinue then
+					local crow = { cqi = num(cqi), slots = {} }
+					for _, slot in ipairs(retinue) do
+						report.slots = report.slots + 1
+						local srow = { index = slot.index, unit = slot.unit_key, experience = slot.experience, strength = slot.strength, recruiting = slot.is_recruiting and slot.recruiting or nil }
+						if not slot.unit_key or slot.unit_key == "" then
+							report.empty = report.empty + 1
+						elseif not slot.is_recruiting then
+							local rows, best_q = se.query.unit_quality(slot.unit_key)
+							srow.quality = best_q or 0
+							local top = 0
+							for _, r in ipairs(rows or {}) do if r.quality_at_max_xp > top then top = r.quality_at_max_xp end end
+							local xp = math.min(num(slot.experience) or 0, se.ai_recruit.max_experience) / se.ai_recruit.max_experience
+							srow.effective = srow.quality + math.max(0, top - srow.quality) * xp
+							local options = se.query.recruitable(cqi, slot.index)
+							local best
+							for _, o in ipairs(options or {}) do
+								if num(o.reasons) == 0 and o.key ~= slot.unit_key and o.key ~= "" then
+									local q = shared_quality(rows or {}, o.key)
+									if q and (not best or q > best.quality) then best = { key = o.key, quality = q, cost = num(o.cost) or 0, turns = num(o.turns) or 0 } end
+								end
+							end
+							if best and srow.effective > 0 then
+								srow.gap = best.quality / srow.effective
+								if srow.gap >= (num(opts.min_gap) or 1.0) and srow.gap > 1.0 then
+									srow.best = best
+									report.upgradable = report.upgradable + 1
+									srow.affordable = best.cost <= report.treasury
+									if srow.affordable then report.affordable = report.affordable + 1 end
+								end
+							end
+						end
+						crow.slots[#crow.slots + 1] = srow
+					end
+					frow.characters[#frow.characters + 1] = crow
+				end
+			end
+		end
+		report.forces[#report.forces + 1] = frow
+	end
+	return report
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")

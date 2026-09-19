@@ -135,6 +135,8 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   45 s (income hook) -> ~30 s (permission maps). Details: `notes/performance.md`.
 - 0.35 `file_probe_cache_ms` (missing-directory cache for loose-file lookups), Lua listener
   timing (`se.diag.listeners_*`), `diag_diplomacy` (measurement).
+- 0.36 AI recruitment trace (read-only): `se.ai_recruit.trace/report`, `se.query.ai_recruitment`,
+  `se.query.unit_quality`; details `notes/ai_recruitment.md`.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 
