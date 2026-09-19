@@ -28,6 +28,7 @@ mod buildings;
 mod alliances;
 mod autoresolve;
 mod income;
+mod profiler;
 mod bundles;
 mod diplomacy;
 

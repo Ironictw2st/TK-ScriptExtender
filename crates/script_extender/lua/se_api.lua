@@ -1645,6 +1645,24 @@ function se.autoresolve.clear_handler()
 	return se.modify.autoresolve_plan_clear()
 end
 
+----------------------------------------------------------------------------------------------
+-- diagnostics
+----------------------------------------------------------------------------------------------
+
+se.profile = se.profile or {}
+
+-- se.profile.start(seconds [, delay_seconds [, label]]) -> ok, message
+--   Sampling profiler of the game process (1 ms, the six busiest threads, re-picked every
+--   second). Waits `delay_seconds` (default 3) so the console can be closed, samples for
+--   `seconds` (1..120), then writes profile_<label>.txt next to the DLL: per thread the functions
+--   the CPU was in ("self") and the functions on the stack, as Ghidra addresses. Reads only;
+--   costs a few percent of frame time while it runs. One run at a time.
+function se.profile.start(seconds, delay_seconds, label)
+	local okn, err = need("se_profile_start")
+	if not okn then return false, err end
+	return se_profile_start(num(seconds) or 20, num(delay_seconds) or 3, str(label or "run"))
+end
+
 -- Pretty-print helper for console use: se.dump(se.query.retinue(1))
 function se.dump(v, indent)
 	indent = indent or ""
