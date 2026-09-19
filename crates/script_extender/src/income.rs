@@ -16,8 +16,10 @@
 //! record @+0x10} (generic getter FUN_140ac9a20(ctx, kind, record, id)). With a force-to-faction
 //! scope the entries sit on the faction, where the region income code never looks.
 //!
-//! Hook (cfg `horde_income=1`, off by default): after the original ran for category 0, the sum
-//! of the faction's `region_gdp` entries whose record is a GDP type is added to that slot, 1:1.
+//! Hook (cfg `horde_income=1`, off by default): after the original recomputed the configured
+//! category (cfg `horde_income_category=0..3`, default 0 = the region / taxation line; 3 = the
+//! line computed from the faction's military forces, FUN_141775690), the sum of the `region_gdp`
+//! values on the faction and its armies is added to that slot, 1:1.
 //!
 //! se_faction_gdp_bonus(q_faction) -> sum, dump:string | nil, msg   (works without the hook)
 
@@ -44,6 +46,7 @@ type EffectCtx = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 static HOOK: OnceLock<GenericDetour<UpdateIncome>> = OnceLock::new();
 static EFFECT_CTX: OnceLock<usize> = OnceLock::new();
 static LOGGED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(8);
+static CATEGORY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// set while the Lua query runs: list every record-bearing effect value of the faction
 static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -187,7 +190,8 @@ unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>
 unsafe extern "C" fn update_income_detour(finance: *mut c_void, category: u32) {
     let Some(hook) = HOOK.get() else { return };
     hook.call(finance, category);
-    if category != 0 { return; }
+    let target = CATEGORY.load(std::sync::atomic::Ordering::Relaxed);
+    if category != target { return; }
     let fin = finance as usize;
     if !readable(fin, 0x890) { return; }
     let faction = rq(fin + 0x888);
@@ -198,11 +202,11 @@ unsafe extern "C" fn update_income_detour(finance: *mut c_void, category: u32) {
     let cur = rd(fin + 0x87c) as i32;
     if !(0..=10).contains(&cur) { return; }
     let idx = if cur - 1 < 0 { cur + 9 } else { cur - 1 } as usize;
-    let slot = fin + 0x5c + idx * 0xd8;
+    let slot = fin + 0x5c + idx * 0xd8 + target as usize * 4;
     let before = rd(slot) as i32;
     core::ptr::write_unaligned(slot as *mut i32, before.saturating_add(extra));
     if LOGGED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
-        log!("horde income: faction {:#x} region income {before} + force-scoped gdp {extra} ({})", faction, rows.join("; "));
+        log!("horde income: faction {:#x} income category {target}: {before} + gdp_abs {extra} ({})", faction, rows.join("; "));
     }
 }
 
@@ -212,6 +216,9 @@ pub fn install(t: &Table) {
         log!("horde income hook off (set horde_income=1 in script_extender.cfg to enable)");
         return;
     }
+    let cat = crate::build::config_value("horde_income_category").and_then(|v| v.parse::<u32>().ok()).filter(|c| *c <= 3).unwrap_or(0);
+    CATEGORY.store(cat, std::sync::atomic::Ordering::Relaxed);
+    log!("horde income goes to income category {cat}");
     let target: UpdateIncome = unsafe { core::mem::transmute(t.get("finance_update_income")) };
     // SAFETY: anchor-verified prologue (mov [rsp+8],rbx; push rdi; sub rsp,0x20; xor r8d,r8d;
     // mov edi,edx; mov rbx,rcx; mov eax,edx): no RIP-relative instruction in the relocated bytes.
