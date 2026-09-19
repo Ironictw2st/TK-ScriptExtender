@@ -124,6 +124,18 @@ governor bypass; 0.11 assignment province; 0.12 flat xp, skill points, effect va
 personality, potential; 0.13 CAI apply owner fix, float effect value; 0.14 registry-based
 personality object; 0.15 registry self-check; **0.16 menu build number + cfg file (wrote into the wrong object); 0.17 correct GameCore pointer; 0.18 cfg lookup in parent folder + deferred apply (verified through TKModManager, which builds from the workspace and stages `dll\<version>\`); 0.19 buildings; 0.20 alliance names; 0.21 effect bundle inspection; 0.22 attitude events + script-side income lines (read-only batch verified live); **0.23 forced building construction through the list entry + effect bundle define / restore / apply_custom (buildings, bundles, alliance rename, income line verified live in 0.23.3)**; **0.24 auto-resolve read-out, autoresolver_* tunables, plan storage + handler (current; untested live)**.
 
+### 0.31 - 0.34: performance (2026-09-19)
+
+- 0.31 sampling profiler (`se.profile.start/stop`, reports in `<dll folder>\..\profiles\`).
+- 0.32 UI recruit-list cache (`ui_recruit_cache_ms`); 0.32.4 made the horde income hook cheap
+  (it had cost 35% of the main thread during an end turn: one IsBadReadPtr per field).
+- 0.34 `recruit_perm_cache` (default on): the recruit list routine FUN_141931e10 rebuilt a full
+  permission hash map per candidate unit; now one per list call, shared as views, self-checked
+  for the first 3000 reuses per session. Measured on a modded late campaign: end turn 76 s ->
+  45 s (income hook) -> ~30 s (permission maps). Details: `notes/performance.md`.
+- Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
+  profiler reports live in `dll\profiles\`, which the manager must not delete.
+
 ## 7. When the game updates
 
 1. New `TimeDateStamp` / `SizeOfImage` -> update the constants in `src/addrs.rs`.

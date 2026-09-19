@@ -1287,6 +1287,32 @@ end)
 
 ---
 
+## 4b. Performance features and diagnostics (DLL 0.31 - 0.34)
+
+These need no script; they are controlled from `script_extender.cfg` (next to the versioned DLL
+folders). None of them changes what the game computes.
+
+| cfg key | default | what it does |
+|---|---|---|
+| `recruit_perm_cache` | `1` | The engine's "what can this retinue slot recruit" routine rebuilt a complete table of the faction's unit permissions **for every candidate unit** (units x permissions per list; with a large unit roster this was the biggest single cost of an AI turn and of an open character panel). The DLL lets the engine build each table once per list and reuses it. The first 3000 reuses of a session are checked against the engine's own rebuild; one difference turns the feature off for the session (DLL log). `0` = off, `2` = check only. |
+| `ui_recruit_cache_ms` | `5000` | UI only: a recruitable-unit list asked for again by the panels is served from memory while the faction's treasury and the turn are unchanged, for at most this long. `0` = off. |
+| `ai_recruit_cache` | `0` | Diagnostic (whole-list cache inside the AI's recruitment budget planner). Measured as not worth it; leave off. |
+
+`recruit_perm_cache` and `ai_recruit_cache` are part of the multiplayer sync fingerprint: both
+players need the same values.
+
+```lua
+se.query.perf()              -- counters: hits / misses (UI cache), perm_built / perm_shared /
+                             -- perm_same / perm_diff (permission tables), ai_* (diagnostic)
+se.profile.start(50, 4, "endturn")  -- CPU sampling: 50 s after a 4 s delay; report
+                                    -- profile_endturn.txt + .folded.txt in <dll folder>\profilesse.profile.stop()            -- end the run now; the report is written when a run ends
+```
+
+`tools/profile_tree.py <folded.txt> [--min 2] [--depth 14] [--callers <fn>] [--minus <baseline>]`
+turns the folded stacks into a call tree (addresses are Ghidra function starts).
+
+---
+
 ## 5. Troubleshooting
 
 ### The API is not there at all
