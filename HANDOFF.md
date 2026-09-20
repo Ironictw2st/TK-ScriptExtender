@@ -1,7 +1,7 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current DLL: **0.30.0**, `Z:\RE\se_deploy\0.26.2\`
+(Steam build 25370317) unless marked otherwise. Current DLL: **0.40.0**, `Z:\RE\se_deploy\0.40.0\`
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -122,7 +122,7 @@ internal. Test/console scripts for every feature live in
 xp/assignment probes; 0.9 unit vtable match; 0.10 float numbers, disband via empty key,
 governor bypass; 0.11 assignment province; 0.12 flat xp, skill points, effect value, CAI
 personality, potential; 0.13 CAI apply owner fix, float effect value; 0.14 registry-based
-personality object; 0.15 registry self-check; **0.16 menu build number + cfg file (wrote into the wrong object); 0.17 correct GameCore pointer; 0.18 cfg lookup in parent folder + deferred apply (verified through TKModManager, which builds from the workspace and stages `dll\<version>\`); 0.19 buildings; 0.20 alliance names; 0.21 effect bundle inspection; 0.22 attitude events + script-side income lines (read-only batch verified live); **0.23 forced building construction through the list entry + effect bundle define / restore / apply_custom (buildings, bundles, alliance rename, income line verified live in 0.23.3)**; **0.24 auto-resolve read-out, autoresolver_* tunables, plan storage + handler (current; untested live)**.
+personality object; 0.15 registry self-check; **0.16 menu build number + cfg file (wrote into the wrong object); 0.17 correct GameCore pointer; 0.18 cfg lookup in parent folder + deferred apply (verified through TKModManager, which builds from the workspace and stages `dll\<version>\`); 0.19 buildings; 0.20 alliance names; 0.21 effect bundle inspection; 0.22 attitude events + script-side income lines (read-only batch verified live); **0.23 forced building construction through the list entry + effect bundle define / restore / apply_custom (buildings, bundles, alliance rename, income line verified live in 0.23.3)**; **0.24 auto-resolve read-out, autoresolver_* tunables, plan storage + handler**; 0.25 - 0.27 the auto-resolve result is actually rewritten (winner and casualties verified live on 0.26.2, duels on 0.27.0); 0.28 - 0.29 horde income hook; **0.30 multiplayer support with the enforced build-string version lock**.
 
 ### 0.31 - 0.34: performance (2026-09-19)
 

@@ -1,10 +1,16 @@
 # TK Script Extender
 
-A native DLL for **Total War: THREE KINGDOMS** (single-player) that is injected into the running
-game and registers extra `se.*` functions into the campaign Lua VM: move characters between
-factions' recruitment pools, recruit/replace/disband retinue units, edit experience, skill
-points, faction potential, CAI personality, and more. See `HANDOFF.md` for the API and the
-engine facts behind it.
+A native DLL for **Total War: THREE KINGDOMS** that is injected into the running game and
+registers extra `se.*` functions into the campaign Lua VM: move characters between factions'
+recruitment pools, recruit/replace/disband retinue units, edit experience, skill points, faction
+potential, CAI personality, steer auto-resolve and the campaign AI's recruitment, and more.
+Multiplayer campaigns are supported since 0.30, under a build-string version lock that keeps
+mismatched setups out of the same lobby.
+
+- **Writing scripts against it: [`docs/SCRIPTING.md`](docs/SCRIPTING.md)** — the full `se.*`
+  reference, recipes and troubleshooting.
+- Integrating or maintaining the DLL: `HANDOFF.md` (injection rules, engine facts, version
+  history).
 
 The DLL fingerprints the game build (PE `TimeDateStamp` + `SizeOfImage`) and verifies every
 engine address before touching anything; on a mismatch it logs and stays inert.

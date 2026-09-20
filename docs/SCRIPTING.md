@@ -5,8 +5,28 @@ KINGDOMS **build 1.7.2.0**. Audience: mod authors who already know 3K campaign s
 (`cm`, `core:add_listener`, `QUERY_*` / `MODIFY_*` interfaces).
 
 Sources of truth for this document: `crates/script_extender/lua/se_api.lua` (signatures),
-`HANDOFF.md` (injection rules, version history), `notes/*.md` (behaviour, live verification),
-`CLAUDE.md` (Lua gotchas). Current DLL version at the time of writing: **0.26.2**.
+the DLL sources under `crates/script_extender/src/` (defaults, refusals), `HANDOFF.md`
+(injection rules, version history), `notes/*.md` (behaviour, live verification). Current DLL
+version at the time of writing: **0.40.0** (2026-09-19), which is the 0.37 beta line on the
+stable channel.
+
+### Which DLL version a feature needs
+
+Every function entry in §3 carries its own `Since` line; this is the overview. The mod manager
+compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
+
+| DLL | Brings |
+|---|---|
+| 0.8 | the embedded `se_api.lua` module itself, characters / pools, retinues, units, progression |
+| 0.10 - 0.12 | disband, world-leader seats, assignments, flat XP, skill points, CAI personality, faction potential |
+| 0.16 - 0.18 | menu build number and `script_extender.cfg` |
+| 0.19 - 0.23 | buildings, alliance names, effect bundles, attitude events, script-side income lines |
+| 0.24 - 0.27 | auto-resolve: tunables, prediction, plans (winner + casualties 0.26.2, duels 0.27) |
+| 0.28 - 0.30 | horde income hook, **multiplayer support with the enforced version lock** |
+| 0.31 - 0.35 | performance work and diagnostics (`se.profile.*`, `se.query.perf`, `se.diag.*`) |
+| 0.36 | AI recruitment trace (`se.ai_recruit.trace/report`, `se.query.ai_recruitment/unit_quality`) |
+| 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
+| **0.40** | the current stable release: everything above, horde income on by default |
 
 ---
 
@@ -46,7 +66,8 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of `autoresolve_hooks`, `ai_recruit_cache`,
+   it always ends up containing the DLL version and a fingerprint of the five settings that can
+   change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
    `horde_income` and `horde_income_category` (`script_extender.cfg` text may use `{version}`
    and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
@@ -86,8 +107,10 @@ globals. Two objects must be handed over explicitly:
 
 ```lua
 se.logger = ModLog     -- any function(string); otherwise output goes to the DLL log
-se.core   = core       -- the event manager; needed by emperor_policy, faction_income,
-                       -- autoresolver_variable and se.autoresolve.set_handler
+se.core   = core       -- the event manager; needed by everything that installs a listener:
+                       -- emperor_policy, faction_income, autoresolver_variable,
+                       -- se.autoresolve.set_handler, se.diag.listeners_start,
+                       -- se.ai_recruit.enable
 ```
 
 Without `se.logger`, the module falls back to a global `ModLog` if one is visible, else to the
@@ -102,8 +125,8 @@ install listeners return
 
 ### The model-thread rule
 
-Model mutation is only legal on the campaign model thread. Every `se.modify.*` call goes through
-`se.on_model`:
+Model mutation is only legal on the campaign model thread. Almost every `se.modify.*` call goes
+through `se.on_model`:
 
 - when `cm:can_modify()` is already true (inside an event handler, a `cm:wait_for_model_sp`
   callback, ...), the work runs immediately and the **real** `ok, message` is returned;
@@ -120,6 +143,12 @@ end, function(ok, msg) ModLog("finished: " .. tostring(ok) .. " " .. tostring(ms
 
 `se.on_model(tag, f [, cb])` is public; use it to wrap your own follow-up reads (for example
 `se.query.cai_personality`, which also needs the model thread).
+
+**Four modifiers do not go through it**, because they change no model state: `build_number`
+(process-local UI strings), `autoresolve_plan_clear` (a DLL-side slot), and the two that only
+keep script-side state and install a listener, `emperor_policy` and `faction_income`. They
+return the real result directly and do not check multiplayer — but what their listeners *do* is
+model state, so install them from code that runs on every machine.
 
 ### Logging
 
@@ -176,6 +205,8 @@ are **not**, and must be re-applied after every load:
 | `se.modify.emperor_policy` | the policy string (via `cm:save_named_value`); the listener does not | `se.load_emperor_policy()` |
 | `se.modify.faction_income` | the income lines (via `cm:save_named_value`); the listener does not | `se.load_income_lines()` |
 | `se.autoresolve.set_handler` | nothing (a Lua function) | install it again |
+| `se.ai_recruit.enable` and its tunables | nothing (Lua state) | set the tables and call `se.ai_recruit.enable()` again |
+| `se.diag.listeners_start` | nothing (Lua state) | call it again if you still want the timings |
 
 Verified to persist across save / restart / load: `cai_personality` and `faction_potential`.
 Not yet tested: persistence of forced world-leader seats, of a renamed alliance, and of the
@@ -320,9 +351,11 @@ principle go stale).
 #### `se.query.retinue(cqi) -> list | nil, message`
 
 One row per slot, sorted by slot index:
-`{ index, unit_key, strength, experience, can_recruit, is_recruiting, recruiting }`.
+`{ index, slot_cqi, unit_key, strength, experience, can_recruit, is_recruiting, recruiting }`.
 `strength` / `experience` are only filled when the slot is linked to a deployed military force
-unit. Since 0.8. Status: verified live.
+unit. `slot_cqi` is the slot's own command-queue index — the number the stock
+`UnitRecruitmentInitiated` event reports as `context:cqi()`, which is how you match an event back
+to a slot. Since 0.8. Status: verified live.
 
 Note: right after a campaign load, `retinue_slots()` entries can briefly read as null interfaces;
 read the list again a moment later.
@@ -374,6 +407,8 @@ se.modify.recruit(1, "3k_dlc04_unit_wood_imperial_gate_guards",
 #### `se.modify.replace(cqi, slot_index, unit_key [, opts]) -> ok, message`
 
 Shorthand for `se.modify.recruit` with `opts.slot = slot_index` and `opts.replace = true`.
+It writes those two keys **into the table you pass**, so do not reuse one `opts` table for a
+later `recruit` call unless you want the slot and the replace flag to come along.
 
 #### `se.modify.disband(cqi, slot_index) -> ok, message`
 
@@ -803,7 +838,7 @@ stored.
 
 ---
 
-### 3.12a Horde income (DLL 0.28+; on by default since 0.37.0-beta.4)
+### 3.12a Horde income (DLL 0.28+; on by default since 0.37.0-beta.4 / stable 0.40.0)
 
 `gdp_abs` effects (bonus value `region_gdp`) only reach the treasury through regions. The DLL
 hooks the engine routine that recomputes a faction's income categories (always, unless
@@ -871,7 +906,8 @@ Three separate mechanisms, in increasing order of intrusiveness:
 2. **Read-out** — the pending battle's context and the engine's prediction.
 3. **Plans** — a per-battle instruction the DLL applies to the freshly computed result.
 
-Everything here applies to battles a human player is involved in (every machine of a multiplayer game evaluates the same handler; see the multiplayer rules).
+Everything here applies to battles a human player is involved in (every machine of a multiplayer
+game evaluates the same handler; see the multiplayer rules in §1).
 
 #### What each DLL version actually applies
 
@@ -879,8 +915,9 @@ Everything here applies to battles a human player is involved in (every machine 
 |---|---|
 | `winner` | applied by the engine hook; **use 0.26.2 or later** (verified live there: winning alliance index and per-side result ids are written; 0.26.0 / 0.26.1 had no effect on the winner) |
 | `casualties` | applied since 0.26; **verified live** (a 10% cap turned a predicted 798 -> 563 into 798 -> 730, and the army kept about 90% after the battle) |
+| `duels` | applied since **0.27**; **verified live** (a forced winner flipped the game log from "Proposer Won Duel" to the other character). `default = "none"` removes every duel without a rule, `max` trims the list, a pair the engine did not roll is appended when both hero unit keys are known |
+| `duels[i].fate` | accepted and validated — **not applied**: the campaign rolls the loser's wound or death afterwards |
 | `bias` | accepted, clamped and stored — **not applied** by any current version |
-| `duels` | accepted, validated and stored — **not applied** by any current version |
 | `refresh_prediction` | applied (re-runs the engine compute routine so the panel prediction matches) |
 
 Further limitations of the result rewrite:
@@ -955,8 +992,11 @@ the prediction native.
 #### `se.modify.autoresolve_plan(plan [, ctx]) -> ok, message`
 
 Store a plan for the current pending battle. `ctx` defaults to `se.query.pending_battle()`;
-the call refuses with `refused: no pending battle with the local player` when the local player is
-not involved, and with `refused: multiplayer campaign` in multiplayer.
+the call refuses with `refused: no pending battle with a human player` when `ctx.human_involved`
+is not true. Since 0.30 the test is "a human is involved", not "the local player is involved",
+so that every machine of a multiplayer game sets the same plan for the same battle; the model
+step itself still goes through `se.on_model` and is refused outside a model callback in
+multiplayer.
 
 Plan shape (schema, not runnable code — `|` means "one of"):
 
@@ -968,11 +1008,12 @@ plan = {
      defender = { scale = 1.0, max = 1.0 },
   },
   bias  = { attacker = 1.0, defender = 1.0 },    -- 0.1..10, STORED BUT NOT APPLIED
-  duels = {                                      -- STORED BUT NOT APPLIED
-     max = 6,                                    -- 0..16
-     default = "vanilla" | "none",
+  duels = {                                      -- applied since 0.27
+     max = 6,                                    -- 0..16, trims the duel list
+     default = "vanilla" | "none",               -- "none" drops every duel without a rule
      pairs = { { a = cqi, b = cqi, happen = true, win_chance = 0.5, winner = cqi,
-                 fate = "kill" | "wound" | "spare" | "flee" } },
+                 fate = "kill" | "wound" | "spare" | "flee",   -- fate is NOT applied
+                 a_key = "unit key", b_key = "unit key" } },   -- only to create a missing duel
   },
   refresh_prediction = true,                     -- false skips the immediate panel recompute
 }
@@ -985,7 +1026,14 @@ Validation errors: `plan must be a table`,
 `plan.duels.pairs[i].fate must be kill, wound, spare or flee`.
 Numeric values outside their range are clamped rather than rejected.
 
-Native `se_ar_plan_set` (+ `se_ar_recompute`). Since 0.24; applied since 0.26.
+A pair naming two characters the engine did not pair up is **created**, but only when both hero
+unit keys are known. The module resolves them for you when the character's force holds exactly
+one `_hero_` unit; when it holds two or more (a force with several generals), pass `a_key` /
+`b_key` yourself. `win_chance` is a probability, so in multiplayer derive the roll from
+`ctx.seed` (see §1) and never from `math.random`.
+
+Native `se_ar_plan_set` (+ `se_ar_recompute`). Since 0.24; winner and casualties applied since
+0.26.2, duels since 0.27.
 
 #### `se.modify.autoresolve_plan_clear() -> ok, message`
 
@@ -997,15 +1045,256 @@ The plan table as it was given, plus the encoded string the DLL currently holds.
 
 #### `se.autoresolve.set_handler(fn) -> ok, message`
 
-Install a handler called on every `PendingBattle` that involves the local player. `fn(ctx)`
-receives the `se.query.pending_battle()` table and returns a plan table, or `nil` for vanilla
-behaviour. Needs `se.core`. The listener clears any previous plan first, and a second listener
-drops the plan again on `BattleCompleted`. Calling it again replaces the handler
-(`"handler replaced"`).
+Install a handler called on every `PendingBattle` that involves **a human player** — on every
+machine of a multiplayer game, not only the one whose battle it is. `fn(ctx)` receives the
+`se.query.pending_battle()` table and returns a plan table, or `nil` for vanilla behaviour. Needs
+`se.core`. The listener clears any previous plan first, and a second listener drops the plan
+again on `BattleCompleted`. Calling it again replaces the handler (`"handler replaced"`).
+
+**Never branch on `ctx.*.is_local_player`** (or `cm:get_local_faction()`) inside the handler: it
+is true on one machine and false on the other, so the two would store different plans and desync.
+Branch on `is_human` and faction keys, and seed any chance from `ctx.seed`.
 
 #### `se.autoresolve.clear_handler() -> ok, message`
 
 Forget the handler and clear the stored plan. The listeners stay registered but do nothing.
+
+---
+
+### 3.15 Performance counters and the profiler
+
+Read-only measurement of the DLL's own caches and of the game process. Nothing here changes what
+the game computes, nothing needs the model thread, and everything is safe in multiplayer. What
+the caches themselves do, and the `script_extender.cfg` keys that switch them, is §4b.
+
+#### `se.query.perf() -> table | nil, message`
+
+The DLL's counters, parsed from the native's `k=v;` string into numbers (plus `installed`, a
+boolean). The set of keys grows with the DLL; the ones worth reading:
+
+| Key | Meaning |
+|---|---|
+| `installed` | the UI recruit-list cache detour is in place |
+| `ttl_ms` | its time-to-live, from `ui_recruit_cache_ms` |
+| `perm_mode`, `ai_mode` | the `recruit_perm_cache` / `ai_recruit_cache` setting actually in effect |
+| `hits` / `misses` | UI recruit-list queries answered from the cache / computed by the engine |
+| `passed_through` | queries from the AI and other non-UI callers, which are never cached |
+| `entries`, `miss_new`, `miss_expired`, `miss_state`, `stamp_failed` | why a query missed |
+| `perm_built`, `perm_shared`, `perm_same`, `perm_diff` | unit-permission tables built, reused, and the result of the self-check (`recruit_perm_cache`) |
+| `ai_*` | the diagnostic AI-planner list cache (`ai_recruit_cache`) |
+| `file_probes`, `file_probes_skipped` | loose-file lookups seen and answered without a system call (`file_probe_cache_ms`) |
+| `dip_*` | diplomacy evaluation counters, only when `diag_diplomacy=1` |
+
+Native `se_perf_stats`. Since 0.32 (`perm_*` 0.34, `file_probes*` 0.35). Status: verified live.
+
+```lua
+local p = se.query.perf()
+if p then ModLog(("recruit list: %d hits / %d misses, %d AI"):format(p.hits, p.misses, p.passed_through)) end
+```
+
+#### `se.profile.start(seconds [, delay_seconds [, label]]) -> ok, message`
+
+Start the sampling profiler: every 1 ms it walks the six busiest threads, for `seconds`
+(1..120, default 20) after a delay of `delay_seconds` (default 3, so you can close the console
+first). `label` (default `"run"`) names the report. One run at a time; it costs a few percent of
+frame time while it runs and reads only.
+
+Two files are written when the run ends, into `profiles\` **next to the DLL's version folder**
+(that is `dll\profiles\` in the mod-manager layout, so the manager's cleanup of old version
+folders does not take them):
+
+- `profile_<label>.txt` — per thread, the functions the CPU was in (`self`) and the functions on
+  the stack, as Ghidra addresses;
+- `profile_<label>.folded.txt` — folded call stacks, the input for
+  `tools/profile_tree.py <folded.txt> [--min 2] [--depth 14] [--callers <fn>] [--minus <baseline>]`.
+
+Native `se_profile_start`. Since 0.31 (report folder 0.32.2).
+
+#### `se.profile.stop() -> ok, message`
+
+End the running profile now; its reports are still written.
+
+```lua
+se.profile.start(50, 4, "endturn")   -- close the console, then press End Turn
+```
+
+---
+
+### 3.16 Script listener diagnostics
+
+Which script listener costs the time. This wraps the event manager, not the engine: behaviour is
+unchanged (same arguments, same return values, errors still pass through the game's own `pcall`).
+Read-only, not saved, and it lasts until the Lua state is rebuilt — install it again after a load.
+
+#### `se.diag.listeners_start() -> ok, message`
+
+Put a stopwatch around the condition and the callback of every listener registered through
+`core:add_listener`, including the ones registered later (`core.add_listener` itself is wrapped).
+Needs `se.core` and the natives `se_timer_push` / `se_timer_pop`. Idempotent: a listener is never
+wrapped twice. Returns `"timing N listeners (new ones are added as they register)"`.
+
+#### `se.diag.listeners_reset() -> true`
+
+Zero the counters — call it right before the thing you want to measure, e.g. End Turn.
+
+#### `se.diag.listeners_report([top]) -> rows`
+
+Log a per-event summary and the `top` (default 30) most expensive listeners, and return the rows:
+`{ event, name, calls, fired, total_ms, condition_ms, callback_ms }`, sorted by total time.
+`calls` counts every evaluation of the condition, `fired` the ones whose callback ran.
+
+**Times are inclusive**: a callback that triggers further events carries their listeners' time
+too, so the numbers do not add up to a total. Natives `se_timer_push` / `se_timer_pop`.
+Since 0.35.
+
+```lua
+se.core = core
+se.diag.listeners_start()
+se.diag.listeners_reset()            -- then press End Turn
+se.diag.listeners_report(40)
+```
+
+---
+
+### 3.17 AI recruitment
+
+Two layers: a **read side** (0.36) that shows what the campaign AI budgets, buys and could have
+bought, and a **policy** (0.37) that adds recruitment orders of its own. §4c and §4d are the
+narrative versions; this is the reference.
+
+Engine background: the AI's recruitment planner only ever prices **empty** retinue slots, at most
+three per character per pass, cheapest first — nothing in the engine replaces a unit that is
+already in a slot. Its ranking of units is the database table
+`cdir_military_generator_unit_qualities`.
+
+#### `se.query.unit_quality(unit_key) -> rows, best`
+
+The AI's own ranking of a unit, read from the live table (so other mods' rows count):
+`rows = { { group, quality, quality_at_max_xp }, ... }`, one row per role group the unit belongs
+to; `best` is the highest quality over the groups, or the value in
+`se.ai_recruit.quality_override`. An unknown unit gives `{}, 0`.
+
+Results are **cached per unit key for the life of the Lua state**; an override set afterwards
+still wins, because it is applied after the lookup. Native `se_unit_quality`. Since 0.36.
+
+#### `se.ai_recruit.trace(on) -> was_on`
+
+Let the DLL copy the AI's recruitment requests after every planning pass. **Off by default**;
+switching it off drops whatever was collected. Native `se_ai_recruit_trace`. Since 0.36.
+
+#### `se.query.ai_recruitment() -> passes`
+
+**Drains** what the trace collected since the last call:
+
+```
+{ { seq, faction_id, pending,
+    requests = { { money, budget2, turn, target,
+                   rows = { { id, cost, cost2, kind } } } } } }
+```
+
+`money` / `budget2` are what the planner set aside for that request, `rows` the purchases it
+priced, `target` the class of the request's target object (hex RVA of its vtable) and
+`faction_id` the engine id of the planning faction (`0` when it could not be resolved). Native
+`se_ai_recruit_passes`. Since 0.36.
+
+#### `se.ai_recruit.report(faction_key [, opts]) -> report | nil, message`
+
+A read-only audit of every retinue slot of every army of a faction:
+
+```
+{ faction, treasury, slots, empty, upgradable, affordable,
+  forces = { { cqi, characters = { { cqi, slots = { {
+      index, unit, experience, strength, recruiting,
+      quality, effective, best = { key, quality, cost, turns }, gap, affordable } } } } } } }
+```
+
+`effective` scales the unit's quality towards `quality_at_max_xp` by its experience, the way the
+AI's own table values a veteran; `best` is the highest-quality unit of a **shared role group**
+the slot could recruit right now with no lock reason; `gap` = `best.quality / effective`, so a
+gap above 1 means a better unit is available. `opts.min_gap` (default 1.0) only fills `best` when
+the gap reaches it. Since 0.36.
+
+#### `se.ai_recruit.plan(faction_key [, money]) -> orders, info`
+
+What the policy would do this turn. **Changes nothing** — the planning half of the pass, exposed
+so you can inspect or edit it.
+
+```
+orders = { { op = "recruit" | "replace", force, character, general, slot,
+             unit, cost, copies, old, score, old_score, gain }, ... }
+info   = { faction, treasury, income, candidates, budget, spent [, skipped ] }
+```
+
+Orders come back sorted deterministically (replacements first, then by gain, then by character
+and slot — the same order on every machine), already cut to the budget and the per-turn caps.
+`money = { treasury, income }` overrides the faction's own numbers for a what-if. Budget =
+`min(treasury - reserve, max(0, income) * income_turns, max_spend)`.
+
+Score of a unit = its AI quality (the old unit's scaled up by its experience) x the general's
+element weight x `duplicate_penalty` per copy already in that retinue. Since 0.37.
+
+#### `se.ai_recruit.execute(orders) -> done, failed`
+
+Carry the orders out at **normal cost**, through `se.modify.replace` / `se.modify.recruit`.
+Returns two counts. Since 0.37.
+
+#### `se.ai_recruit.set_policy(fn) -> true`
+
+`fn(faction_key) -> orders` replaces `se.ai_recruit.plan` as the decision maker of the turn-start
+pass; it may call `plan()` and edit the result. `nil` restores the default. Since 0.37.
+
+#### `se.ai_recruit.enable() -> ok, message`
+
+Install the turn-start pass: a `FactionTurnStart` listener that runs for every AI faction that is
+not dead. Needs `se.core`. Once per Lua state — **call it again after a load**. Returns
+`"listening"`, or `"already listening; enabled"` when it was installed before.
+
+It runs inside the model callback, so it is legal in multiplayer: no local-player branching and
+no randomness anywhere in the pass. Both machines must run the same rules, i.e. the same values
+in the tables below — ship them as mod content, not as a console edit on one machine.
+
+#### `se.ai_recruit.disable() -> true`
+
+The listener stays registered but does nothing.
+
+#### Tunables
+
+Plain tables; edit them before or after `enable()`.
+
+| Table | Default | Meaning |
+|---|---|---|
+| `se.ai_recruit.config` | see below | the policy's numbers |
+| `se.ai_recruit.element_order[element]` | five lists | units ranked best to worst for a general of that element. An entry is `"element"` or `"element:class"` with class `cavalry` / `infantry`; a unit takes the best entry it matches |
+| `se.ai_recruit.element_weight` | `{ 1.30, 1.15, 1.00, 0.90, 0.80 }` | score multiplier by rank in that list. A longer list is spread evenly between the first and the last value |
+| `se.ai_recruit.unit_element[key]` | `{}` | element of a unit whose key does not name one |
+| `se.ai_recruit.unit_class[key]` | `{}` | `"cavalry"` / `"infantry"` for units the quality table does not know |
+| `se.ai_recruit.quality_override[key]` | `{}` | quality for units missing from the table, or a rebalance |
+| `se.ai_recruit.max_experience` | `9` | the experience level that counts as fully veteran |
+
+| `config` key | Default | Meaning |
+|---|---|---|
+| `fill_empty` / `replace` | `true` / `true` | which of the two jobs run |
+| `min_gain` | `1.5` | replace only when the new score is at least this times the old |
+| `same_role_only` | `false` | a replacement must share a role group with the old unit |
+| `min_strength` | `50` | leave units below this strength % alone |
+| `max_per_character` / `max_per_force` / `max_per_faction` | `2` / `3` / `8` | orders per turn |
+| `reserve` | `1500` | treasury the pass never touches |
+| `income_turns` / `max_spend` | `3` / `4000` | the other two budget limits |
+| `min_income` | `0` | a faction with a lower projected income does nothing |
+| `duplicate_penalty` | `0.92` | score multiplier per copy of the unit already in the retinue |
+| `max_copies` | `0` | hard limit of copies of one unit per retinue (0 = none) |
+| `log_orders` | `true` | log every executed order with before / after |
+
+#### Helpers
+
+`se.ai_recruit.element_of(key) -> element | nil` — the first `_`-separated word of a unit or
+character-subtype key that names an element (`unit_element` overrides).
+`se.ai_recruit.class_of(unit_key) -> "cavalry" | "infantry"` — cavalry when any of the unit's
+role groups names cavalry (`unit_class` overrides).
+`se.ai_recruit.element_factor(general_element, unit_key) -> number` — the weight of the best
+entry of that general's list the unit matches, 1 when either side is unknown.
+`se.ai_recruit.forces_of(faction_key) -> { { cqi, characters = { { cqi, element } } } }` — the
+pass's data source, kept separate so a test or another script can replace it.
 
 ---
 
@@ -1189,8 +1478,10 @@ core:add_listener("recipe_bundle_load", "LoadingGame", true, function() install(
 
 ```lua
 -- se_recipe_ar_rules.lua : load once per session (or ship the same code in a mod script).
+local MINE     = "3k_main_faction_cao_cao"     -- the faction the rules protect, by key: the same
+                                               -- on every machine (never is_local_player)
 local NEMESIS  = "3k_main_faction_dong_zhuo"   -- battles against this faction are always lost
-local MY_CAP   = 0.25                          -- the player never loses more than 25% per unit
+local MY_CAP   = 0.25                          -- that faction never loses more than 25% per unit
 
 local function log(s) ModLog("[recipe_ar] " .. tostring(s)) end
 pcall(function() return cm:query_model():world() end)
@@ -1199,9 +1490,10 @@ se.logger = ModLog
 se.core = core
 
 local function handler(ctx)
-    local i_attack = ctx.attacker.is_local_player == true
-    local mine     = i_attack and "attacker" or "defender"
-    local theirs   = i_attack and "defender" or "attacker"
+    local attacking = ctx.attacker.faction == MINE
+    if not (attacking or ctx.defender.faction == MINE) then return nil end   -- not our battle
+    local mine     = attacking and "attacker" or "defender"
+    local theirs   = attacking and "defender" or "attacker"
     local enemy    = ctx[theirs]
     log("battle vs " .. tostring(enemy.faction) .. " (" .. tostring(ctx.battle_type) .. ")")
 
@@ -1215,7 +1507,8 @@ end
 
 local ok, msg = se.autoresolve.set_handler(handler)
 log("set_handler -> " .. tostring(ok) .. " : " .. tostring(msg))
--- bias and duels in a plan are stored but not applied by the current DLL.
+-- The handler runs on every machine, so it must decide from faction keys only. plan.duels works
+-- since 0.27; plan.bias is stored but never applied.
 ```
 
 ### 4.8 A per-turn income line that survives loading
@@ -1291,10 +1584,35 @@ end)
 
 ---
 
-## 4b. Performance features and diagnostics (DLL 0.31 - 0.34)
+## 4b. `script_extender.cfg` and the performance features (DLL 0.31 - 0.35)
 
-These need no script; they are controlled from `script_extender.cfg` (next to the versioned DLL
-folders). None of them changes what the game computes.
+### The configuration file
+
+The DLL reads `script_extender.cfg` **next to itself, then in its parent folder** — the second
+place is the mod-manager layout, where the DLL sits in `dll\<version>\` and the file in `dll\`,
+so one file serves every installed version. Format: one `key=value` per line, `#` comments,
+values optionally quoted; an unknown key is logged and ignored.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `build_number`, `build_number_short`, `build_modified` | — | menu build strings applied at injection (§3.13) |
+| `autoresolve_hooks` | on | `0` disables every auto-resolve hook (§3.14) |
+| `horde_income` | on | `0` disables the horde income hook (§3.12a) |
+| `horde_income_category` | `1` (MINING) | which income category receives the total, `0..3` |
+| `recruit_perm_cache` | `1` | unit-permission table reuse, see below |
+| `ui_recruit_cache_ms` | `5000` (max 30000) | UI recruit-list cache TTL |
+| `ai_recruit_cache` | `0` | diagnostic AI-planner list cache |
+| `file_probe_cache_ms` | `10000` (max 600000) | missing-directory cache for loose-file lookups |
+| `diag_diplomacy` | `0` | diplomacy evaluation counters only |
+
+**Five of them are part of the multiplayer version lock** — `autoresolve_hooks`,
+`ai_recruit_cache`, `recruit_perm_cache`, `horde_income` and `horde_income_category`. The DLL
+hashes their *effective* values into the build string, so an absent key and an explicitly written
+default give the same tag, but two players with different values cannot join each other (§1).
+
+### The performance features
+
+These need no script. None of them changes what the game computes.
 
 | cfg key | default | what it does |
 |---|---|---|
@@ -1304,21 +1622,24 @@ folders). None of them changes what the game computes.
 | `diag_diplomacy` | `0` | Measurement only (`dip_*` counters). |
 | `ai_recruit_cache` | `0` | Diagnostic (whole-list cache inside the AI's recruitment budget planner). Measured as not worth it; leave off. |
 
-`recruit_perm_cache` and `ai_recruit_cache` are part of the multiplayer sync fingerprint: both
-players need the same values.
+Measured on a modded late campaign: end turn 76 s -> 45 s (horde income hook made cheap in
+0.32.4) -> about 30 s (permission tables, 0.34); turn 1 went 62 s -> 39 s.
+
+### Reading the numbers from a script
+
+The full reference for these three groups is §3.15 and §3.16.
 
 ```lua
-se.query.perf()              -- counters: hits / misses (UI cache), perm_built / perm_shared /
-                             -- perm_same / perm_diff (permission tables), ai_* (diagnostic)
-se.profile.start(50, 4, "endturn")  -- CPU sampling: 50 s after a 4 s delay; report
-                                    -- profile_endturn.txt + .folded.txt in <dll folder>\profilesse.profile.stop()            -- end the run now; the report is written when a run ends
+se.query.perf()                     -- cache counters: hits / misses / passed_through, perm_*,
+                                    -- ai_*, file_probes*
+se.profile.start(50, 4, "endturn")  -- CPU sampling: 50 s after a 4 s delay; writes
+                                    -- profile_endturn.txt + .folded.txt into dll\profiles\
+se.profile.stop()                   -- end the run now; the reports are still written
 
 se.core = core                      -- hand over the event manager once
 se.diag.listeners_start()           -- time every core:add_listener listener from now on
 se.diag.listeners_reset()           -- zero the numbers (e.g. right before End Turn)
-se.diag.listeners_report(40)        -- log totals per event and the 40 most expensive listeners;
-                                    -- returns rows { event, name, calls, fired, total_ms,
-                                    -- condition_ms, callback_ms } (inclusive times)
+se.diag.listeners_report(40)        -- log totals per event and the 40 most expensive listeners
 ```
 
 `tools/profile_tree.py <folded.txt> [--min 2] [--depth 14] [--callers <fn>] [--minus <baseline>]`
@@ -1326,7 +1647,7 @@ turns the folded stacks into a call tree (addresses are Ghidra function starts).
 
 ---
 
-## 4c. Watching the campaign AI recruit (DLL 0.36, read-only)
+## 4c. Watching the campaign AI recruit (DLL 0.36+, read-only; reference in §3.17)
 
 The AI's recruitment planner only ever prices **empty** retinue slots (at most three per
 character per pass, cheapest first); nothing in the engine replaces a unit that is already in a
@@ -1353,7 +1674,7 @@ bought. The console script `se_ai_trace.lua` logs all three per AI faction turn.
 
 ---
 
-## 4d. AI recruitment policy: better armies that fit their general (DLL 0.37, pre-release)
+## 4d. AI recruitment policy: better armies that fit their general (DLL 0.37+; reference in §3.17)
 
 The engine fills empty retinue slots with the cheapest unit and never replaces a unit. This pass
 runs at the start of every AI faction's turn, inside the model callback (the same on every
@@ -1381,23 +1702,16 @@ end)
 ```
 
 score = the game's AI quality of the unit (`se.query.unit_quality`, the old unit's scaled up with
-its experience) x element weight (the general's element comes from `character_subtype_key()`, or, for captains and other leaders whose subtype names none, from their bodyguard unit in slot 0;
-the unit's from its key: the first `_`-separated word that names an element) x
+its experience) x element weight (the general's element comes from `character_subtype_key()`, or,
+for captains and other leaders whose subtype names none, from their bodyguard unit in slot 0; the
+unit's element from its key: the first `_`-separated word that names one) x
 `duplicate_penalty` per copy already in the retinue. Empty slots take the best score; an occupied
 slot is replaced when the best score is at least `min_gain` times the old one.
 
-| config key | default | meaning |
-|---|---|---|
-| `fill_empty` / `replace` | true / true | which of the two jobs run |
-| `min_gain` | 1.5 | replacement threshold (new score / old score) |
-| `same_role_only` | false | replacements must share a role group with the old unit |
-| `min_strength` | 50 | leave units below this strength % alone |
-| `max_per_character` / `max_per_force` / `max_per_faction` | 2 / 3 / 8 | orders per turn |
-| `reserve` | 1500 | treasury never touched |
-| `income_turns`, `max_spend` | 3, 4000 | per-turn budget = min(treasury - reserve, income x income_turns, max_spend) |
-| `min_income` | 0 | factions with a lower projected income do nothing |
-| `duplicate_penalty` | 0.92 | score multiplier per copy of the same unit in the retinue |
-| `max_copies` | 0 | hard limit of copies of one unit per retinue (0 = none) |
+Every `config` key with its default is in §3.17; the ones you are most likely to move are
+`min_gain` (how much better a replacement must be), `reserve` / `income_turns` / `max_spend`
+(the budget) and `max_per_character` / `max_per_force` / `max_per_faction` (how fast an army
+may change).
 
 Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `tools/test_lua_aipolicy.py`.
 
@@ -1434,8 +1748,13 @@ Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `to
 | `slot N holds <key>; pass replace = true to swap it` | target an empty slot or pass `replace` |
 | `<key> is locked (reasons 0x...); use opts.source = 'locked' or 'any'` | the item is not unlocked in that tree |
 | `refusing to disband the commander's own slot` | slot 0 is the commander |
-| `refused: no pending battle with the local player` | no pre-battle panel, or the battle does not involve you |
+| `refused: no pending battle with a human player` | no pre-battle panel, or the battle is AI against AI |
 | `effects must be a non-empty list of {effect=, scope=, value=}` | malformed effect bundle list |
+| `cm:modify_campaign_ai() is not available (needs the model thread)` | `se.query.cai_personality` was called outside a model callback — wrap it in `se.on_model` |
+| `state must be 'pool' or 'recruited'` | third argument of `move_character` |
+| `usage: autoresolver_variable(key, number)` | the key must be a string and the value a number |
+| `a profile is already running` | one profiler run at a time; `se.profile.stop()` first |
+| `no saved policy` / `no saved income lines` | `se.load_emperor_policy()` / `se.load_income_lines()` found nothing in the save |
 
 ### Nothing visibly changed
 
@@ -1472,30 +1791,46 @@ reporting.
 
 ## 6. Index of public functions
 
+Every function the module defines. Optional arguments in `[ ]`; §3 has the details.
+
 | Function | Description |
 |---|---|
+| `se.ai_recruit.class_of(unit_key)` | cavalry or infantry, from the unit's role groups |
+| `se.ai_recruit.disable()` | stop the AI recruitment pass (the listener stays registered) |
+| `se.ai_recruit.element_factor(element, unit_key)` | score multiplier of a unit for a general of that element |
+| `se.ai_recruit.element_of(key)` | the element named by a unit or character-subtype key |
+| `se.ai_recruit.enable()` | install the AI recruitment pass at faction turn start |
+| `se.ai_recruit.execute(orders)` | carry recruitment orders out at normal cost |
+| `se.ai_recruit.forces_of(faction_key)` | the pass's own view of a faction's armies |
+| `se.ai_recruit.plan(faction_key [, money])` | the orders the policy would issue; changes nothing |
+| `se.ai_recruit.report(faction_key [, opts])` | per-slot audit: unit, quality, best option, gap |
+| `se.ai_recruit.set_policy(fn)` | replace the pass's decision maker |
+| `se.ai_recruit.trace(on)` | let the DLL copy the AI's recruitment requests |
 | `se.autoresolve.clear_handler()` | forget the auto-resolve handler and clear the stored plan |
-| `se.autoresolve.set_handler(fn)` | call `fn(ctx)` on every local-player `PendingBattle` to produce a plan |
-| `se.available(native)` | is a given `se_*` native present in this Lua state |
-| `se.character(cqi)` | checked `cm:query_character` |
+| `se.autoresolve.set_handler(fn)` | call fn(ctx) on every PendingBattle with a human player |
+| `se.available(native)` | is a given se_* native present in this Lua state |
+| `se.character(cqi)` | checked cm:query_character |
+| `se.diag.listeners_report([top])` | totals per event and the most expensive listeners |
+| `se.diag.listeners_reset()` | zero the listener timings |
+| `se.diag.listeners_start()` | time every core:add_listener listener from now on |
 | `se.dump(t [, indent])` | pretty-print a table |
-| `se.faction(key)` | checked `cm:query_faction` |
+| `se.faction(key)` | checked cm:query_faction |
 | `se.G(name)` | read a global from the state's real global table |
 | `se.is_null(v)` | null-interface test that also works on list interfaces |
 | `se.load_emperor_policy()` | restore the saved emperor policy and its listener |
 | `se.load_income_lines()` | restore saved income lines and their listener |
-| `se.log(s)` | log through `se.logger` / `ModLog` / the DLL log |
+| `se.log(s)` | log through se.logger / ModLog / the DLL log |
 | `se.modify.alliance_name(cqi, text [, mode])` | rename an alliance / coalition |
 | `se.modify.attitude(a, b, level)` | fire an attitude-change event, level -3..3 |
 | `se.modify.autoresolve_plan(plan [, ctx])` | store a plan for the current pending battle |
 | `se.modify.autoresolve_plan_clear()` | drop the stored plan |
-| `se.modify.autoresolver_variable(key, value)` | retune one `autoresolver_*` constant (session) |
+| `se.modify.autoresolver_variable(key, value)` | retune one autoresolver_* constant (session) |
 | `se.modify.autoresolver_variables_reset()` | all auto-resolver constants back to engine values |
 | `se.modify.build_number(build, short, modified)` | replace the main-menu build strings |
 | `se.modify.building_construct(region, slot, level [, opts])` | build / upgrade / convert, optionally forced and free |
 | `se.modify.building_damage(region, slot, percent)` | damage a building |
 | `se.modify.building_destroy(region, slot)` | destroy a building |
-| `se.modify.building_repair(region, slot [, opts])` | repair a building (`opts.free`) |
+| `se.modify.building_repair(region, slot [, opts])` | repair a building (opts.free) |
 | `se.modify.cai_personality(faction, personality)` | swap an AI faction's CAI personality |
 | `se.modify.character_add_xp(cqi, n [, scaled])` | add exact or engine-scaled experience |
 | `se.modify.disband(cqi, slot)` | empty a retinue slot |
@@ -1518,13 +1853,16 @@ reporting.
 | `se.modify.unit_strength(cqi, slot, percent)` | set a unit's strength percent |
 | `se.modify.world_leader(key)` | grant an emperor seat directly |
 | `se.on_model(tag, f [, cb])` | run a function on the model thread |
+| `se.profile.start(seconds [, delay [, label]])` | sampling profiler run; reports next to the DLL |
+| `se.profile.stop()` | end the running profile now |
+| `se.query.ai_recruitment()` | drain the traced AI recruitment planning passes |
 | `se.query.alliances()` | alliances with cqi, name and members |
 | `se.query.assignment(cqi [, dump])` | active assignment key, state, rounds, province |
 | `se.query.attitude(a, b)` | standing of a towards b |
 | `se.query.autoresolve_plan()` | the stored plan and its encoded form |
 | `se.query.autoresolve_prediction()` | the engine's prediction for the pending battle |
-| `se.query.autoresolver_variable(key)` | one `autoresolver_*` constant |
-| `se.query.autoresolver_variables()` | all `autoresolver_*` constants |
+| `se.query.autoresolver_variable(key)` | one autoresolver_* constant |
+| `se.query.autoresolver_variables()` | all autoresolver_* constants |
 | `se.query.build_number()` | current main-menu build strings |
 | `se.query.building_candidates(region, slot [, opts])` | building levels a slot can take |
 | `se.query.cai_personality(faction)` | current CAI personality (model thread) |
@@ -1534,59 +1872,88 @@ reporting.
 | `se.query.faction(key)` | progression level, world-leader state, seats |
 | `se.query.faction_effect_value(faction, effect_id)` | faction-level value of an effect id |
 | `se.query.faction_force_gdp(faction_key)` | gdp_abs total on the faction and its armies (what the horde income hook adds) |
-| `se.query.horde_income_hook()` | whether the horde income hook is installed, and its income category |
 | `se.query.faction_income(faction)` | script-side income lines and their total |
 | `se.query.faction_potential(key)` | potential value, base, bonus, roll |
 | `se.query.faction_xp_gain_percent(key)` | faction character-experience-gain percentage |
+| `se.query.horde_income_hook()` | whether the horde income hook is installed, and its income category |
 | `se.query.pending_battle()` | full pending-battle context incl. prediction |
-| `se.query.pool_lock(cqi)` | pool availability status and counter |
+| `se.query.perf()` | counters of the DLL's caches and file probes |
+| `se.query.pool_lock(cqi)` | pool availability status and counter (two numbers) |
 | `se.query.recruitable(cqi, slot)` | the slot's recruitment items with cost / turns / lock reasons |
 | `se.query.region_slots(region)` | region slots with their buildings and health |
 | `se.query.retinue(cqi)` | retinue slots with units, strength, experience |
 | `se.query.skill_points(cqi)` | unspent skill points |
 | `se.query.unit(cqi, slot)` | unit key, strength, experience of one slot |
+| `se.query.unit_quality(unit_key)` | the campaign AI's quality rows for a unit, and the best of them |
 | `se.query.world_leaders()` | faction keys holding an emperor seat |
-| `se.region(key)` | checked `cm:query_region` |
+| `se.region(key)` | checked cm:query_region |
 | `se.version()` | DLL version string |
 
-Constant: `se.EFFECT_CHARACTER_XP_GAIN = 385` (character experience gain effect id).
+### Values the module reads from you, and its own state
+
+| Name | Purpose |
+|---|---|
+| `se.logger` | `function(string)` used by `se.log`; set it to `ModLog` in a console script |
+| `se.core` | the event manager; needed by everything that installs a listener |
+| `se.EFFECT_CHARACTER_XP_GAIN` | `385` (`0x181`), the character-experience-gain effect id |
+| `se.autoresolve.handler` | the handler `set_handler` stored |
+| `se.ai_recruit.config` and the tables beside it | tuning of the AI recruitment policy (§3.17) |
+
+Fields starting with an underscore (`se._income`, `se._ar_vars`, `se._ar_plan`,
+`se._emperor_policy`, ...) and `se.ai_recruit.enabled` / `listening` / `policy` are the
+module's own state. They are visible, but they are not API and may change with any DLL version.
 
 ---
 
 ## 7. Open questions and source discrepancies
 
-These are places where the sources disagree or are explicitly unresolved. Signatures follow
-`se_api.lua`; behaviour follows the newest dated section of the notes.
+Re-checked against `se_api.lua`, the DLL sources and `notes/*.md` on **2026-09-19, DLL 0.40.0**.
+These are the places where a source disagrees with another, or where something is implemented but
+not confirmed by a live test. Signatures follow `se_api.lua`; behaviour follows the newest dated
+section of the notes.
 
-1. **Auto-resolve version claims.** `HANDOFF.md` §4 and §6 describe 0.24 as the current DLL and
-   say "winner 0.25, bias/casualties 0.26, duels 0.27 pending". `Cargo.toml`, the git history and
-   `notes/autoresolve.md` are at **0.26.2**, where *casualties and winner* are applied and *bias*
-   is not. The example script `se_ar_rules.lua` repeats the older claim in its header comment.
-   This document follows the notes and the code.
-2. **Prediction table keys.** The comment above `se.query.autoresolve_prediction` in `se_api.lua`
-   lists neither `<side>_prediction_id` nor `pending_battle`, but the DLL emits both, and
-   `se_ar_plan.lua` reads `attacker_prediction_id`. Documented here from the DLL's output.
-3. **`se.query.attitude` return shape.** `HANDOFF.md` describes it as returning a standing value;
-   `se_api.lua` returns a table `{ standing, stock }`. The table is correct.
-4. **Forced winner: verified live on 0.26.2** (2026-09-18: a predicted close victory was forced
-   to a defeat; the game logged "player has lost a field battle as an attacker" and awarded
-   "Battle Defeat" XP). 0.26.0 / 0.26.1 swapped the wrong fields and had no effect on the
-   winner. The casualty cap is verified live as well.
-5. **Multi-force sides.** A side whose alliance summary holds more than one army record is skipped
-   by the plan rewrite; the element size of that vector is not mapped.
-6. **Forced new buildings.** A forced construction into an empty slot was dropped at turn
-   processing while the province was over its construction limit; whether a forced build under the
-   limit completes has not been tested.
-7. **Effect bundle income.** A defined `+50 gdp_mod_all / faction_to_region_own` bundle produced
-   no change in `projected_net_income` before or after a turn. Force-scoped GDP effects are not
-   implemented at all (the region GDP computation was never reached).
-8. **Persistence not yet tested**: forced world-leader seats, renamed alliances, and the custom
-   effect list of `effect_bundle_apply_custom`.
-9. **`emperor_policy`** installs a `FactionTurnStart` listener that has never been observed
-   running across a turn.
-10. **Unit strength and chevron writes** are direct field writes; the engine's own setters were
-    never traced, so derived state could in principle go stale.
-11. **No direct skill grant** by skill key, and **no effect id -> key map** beyond the single
-    named constant.
-12. **`se.modify.attitude`** (the change event) and the treaty-component evaluation bias are
-    untested / not implemented respectively.
+**Not confirmed live yet**
+
+1. **The multiplayer lobby check.** The whole version lock rests on the lobby comparing the build
+   string the DLL rewrites. That has **not been tested on two machines** - neither the join
+   refusal between different DLL versions nor a campaign running in lockstep with the API in use.
+   Everything else about multiplayer follows from the lockstep rules, not from a test.
+2. **Persistence** of forced world-leader seats, of a renamed alliance
+   (`se.modify.alliance_name`) and of the per-instance effect list of
+   `se.modify.effect_bundle_apply_custom`. Verified to persist across save / restart / load:
+   `cai_personality` and `faction_potential`.
+3. **`se.modify.emperor_policy`** installs a `FactionTurnStart` listener that has never been
+   observed running across a turn.
+4. **`se.modify.attitude`** (the change event) is implemented but not confirmed live; the
+   per-treaty-component evaluation bias is not implemented at all.
+5. **Forced new buildings.** A forced construction into an empty slot was dropped at turn
+   processing while the province was over its construction limit. Whether a forced build under
+   the limit completes has not been tested.
+
+**Implemented but deliberately incomplete**
+
+6. **`plan.bias` and `plan.duels[i].fate`** are validated, clamped and stored, and neither is
+   applied. `winner` and `casualties` are applied since 0.26.2, `duels` since 0.27 (all three
+   verified live).
+7. **Multi-force sides in an auto-resolve plan.** A side whose alliance summary holds more than
+   one army record is skipped by the result rewrite; the element size of that vector is not
+   mapped.
+8. **Unit strength and chevron writes** are direct field writes. The engine's own setters were
+   never traced, so derived state could in principle go stale. The stock getters and the retinue
+   panel agree with what is written.
+9. **No direct skill grant** by skill key, and **no effect id -> key map** beyond the single
+   named constant `se.EFFECT_CHARACTER_XP_GAIN`.
+10. **Effect bundle income.** A defined `+50 gdp_mod_all / faction_to_region_own` bundle produced
+    no change in `projected_net_income`, before or after a turn. Force-scoped GDP effects are not
+    implemented at all (the region GDP computation was never reached) - which is what the horde
+    income hook exists for.
+
+**Stale text in the sources**
+
+11. **`HANDOFF.md` is a maintainer document and its API table lags.** Where the two disagree,
+    this document and `se_api.lua` are right. Its pre-0.31 version paragraph ends at 0.24.
+12. **`se_api.lua:1657` still documents `ui_recruit_cache_ms` as "default 250"**; the DLL's
+    default is **5000** (`perf.rs:390`), which is what §4b lists. The comment is stale, the code
+    is right.
+13. **Example scripts carry their own version claims** in their header comments
+    (`se_ar_rules.lua` still describes the 0.24-era auto-resolve state). Trust this document.
