@@ -1836,6 +1836,97 @@ function se.diag.listeners_report(top)
 	return rows
 end
 
+-- se.diag.diplomacy_trace(on [, include_ai]) -> was_on | nil, message
+--   Records every "is this treaty component valid between A and B" question the engine asks
+--   (diplomacy screen, ultimatum popups, scripted deals; the campaign AI's too with include_ai)
+--   together with the campaign_diplomacy_groups tree it walked. Needs diag_diplomacy=1 in
+--   script_extender.cfg at injection. Read-only; switching it on clears the previous recording.
+function se.diag.diplomacy_trace(on, include_ai)
+	local okn, err = need("se_dip_trace")
+	if not okn then return nil, err end
+	return se_dip_trace(on and true or false, include_ai and true or false)
+end
+
+-- se.diag.diplomacy_mark(label) : a time marker between the recorded evaluations (a click, a step
+--   of a test), so the report shows what was asked after it.
+function se.diag.diplomacy_mark(label)
+	if type(G("se_dip_trace_mark")) == "function" then se_dip_trace_mark(str(label)) end
+end
+
+-- se.diag.diplomacy_report() -> { path, evaluations, blocked, summary = { line, ... } } | nil, message
+--   Writes dip_trace.txt next to the DLL (one entry per distinct evaluation, with the walked
+--   tree: '+' passed, '-' failed) and logs the blocked ones: component | A -> B | flags | reason.
+function se.diag.diplomacy_report()
+	local okn, err = need("se_dip_trace_report")
+	if not okn then return nil, err end
+	local path, evals, blocked, summary = se_dip_trace_report()
+	local t = { path = str(path), evaluations = num(evals) or 0, blocked = num(blocked) or 0, summary = {} }
+	for line in str(summary):gmatch("[^\n]+") do t.summary[#t.summary + 1] = line end
+	log(string.format("diplomacy trace: %d distinct evaluation(s), %d blocked -> %s", t.evaluations, t.blocked, t.path))
+	for _, line in ipairs(t.summary) do log("  BLOCKED " .. line) end
+	return t
+end
+
+----------------------------------------------------------------------------------------------
+-- UI repairs (DLL 0.41+)
+----------------------------------------------------------------------------------------------
+
+se.ui = se.ui or {}
+
+local FOLLOWUP_PANEL = "diplomacy_followup_negotiation_popup_panel"
+local FOLLOWUP_BUTTONS = { button_accept = true, button_txt = true }
+
+-- is the clicked component part of the follow-up negotiation popup? nil = cannot tell (no
+-- UIComponent in reach: hand it over as se.UIComponent); the native has its own guards then
+local function in_followup_popup(address)
+	local UIC = se.UIComponent or G("UIComponent")
+	if type(UIC) ~= "function" then return nil end
+	local okc, uic = pcall(UIC, address)
+	for _ = 1, 16 do
+		if not okc or not uic then return false end
+		local oki, id = pcall(function() return uic:Id() end)
+		if not oki then return false end
+		if id == FOLLOWUP_PANEL then return true end
+		local okp, parent = pcall(function() return uic:Parent() end)
+		if not okp or not parent then return false end
+		okc, uic = pcall(UIC, parent)
+	end
+	return false
+end
+
+-- se.modify.followup_propose() -> ok, message
+--   Runs the engine's own "propose" of the follow-up negotiation popup that is on screen (the
+--   ultimatum raised when a faction you vassalise is at war: MEDIATE PEACE). The recipient then
+--   accepts or refuses exactly as in the unmodified game; the command travels through the normal
+--   command queue. Refused when no such popup is up or the engine just handled the click itself.
+function se.modify.followup_propose()
+	local okn, err = need("se_followup_propose")
+	if not okn then return false, err end
+	return se_followup_propose()
+end
+
+-- se.ui.fix_followup_button() -> ok, message
+--   On game build 1.7.2.0 the call-for-action button of that popup is lit but dead: a click never
+--   reaches its ProposeDeal command. This listens for the click and proposes through
+--   se.modify.followup_propose(). Needs se.core = core. Call it once per campaign session (first
+--   tick); calling it again replaces the listener.
+function se.ui.fix_followup_button()
+	local okn, err = need("se_followup_propose")
+	if not okn then return false, err end
+	local core = se.core or G("core")
+	if type(core) ~= "table" or type(core.add_listener) ~= "function" then return false, "core (event manager) is not available: set se.core = core first" end
+	pcall(function() core:remove_listener("se_followup_button") end)
+	core:add_listener("se_followup_button", "ComponentLClickUp",
+		function(context) return FOLLOWUP_BUTTONS[context.string] == true end,
+		function(context)
+			if in_followup_popup(context.component) == false then return end
+			local ok, msg = se.modify.followup_propose()
+			if type(G("se_dip_trace_mark")) == "function" then se_dip_trace_mark("lua click " .. str(context.string) .. " -> " .. str(ok) .. " " .. str(msg)) end
+			log("follow-up popup button: " .. str(ok) .. " " .. str(msg))
+		end, true)
+	return true, "listening"
+end
+
 ----------------------------------------------------------------------------------------------
 -- AI recruitment: what the campaign AI budgets, what it buys, what it could have bought
 -- (DLL 0.36+, read-only; notes/ai_recruitment.md)

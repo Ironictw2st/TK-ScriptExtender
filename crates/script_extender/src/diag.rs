@@ -91,6 +91,9 @@ extern "system" {
     fn IsBadReadPtr(lp: *const c_void, ucb: usize) -> i32;
 }
 
+/// Is this thread inside a campaign AI diplomacy scan (FUN_141d8bf60)?
+pub fn in_scan() -> bool { DIP_DEPTH.with(|d| d.get()) != 0 }
+
 unsafe extern "C" fn dip_scan_detour(a: *mut c_void, b: *mut c_void) -> u64 {
     let Some(h) = DIP_SCAN.get() else { return 0 };
     let outer = DIP_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v == 0 });
@@ -111,7 +114,8 @@ unsafe extern "C" fn dip_scan_detour(a: *mut c_void, b: *mut c_void) -> u64 {
 
 unsafe extern "C" fn dip_eval_detour(out: *mut c_void, comp: *mut c_void, neg: *mut c_void, fa: *mut c_void, fb: *mut c_void, params: *mut c_void, flags: u32) -> u64 {
     let Some(h) = DIP_EVAL.get() else { return 0 };
-    if DIP_DEPTH.with(|d| d.get()) == 0 {
+    let in_scan = DIP_DEPTH.with(|d| d.get()) != 0;
+    if !in_scan {
         DIP_UNSCOPED.fetch_add(1, Ordering::Relaxed);
     } else {
         DIP_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -125,11 +129,14 @@ unsafe extern "C" fn dip_eval_detour(out: *mut c_void, comp: *mut c_void, neg: *
             k.1.insert((comp as usize, fa as usize, fb as usize, flags, hash));
         });
     }
-    h.call(out, comp, neg, fa, fb, params, flags)
+    let traced = crate::diptrace::eval_enter(in_scan);
+    let r = h.call(out, comp, neg, fa, fb, params, flags);
+    if traced { crate::diptrace::eval_exit(out as usize, comp as usize, fa as usize, fb as usize, flags, in_scan); }
+    r
 }
 
 pub fn install(t: &Table) {
-    if crate::build::config_value("diag_diplomacy").as_deref() != Some("1") { return; }
+    if !matches!(crate::build::config_value("diag_diplomacy").as_deref(), Some("1") | Some("2")) { return; }
     // SAFETY: both prologues are anchor-verified stack stores / pushes.
     unsafe {
         let eval: DipEval = core::mem::transmute(t.get("dip_component_eval"));
@@ -146,4 +153,5 @@ pub fn install(t: &Table) {
         }
     }
     log!("diplomacy diagnostic installed (counters in se.query.perf(): dip_*)");
+    crate::diptrace::install(t);
 }

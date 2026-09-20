@@ -60,6 +60,8 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::profiler::register(l);
     crate::perf::register(l);
     crate::diag::register(l);
+    crate::diptrace::register(l);
+    crate::followup::register(l);
     crate::airecruit::register(l);
     crate::diplomacy::register(l);
 }

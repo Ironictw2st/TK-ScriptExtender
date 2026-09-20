@@ -30,6 +30,9 @@ mod autoresolve;
 mod income;
 mod airecruit;
 mod diag;
+mod diptrace;
+mod dipui;
+mod followup;
 mod fileprobe;
 mod perf;
 mod permcache;
@@ -99,6 +102,7 @@ fn bootstrap() {
     permcache::install(&table);
     fileprobe::install(&table);
     diag::install(&table);
+    followup::install(&table);
     hook::install(&table);
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }

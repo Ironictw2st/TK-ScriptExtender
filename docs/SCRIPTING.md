@@ -7,8 +7,8 @@ KINGDOMS **build 1.7.2.0**. Audience: mod authors who already know 3K campaign s
 Sources of truth for this document: `crates/script_extender/lua/se_api.lua` (signatures),
 the DLL sources under `crates/script_extender/src/` (defaults, refusals), `HANDOFF.md`
 (injection rules, version history), `notes/*.md` (behaviour, live verification). Current DLL
-version at the time of writing: **0.40.0** (2026-09-19), which is the 0.37 beta line on the
-stable channel.
+version at the time of writing: **0.41.0** (2026-09-20): 0.40.0 (the 0.37 beta line on the stable
+channel) plus the MEDIATE PEACE button repair and the diplomacy trace.
 
 ### Which DLL version a feature needs
 
@@ -26,7 +26,8 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.31 - 0.35 | performance work and diagnostics (`se.profile.*`, `se.query.perf`, `se.diag.*`) |
 | 0.36 | AI recruitment trace (`se.ai_recruit.trace/report`, `se.query.ai_recruitment/unit_quality`) |
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
-| **0.40** | the current stable release: everything above, horde income on by default |
+| 0.40 | stable release of everything above, horde income on by default |
+| **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
 
 ---
 
@@ -1154,6 +1155,57 @@ se.diag.listeners_reset()            -- then press End Turn
 se.diag.listeners_report(40)
 ```
 
+#### `se.ui.fix_followup_button() -> ok, message` and `se.modify.followup_propose() -> ok, message`
+
+Game build 1.7.2.0: the first follow-up negotiation popup raised by a vassalisation (the ultimatum
+against a faction at war with your new vassal - **MEDIATE PEACE** after taking the Emperor) has a
+lit but dead button: the click never reaches its `ProposeDeal` command, and the popup comes back
+every turn. `se.ui.fix_followup_button()` installs a `ComponentLClickUp` listener for that button
+(`button_accept` inside `diplomacy_followup_negotiation_popup_panel`); on a click it calls
+`se.modify.followup_propose()`, which queues the engine's own "propose" command for the deal on
+screen. The DLL sends it from the main thread on the next UI update, only if the deal is still
+the one that was shown and still waiting, and not when the engine handled the click itself (the
+later popups of the same batch do work). The recipient then accepts or refuses as in the
+unmodified game; cancel is untouched. Needs `se.core = core`; hand over
+`se.UIComponent = UIComponent` so the listener can check the popup. Natives: `se_followup_propose`.
+Since 0.41.0.
+
+```lua
+cm:add_first_tick_callback(function()
+    if type(se) ~= "table" or not se.ui or not se.ui.fix_followup_button then return end
+    se.core = core
+    se.UIComponent = UIComponent
+    se.ui.fix_followup_button()
+end)
+```
+
+#### `se.diag.diplomacy_trace(on [, include_ai]) -> was_on`
+
+Record every "is this treaty component valid between faction A and faction B" question the
+engine asks - the diplomacy screen, an ultimatum popup, a scripted automatic deal, and with
+`include_ai` the campaign AI's too - together with the `campaign_diplomacy_groups` tree it
+walked to answer it. Read-only. Needs `diag_diplomacy=1` (or `2`) in `script_extender.cfg` when
+the DLL is injected; switching the trace on clears the previous recording. Identical questions
+are stored once with a count. Since 0.41.0.
+
+#### `se.diag.diplomacy_mark(label)`
+
+Put a time marker between the recorded evaluations (a click, a step of a test).
+
+#### `se.diag.diplomacy_report() -> { path, evaluations, blocked, summary }`
+
+Write `dip_trace.txt` next to the DLL and log the blocked evaluations
+(`component | A -> B | flags | reason`). In the file every evaluation is followed by its walk:
+`AND` / `OR` / `NOT` lines are group nodes (key, reason), `REQ` lines requirement leaves, `+`
+passed and `-` failed, so the first `-` leaf under a `BLOCKED` entry is the rule that refused it.
+
+```lua
+se.diag.diplomacy_trace(true)
+-- ... open the diplomacy screen, click the button that does nothing ...
+local t = se.diag.diplomacy_report()
+se.diag.diplomacy_trace(false)
+```
+
 ---
 
 ### 3.17 AI recruitment
@@ -1603,7 +1655,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ui_recruit_cache_ms` | `5000` (max 30000) | UI recruit-list cache TTL |
 | `ai_recruit_cache` | `0` | diagnostic AI-planner list cache |
 | `file_probe_cache_ms` | `10000` (max 600000) | missing-directory cache for loose-file lookups |
-| `diag_diplomacy` | `0` | diplomacy evaluation counters only |
+| `diag_diplomacy` | `0` | `1` diplomacy evaluation counters + validation trace on request, `2` trace recording from injection |
 
 **Five of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income` and `horde_income_category`. The DLL
@@ -1619,7 +1671,7 @@ These need no script. None of them changes what the game computes.
 | `recruit_perm_cache` | `1` | The engine's "what can this retinue slot recruit" routine rebuilt a complete table of the faction's unit permissions **for every candidate unit** (units x permissions per list; with a large unit roster this was the biggest single cost of an AI turn and of an open character panel). The DLL lets the engine build each table once per list and reuses it. The first 3000 reuses of a session are checked against the engine's own rebuild; one difference turns the feature off for the session (DLL log). `0` = off, `2` = check only. |
 | `ui_recruit_cache_ms` | `5000` | UI only: a recruitable-unit list asked for again by the panels is served from memory while the faction's treasury and the turn are unchanged, for at most this long. `0` = off. |
 | `file_probe_cache_ms` | `10000` | Before reading a file from a pack the engine looks for a loose copy in every search root (each subscribed mod folder, `data`, ...) and remembers nothing: zooming the camera in fired 1316 failed lookups in one burst. The DLL remembers for this long that a *directory* does not exist and answers lookups into it without a system call. A folder created while the game runs is seen after at most this time. `0` = off. |
-| `diag_diplomacy` | `0` | Measurement only (`dip_*` counters). |
+| `diag_diplomacy` | `0` | Diagnostics only, nothing is changed. `1`: the `dip_*` counters and the hooks behind `se.diag.diplomacy_trace`. `2`: the same, and the trace records from injection and rewrites `dip_trace.txt` next to the DLL every two seconds (for a session without a Lua console). |
 | `ai_recruit_cache` | `0` | Diagnostic (whole-list cache inside the AI's recruitment budget planner). Measured as not worth it; leave off. |
 
 Measured on a modded late campaign: end turn 76 s -> 45 s (horde income hook made cheap in
@@ -1810,6 +1862,11 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.autoresolve.set_handler(fn)` | call fn(ctx) on every PendingBattle with a human player |
 | `se.available(native)` | is a given se_* native present in this Lua state |
 | `se.character(cqi)` | checked cm:query_character |
+| `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
+| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0) |
+| `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |
+| `se.diag.diplomacy_report()` | write dip_trace.txt, log the blocked evaluations |
+| `se.diag.diplomacy_trace(on [, include_ai])` | record the engine's treaty-component validations |
 | `se.diag.listeners_report([top])` | totals per event and the most expensive listeners |
 | `se.diag.listeners_reset()` | zero the listener timings |
 | `se.diag.listeners_start()` | time every core:add_listener listener from now on |
@@ -1907,7 +1964,8 @@ module's own state. They are visible, but they are not API and may change with a
 
 ## 7. Open questions and source discrepancies
 
-Re-checked against `se_api.lua`, the DLL sources and `notes/*.md` on **2026-09-19, DLL 0.40.0**.
+Re-checked against `se_api.lua`, the DLL sources and `notes/*.md` on **2026-09-19, DLL 0.40.0**;
+the 0.41.0 additions (sections 3.16, 4b) on **2026-09-20**.
 These are the places where a source disagrees with another, or where something is implemented but
 not confirmed by a live test. Signatures follow `se_api.lua`; behaviour follows the newest dated
 section of the notes.

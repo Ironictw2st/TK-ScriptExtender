@@ -151,6 +151,23 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   latency): the profiler unwinds through our own detours (callers of a hooked function are no
   longer cut off) and writes a third report `profile_<label>.timeline.txt` (one line per main
   thread sample; `tools/profile_timeline.py`). No new hook, no cfg key, no API change.
+- **0.41.0 (stable, 2026-09-20)** = 0.41.0-beta.10 as released: the MEDIATE PEACE button fix, the diplomacy
+  validation trace (`diag_diplomacy=1|2`, off by default) and the beta.1 profiler timeline. beta.2 - beta.10
+  were local builds, never tagged. Mods must call `se.ui.fix_followup_button()` on first tick.
+- 0.41.0-beta.10 (**confirmed in game 2026-09-20**): fix for the dead MEDIATE PEACE button of the first
+  follow-up negotiation popup on 1.7.2.0 (`followup.rs`, always installed): `se.ui.fix_followup_button()`
+  (click listener, needs a mod script to call it on first tick) + `se.modify.followup_propose()`; the DLL
+  sends the engine's own negotiation command op 5 from the per-frame UI update. beta.4 - beta.9 were
+  diagnostic steps towards it (more `diag_diplomacy` hooks: deal builder, state machine, command handler,
+  ProposeDeal / CanPropose). Rule learned: never call a UI/CCO handler from inside a Lua native.
+- 0.41.0-beta.3: beta.2 plus detours on the deal builder (FUN_141ad4c00 add component, FUN_141ad0870
+  expand required treaties), exe call stacks and mouse-click markers in `dip_trace.txt`. Same cfg switch.
+- 0.41.0-beta.2 (diagnostic build for "MEDIATE PEACE does nothing", reproduced without 190Expanded and
+  without the DLL): `diag_diplomacy=1|2` additionally hooks the diplomacy condition tree
+  (FUN_1413c86b0 group node, FUN_1413d0cc0 requirement leaf; `diptrace.rs`) and records the engine's
+  treaty-component validations: `se.diag.diplomacy_trace / diplomacy_mark / diplomacy_report`,
+  report `dip_trace.txt` next to the DLL. `2` records from injection (no Lua console needed). Read-only,
+  not in the sync tag. Default `0` = no hook at all.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 
