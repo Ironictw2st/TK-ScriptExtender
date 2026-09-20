@@ -147,6 +147,10 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
 - **0.40.0 = the 0.37 beta line gone live (2026-09-19)**: stable channel now has the performance
   work (0.31-0.35), the AI recruitment trace + policy (0.36-0.37) and the default-on horde income
   hook. Version numbers compare as dotted integers in the manager (0.40 > 0.37 > 0.4).
+- 0.41.0-beta.1 (pre-release line after 0.40.0; measurement build for the court screen open
+  latency): the profiler unwinds through our own detours (callers of a hooked function are no
+  longer cut off) and writes a third report `profile_<label>.timeline.txt` (one line per main
+  thread sample; `tools/profile_timeline.py`). No new hook, no cfg key, no API change.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 

@@ -15,6 +15,8 @@
 //!   profile_<label>.txt         per thread: self % and inclusive % per function (Ghidra addresses)
 //!   profile_<label>.folded.txt  folded call stacks `thread;root;...;leaf count` (flame-graph input,
 //!                               read by tools/profile_tree.py)
+//!   profile_<label>.timeline.txt  busiest thread, one line per sample `ms;root;...;leaf`
+//!                               (0.41; tools/profile_timeline.py: blocks per 100 ms, window -> folded)
 
 use crate::log;
 use crate::lua::{self, LuaState};
@@ -81,7 +83,8 @@ unsafe extern "C" fn se_profile_stop(l: *mut LuaState) -> c_int {
 }
 
 /// Unwound sample: frames[0] = the function RIP was in (0 when outside the exe), then callers.
-struct Sample { thread: u16, n: u8, frames: [u32; MAX_FRAMES] }
+/// `t_ms` = milliseconds since the start of the run (timeline report).
+struct Sample { thread: u16, n: u8, t_ms: u32, frames: [u32; MAX_FRAMES] }
 
 unsafe fn cpu_100ns(h: *mut c_void) -> u64 {
     let z = FileTime { lo: 0, hi: 0 };
@@ -232,32 +235,37 @@ unsafe fn unwind(base: usize, size: usize, rfs: &[(u32, u32, u32)], ctx: &Ctx, s
     let func = |rip: usize| lookup(rfs, (rip - base) as u32).map(|rf| function_start(base, rf)).unwrap_or((rip - base) as u32);
     out.n = 0;
     if !in_exe(rip) {
-        // RIP outside the exe (system call, driver, wait): mark it with a 0 frame, then continue
-        // from the first return address into the exe that follows a call instruction.
+        // RIP outside the exe (system call, driver, wait): mark it with a 0 frame
         out.frames[0] = 0;
         out.n = 1;
-        // A stale return address can sit near the top of the stack (0.31.x blamed a tiny faction
-        // check for 19% of an end turn that way): a candidate is only accepted when unwinding
-        // from it yields at least three more frames inside the exe.
-        let mut found = None;
-        let mut a = regs[4];
-        while let Some(v) = st.read(a) {
-            if in_exe(v) && follows_call(v) {
-                let mut trial = regs;
-                trial[4] = a + 8;
-                let (mut r, mut depth) = (v, 0);
-                while depth < 3 {
-                    match unwind_step(base, rfs, r, &mut trial, &st) { Some(n) if in_exe(n) => { r = n; depth += 1; } _ => break }
-                }
-                if depth >= 3 { found = Some((v, a + 8)); break; }
-            }
-            a += 8;
-        }
-        let Some((v, sp)) = found else { return };
-        rip = v;
-        regs[4] = sp;
     }
-    while (out.n as usize) < MAX_FRAMES && in_exe(rip) {
+    while (out.n as usize) < MAX_FRAMES {
+        if !in_exe(rip) {
+            // Outside the exe: a system call at the top of the stack, or (0.41) one of our own
+            // detours / trampolines between two exe frames, which used to end the walk and cut
+            // every caller of a hooked function out of the tree. Continue from the first return
+            // address into the exe that follows a call instruction. A stale return address can
+            // sit on the stack (0.31.x blamed a tiny faction check for 19% of an end turn that
+            // way): a candidate is only accepted when unwinding from it yields at least three
+            // more frames inside the exe.
+            let mut found = None;
+            let mut a = regs[4];
+            while let Some(v) = st.read(a) {
+                if in_exe(v) && follows_call(v) {
+                    let mut trial = regs;
+                    trial[4] = a + 8;
+                    let (mut r, mut depth) = (v, 0);
+                    while depth < 3 {
+                        match unwind_step(base, rfs, r, &mut trial, &st) { Some(n) if in_exe(n) => { r = n; depth += 1; } _ => break }
+                    }
+                    if depth >= 3 { found = Some((v, a + 8)); break; }
+                }
+                a += 8;
+            }
+            let Some((v, sp)) = found else { break };
+            rip = v;
+            regs[4] = sp;
+        }
         out.frames[out.n as usize] = func(rip);
         out.n += 1;
         let Some(next) = unwind_step(base, rfs, rip, &mut regs, &st) else { break };
@@ -320,7 +328,7 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
             ResumeThread(*h);
             // -----------------------------------------------------------------------
             if !ok { continue; }
-            let mut s = Sample { thread: *ti as u16, n: 0, frames: [0; MAX_FRAMES] };
+            let mut s = Sample { thread: *ti as u16, n: 0, t_ms: elapsed.as_millis() as u32, frames: [0; MAX_FRAMES] };
             unwind(base, size, &rfs, &ctx, &stack[..got], &mut s);
             samples.push(s);
         }
@@ -336,6 +344,7 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
     let mut folded: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
     let mut order: Vec<usize> = (0..all.len()).collect();
     order.sort_unstable_by_key(|i| std::cmp::Reverse(samples.iter().filter(|s| s.thread as usize == *i).count()));
+    let timeline_thread = order.first().copied();
     for ti in order {
         let (tid, cpu) = (all[ti].0, cpu_100ns(all[ti].1).saturating_sub(first[ti]));
         let mine: Vec<&Sample> = samples.iter().filter(|s| s.thread as usize == ti).collect();
@@ -366,19 +375,33 @@ unsafe fn run(seconds: u32, delay: u32, label: String) {
             }
         }
     }
+    let all_tids: Vec<u32> = all.iter().map(|(tid, _)| *tid).collect();
     for (_, h) in all { CloseHandle(h); }
     let mut lines: Vec<String> = folded.iter().map(|((tid, chain), c)| {
         let names: Vec<String> = chain.iter().map(|f| if *f == 0 { "outside".to_string() } else { format!("{:x}", ghidra(*f)) }).collect();
         format!("t{};{} {}", tid, names.join(";"), c)
     }).collect();
     lines.sort();
+    // Time-resolved view of the busiest thread (the main thread): one line per sample,
+    // `ms;root;...;leaf`. An aggregate cannot show a single hitch (a panel that takes 2 s to
+    // open); tools/profile_timeline.py finds the blocks and cuts a window out of this file.
+    let mut timeline = String::new();
+    if let Some(ti) = timeline_thread {
+        timeline += &format!("# thread {} of profile '{label}', {:.1} s wall\n", all_tids[ti], wall);
+        for s in samples.iter().filter(|s| s.thread as usize == ti) {
+            let frames = &s.frames[..s.n as usize];
+            let mut names: Vec<String> = frames.iter().rev().filter(|f| **f != 0).map(|f| format!("{:x}", ghidra(*f))).collect();
+            if frames.first() == Some(&0) { names.push("outside".to_string()); }
+            timeline += &format!("{};{}\n", s.t_ms, names.join(";"));
+        }
+    }
     // The mod manager deletes old version folders (the 0.31.2 reports were lost that way), so
     // reports go to <dll folder>\..\profiles when the DLL sits in a version folder.
     let dir = crate::process::self_dir().map(|d| {
         let target = d.parent().map(|p| p.join("profiles")).unwrap_or_else(|| d.clone());
         if std::fs::create_dir_all(&target).is_ok() { target } else { d }
     });
-    for (name, text) in [(format!("profile_{label}.txt"), report), (format!("profile_{label}.folded.txt"), lines.join("\n"))] {
+    for (name, text) in [(format!("profile_{label}.txt"), report), (format!("profile_{label}.folded.txt"), lines.join("\n")), (format!("profile_{label}.timeline.txt"), timeline)] {
         match dir.as_ref().map(|d| d.join(&name)) {
             Some(p) => match std::fs::write(&p, text) {
                 Ok(()) => log!("profiler '{label}': wrote {}", p.display()),
