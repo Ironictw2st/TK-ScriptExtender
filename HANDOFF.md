@@ -144,6 +144,9 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   turns it off. Mods no longer depend on a cfg line. NOTE for the manager: its cfg writer
   (`dll.rs` render_cfg) keeps only the build_number keys and drops every other line of
   `script_extender.cfg`; it should preserve unknown keys.
+- **0.40.0 = the 0.37 beta line gone live (2026-09-19)**: stable channel now has the performance
+  work (0.31-0.35), the AI recruitment trace + policy (0.36-0.37) and the default-on horde income
+  hook. Version numbers compare as dotted integers in the manager (0.40 > 0.37 > 0.4).
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 
