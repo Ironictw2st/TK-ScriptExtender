@@ -175,10 +175,16 @@ pub fn sync_tag() -> String {
     let mut h: u32 = 0x811c9dc5;
     let mut feed = |s: &str| for b in s.bytes() { h ^= b as u32; h = h.wrapping_mul(0x01000193); };
     feed(env!("CARGO_PKG_VERSION"));
-    for key in ["autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_cache", "recruit_perm_cache"] {
+    for key in ["autoresolve_hooks", "ai_recruit_cache", "recruit_perm_cache"] {
         feed(key);
         feed(&config_value(key).unwrap_or_default());
     }
+    // effective values, so "key absent" and "key = its default" give the same tag
+    let (income_on, income_category) = crate::income::effective();
+    feed("horde_income");
+    feed(if income_on { "1" } else { "0" });
+    feed("horde_income_category");
+    feed(&income_category.to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
 }
 

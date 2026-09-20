@@ -234,13 +234,28 @@ unsafe extern "C" fn update_income_detour(finance: *mut c_void, category: u32) {
     }
 }
 
+/// Effective settings: ON unless `horde_income=0`; category from `horde_income_category` (0 TAXES,
+/// 1 MINING, 2 TRADE, 3 MILITARY_FORCE), default 1 = MINING, which the engine itself never
+/// uses. On by default since 0.37.0-beta.4: the hook only adds force- / faction-scoped
+/// `gdp_abs` values (kind 31, id 0), which ordinary factions do not have (live logs: only the
+/// percentage entry id 1 on the faction holder, which is not summed), so without a mod that
+/// grants such bundles the amount is 0; and a mod that does must not depend on every player
+/// editing a cfg file. `build::sync_tag` hashes these effective values, not the cfg text.
+static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn effective() -> (bool, u32) {
+    let on = crate::build::config_value("horde_income").as_deref() != Some("0");
+    let cat = crate::build::config_value("horde_income_category").and_then(|v| v.parse::<u32>().ok()).filter(|c| *c <= 3).unwrap_or(1);
+    (on, cat)
+}
+
 pub fn install(t: &Table) {
     let _ = EFFECT_CTX.set(t.get("effect_ctx"));
-    if crate::build::config_value("horde_income").as_deref() != Some("1") {
-        log!("horde income hook off (set horde_income=1 in script_extender.cfg to enable)");
+    let (on, cat) = effective();
+    if !on {
+        log!("horde income hook off (horde_income=0 in script_extender.cfg)");
         return;
     }
-    let cat = crate::build::config_value("horde_income_category").and_then(|v| v.parse::<u32>().ok()).filter(|c| *c <= 3).unwrap_or(0);
     CATEGORY.store(cat, std::sync::atomic::Ordering::Relaxed);
     log!("horde income goes to income category {cat}");
     let target: UpdateIncome = unsafe { core::mem::transmute(t.get("finance_update_income")) };
@@ -249,11 +264,14 @@ pub fn install(t: &Table) {
     unsafe {
         match GenericDetour::new(target, update_income_detour) {
             Ok(d) => {
+                // stored before it is enabled: the detour must never run without its trampoline
+                let _ = HOOK.set(d);
+                let Some(d) = HOOK.get() else { return };
                 if let Err(e) = crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()) {
                     log!("failed to enable the horde income hook: {e}");
                     return;
                 }
-                let _ = HOOK.set(d);
+                INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 log!("horde income hook installed");
             }
             Err(e) => log!("failed to create the horde income hook: {e}"),
@@ -272,7 +290,7 @@ pub unsafe fn register(l: *mut LuaState) {
 /// 3 MILITARY_FORCE).
 unsafe extern "C" fn se_horde_income_hook(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
-    (api.pushboolean)(l, HOOK.get().is_some() as c_int);
+    (api.pushboolean)(l, INSTALLED.load(std::sync::atomic::Ordering::Relaxed) as c_int);
     (api.pushinteger)(l, CATEGORY.load(std::sync::atomic::Ordering::Relaxed) as isize);
     2
 }
@@ -284,7 +302,7 @@ unsafe extern "C" fn se_faction_gdp_bonus(l: *mut LuaState) -> c_int {
     DIAG.store(false, std::sync::atomic::Ordering::Relaxed);
     match r {
         Ok((sum, rows)) => {
-            log!("se_faction_gdp_bonus: sum {sum}; hook {}; {}", if HOOK.get().is_some() { "on" } else { "off" }, rows.join("; "));
+            log!("se_faction_gdp_bonus: sum {sum}; hook {}; {}", if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) { "on" } else { "off" }, rows.join("; "));
             (api.pushnumber)(l, sum);
             lua::push_str(l, &rows.join("\n"));
             2

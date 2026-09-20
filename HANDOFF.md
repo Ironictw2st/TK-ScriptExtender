@@ -140,6 +140,10 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
 - 0.37.0-beta.1 (PRE-RELEASE channel from here on, tags `vX.Y.Z-beta.N`): AI recruitment policy
   `se.ai_recruit.enable/plan/execute/set_policy` (element-weighted quality score; fills empty
   slots, replaces weak units at normal cost). Lua only; no new hook, no cfg key.
+- 0.37.0-beta.4: the horde income hook is ON by default (category MINING); `horde_income=0`
+  turns it off. Mods no longer depend on a cfg line. NOTE for the manager: its cfg writer
+  (`dll.rs` render_cfg) keeps only the build_number keys and drops every other line of
+  `script_extender.cfg`; it should preserve unknown keys.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
 

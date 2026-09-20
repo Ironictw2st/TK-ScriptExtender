@@ -803,19 +803,23 @@ stored.
 
 ---
 
-### 3.12a Horde income (DLL 0.28+, hook optional)
+### 3.12a Horde income (DLL 0.28+; on by default since 0.37.0-beta.4)
 
-`gdp_abs` effects (bonus value `region_gdp`) only reach the treasury through regions. With
-`horde_income=1` in `script_extender.cfg` the DLL hooks the engine routine that recomputes a
-faction's income categories and adds, 1:1, every `gdp_abs` value found on the **faction itself**
+`gdp_abs` effects (bonus value `region_gdp`) only reach the treasury through regions. The DLL
+hooks the engine routine that recomputes a faction's income categories (always, unless
+`script_extender.cfg` says `horde_income=0`; before 0.37.0-beta.4 it needed `horde_income=1`) and
+adds, 1:1, every `gdp_abs` value found on the **faction itself**
 (scopes such as `faction_to_faction_own`) and on **each military force it owns**
 (`force_to_force_own`, what horde building bundles use). `gdp_mod` values are ignored.
-`horde_income_category` selects the category: `0` TAXES, `1` MINING, `2` TRADE,
-`3` MILITARY_FORCE. **MINING is unused in 3K** (never computed, no row in the stock treasury
+Ordinary factions carry no such values (only percentage entries, which are ignored), so
+without a mod that grants them the amount is 0 and nothing changes.
+`horde_income_category` selects the category: `0` TAXES, `1` MINING (the default since
+0.37.0-beta.4; `0` before), `2` TRADE, `3` MILITARY_FORCE. **MINING is unused in 3K** (never computed, no row in the stock treasury
 panel, but part of the totals), so a UI mod can show it as its own line: bind a treasury row to
 `CcoFactionEconomy` / `VaryingRegIncomeDetailsSum("MINING")` and label it with
 `Loc("<your key>")` (= `campaign_localised_strings_string_<your key>`), which other mods can
-translate. Both settings are part of the multiplayer version lock. Verified live on 0.28.3 /
+translate. Both settings are part of the multiplayer version lock (their effective values, so
+an absent key and an explicit default give the same tag). Verified live on 0.28.3 /
 0.29.1 (a 150 `gdp_abs` army bundle raised `projected_net_income` by 150); receiving it at turn
 end and a region-less faction are not yet confirmed.
 
@@ -829,7 +833,7 @@ access, usable anywhere.
 ```lua
 local h = se.query.horde_income_hook()
 if not (h and h.enabled and h.category == 1) then
-	ModLog("horde income needs script_extender.cfg: horde_income=1, horde_income_category=1")
+	ModLog("horde income is off or points elsewhere: check horde_income / horde_income_category in script_extender.cfg (DLL older than 0.37.0-beta.4 needs horde_income=1, horde_income_category=1)")
 end
 ```
 
