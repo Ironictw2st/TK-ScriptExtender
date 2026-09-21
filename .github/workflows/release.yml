@@ -78,3 +78,12 @@ jobs:
             script_extender.dll
             injector.exe
             manifest.json
+
+  # Full releases also go to Nexus Mods (see nexus.yml); pre-releases stay on GitHub.
+  nexus:
+    needs: publish
+    if: ${{ !contains(github.ref_name, '-') && vars.NEXUSMODS_FILE_ID != '' }}
+    uses: ./.github/workflows/nexus.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

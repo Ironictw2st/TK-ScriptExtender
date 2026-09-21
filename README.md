@@ -28,7 +28,9 @@ produces `target/release/script_extender.dll` and `injector.exe` (a dev loader:
 Tag `vX.Y.Z` (matching `Cargo.toml`) and the release workflow publishes `script_extender.dll`,
 `injector.exe` and `manifest.json`. [TK Mod Manager](https://github.com/Ironictw2st/TKModManager)
 downloads these, checks the manifest's game fingerprint against the installed exe, and injects
-the DLL after launch.
+the DLL after launch. A full release (a tag without a hyphen) is also zipped and uploaded to the
+[Nexus Mods page](https://www.nexusmods.com/totalwarthreekingdoms/mods/249) (shared with TK Mod
+Manager) by `.github/workflows/nexus.yml`; run that workflow by hand to re-send a tag.
 
 ## Crates
 

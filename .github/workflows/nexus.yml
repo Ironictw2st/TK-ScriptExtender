@@ -1,0 +1,62 @@
+name: Nexus Mods
+
+# Zips a full release's script_extender.dll, injector.exe and manifest.json and uploads the zip to
+# Nexus as a new version of the script extender file. The file sits on the TK Mod Manager page
+# (mod 249), so this leaves that page's version and changelog alone and links the release notes
+# from the file description instead. release.yml calls this after publishing a non-hyphenated tag
+# (a release made with GITHUB_TOKEN does not fire a `release` event); run it by hand to re-send a
+# release. Needs the NEXUSMODS_API_KEY secret and the NEXUSMODS_FILE_ID variable.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload (e.g. v0.41.0)
+        required: true
+
+concurrency:
+  group: nexus
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: vars.NEXUSMODS_FILE_ID != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Fetch the release and zip it
+        id: release
+        run: |
+          if [ "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)" = "true" ]; then
+            echo "::error::$TAG is a pre-release; only full releases go to Nexus"
+            exit 1
+          fi
+          mkdir dist
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist \
+            -p script_extender.dll -p injector.exe -p manifest.json
+          zip="TK-ScriptExtender-$TAG.zip"
+          (cd dist && zip -9 "../$zip" script_extender.dll injector.exe manifest.json)
+          {
+            echo "zip=$zip"
+            echo "version=${TAG#v}"
+            echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: Nexus-Mods/upload-action@v1.0.0-beta.10
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ vars.NEXUSMODS_FILE_ID }}
+          filename: ${{ steps.release.outputs.zip }}
+          display_name: TK Script Extender
+          version: ${{ steps.release.outputs.version }}
+          description: "Script extender DLL and injector. TK Mod Manager installs it for you. Release notes: ${{ steps.release.outputs.url }}"
+          update_mod_version: false
+          archive_existing_version: true
