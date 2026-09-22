@@ -66,7 +66,7 @@ fn now_ms() -> u64 { START.get_or_init(Instant::now).elapsed().as_millis() as u6
 
 unsafe extern "C" fn can_propose_detour(cco: P, out: P) -> u64 {
     let Some(h) = CAN_PROPOSE.get() else { return 0 };
-    let _g = crate::crash::enter("dipui_can_propose");
+    let _g = crate::crash::enter_quiet("dipui_can_propose");
     if let Some(e) = ENGINE.get() {
         let neg = rq(cco as usize + 0x218);
         if neg != 0 {
@@ -93,7 +93,7 @@ unsafe extern "C" fn propose_detour(cco: P, b: P) -> u64 {
 /// Per-frame campaign UI update, main thread: carry out a queued request once it has returned.
 unsafe extern "C" fn ui_update_detour(ui: P, x: P) -> u64 {
     let Some(h) = UI_UPDATE.get() else { return 0 };
-    let _g = crate::crash::enter("campaign_ui_update");
+    let _g = crate::crash::enter_quiet("campaign_ui_update");
     let r = h.call(ui, x);
     let asked = REQUEST_MS.swap(0, Ordering::Relaxed);
     if asked == 0 { return r; }

@@ -64,7 +64,7 @@ unsafe extern "C" fn exists_detour(path: *const c_char) -> u64 {
         Some((at, false)) if now.duration_since(at) < ttl => return h.call(path),
         _ => {}
     }
-    let _g = crate::crash::enter("file_exists_miss");
+    let _g = crate::crash::enter_quiet("file_exists_miss");
     let found = h.call(path);
     // a found file proves the directory; after a miss ask once whether the directory is there
     let missing = if found & 0xff != 0 { false } else {

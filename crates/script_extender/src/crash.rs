@@ -221,10 +221,18 @@ pub fn enter(name: &'static str) -> Scope { enter_kind(name, KIND_HOOK) }
 #[inline]
 pub fn enter_native(name: &'static str) -> Scope { enter_kind(name, KIND_NATIVE) }
 
+/// For hooks that run every frame (UI update, CCO getters, file probes): the scope is kept, so
+/// a fault inside still names the hook, but no ring event is recorded. Otherwise 64 events cover
+/// a few frames and nothing else (seen live: the ring held only campaign_ui_update pairs).
+#[inline]
+pub fn enter_quiet(name: &'static str) -> Scope { enter_kind(name, KIND_HOOK | QUIET) }
+
+const QUIET: u8 = 0x80;
+
 fn enter_kind(name: &'static str, kind: u8) -> Scope {
     let inactive = Scope { name: (0, 0), kind: 0 };
     if LEVEL.load(Ordering::Relaxed) == 0 { return inactive; }
-    let entry = (name.as_ptr() as usize, name.len(), kind);
+    let entry = (name.as_ptr() as usize, name.len(), kind & !QUIET);
     let pushed = STACK.try_with(|s| {
         let mut st = s.get();
         let d = st.depth as usize;
@@ -237,7 +245,7 @@ fn enter_kind(name: &'static str, kind: u8) -> Scope {
         SCOPE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         return inactive;
     }
-    push_crumb(kind, entry.0, entry.1);
+    if kind & QUIET == 0 { push_crumb(kind, entry.0, entry.1); }
     Scope { name: (entry.0, entry.1), kind }
 }
 
@@ -248,7 +256,7 @@ impl Drop for Scope {
             let mut st = s.get();
             if st.depth > 0 { st.depth -= 1; s.set(st); }
         });
-        push_crumb(self.kind + 1, self.name.0, self.name.1);
+        if self.kind & QUIET == 0 { push_crumb(self.kind + 1, self.name.0, self.name.1); }
     }
 }
 

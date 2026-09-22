@@ -304,7 +304,7 @@ unsafe fn ai_query(e: &Engine, h: &GenericDetour<BuildList>, iface: *mut c_void,
 
 unsafe extern "C" fn get2_detour(cco: *mut c_void, out: *mut c_void) {
     let Some(h) = GET2.get() else { return };
-    let _g = crate::crash::enter("cco_can_recruit_any");
+    let _g = crate::crash::enter_quiet("cco_can_recruit_any");
     UI_DEPTH.with(|d| d.set(d.get() + 1));
     h.call(cco, out);
     UI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
@@ -312,7 +312,7 @@ unsafe extern "C" fn get2_detour(cco: *mut c_void, out: *mut c_void) {
 
 unsafe extern "C" fn get3_detour(cco: *mut c_void, out: *mut c_void, arg: *mut c_void) -> *mut c_void {
     let Some(h) = GET3.get() else { return out };
-    let _g = crate::crash::enter("cco_recruit_list");
+    let _g = crate::crash::enter_quiet("cco_recruit_list");
     UI_DEPTH.with(|d| d.set(d.get() + 1));
     let r = h.call(cco, out, arg);
     UI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
