@@ -96,6 +96,7 @@ pub fn in_scan() -> bool { DIP_DEPTH.with(|d| d.get()) != 0 }
 
 unsafe extern "C" fn dip_scan_detour(a: *mut c_void, b: *mut c_void) -> u64 {
     let Some(h) = DIP_SCAN.get() else { return 0 };
+    let _g = crate::crash::enter("cai_dip_scan");
     let outer = DIP_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v == 0 });
     if outer { DIP_SCANS.fetch_add(1, Ordering::Relaxed); }
     let r = h.call(a, b);
@@ -114,6 +115,7 @@ unsafe extern "C" fn dip_scan_detour(a: *mut c_void, b: *mut c_void) -> u64 {
 
 unsafe extern "C" fn dip_eval_detour(out: *mut c_void, comp: *mut c_void, neg: *mut c_void, fa: *mut c_void, fb: *mut c_void, params: *mut c_void, flags: u32) -> u64 {
     let Some(h) = DIP_EVAL.get() else { return 0 };
+    let _g = crate::crash::enter("dip_component_eval");
     let in_scan = DIP_DEPTH.with(|d| d.get()) != 0;
     if !in_scan {
         DIP_UNSCOPED.fetch_add(1, Ordering::Relaxed);
@@ -151,6 +153,8 @@ pub fn install(t: &Table) {
             log!("diplomacy diagnostic: could not enable the detours");
             return;
         }
+        crate::crash::hook_installed("dip_component_eval", "diag_diplomacy", eval as usize);
+        crate::crash::hook_installed("cai_dip_scan", "diag_diplomacy", scan as usize);
     }
     log!("diplomacy diagnostic installed (counters in se.query.perf(): dip_*)");
     crate::diptrace::install(t);

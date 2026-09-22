@@ -97,12 +97,53 @@ pub unsafe fn to_str(l: *mut LuaState, idx: c_int) -> String {
     String::from_utf8_lossy(core::slice::from_raw_parts(p as *const u8, len)).into_owned()
 }
 
-/// Register a global C function by name.
-pub unsafe fn set_global_fn(l: *mut LuaState, name: &str, f: CFunction) {
+/// One registered native: its global name and the Rust function behind it. Every native is
+/// installed as the same C closure (`native_shim`) with this entry as its only upvalue, so the
+/// crash reporter can record which native a thread is in (`crash::enter_native`).
+pub struct NativeEntry { pub name: &'static str, pub f: CFunction }
+
+static NATIVES: std::sync::Mutex<Vec<&'static NativeEntry>> = std::sync::Mutex::new(Vec::new());
+
+fn intern(name: &'static str, f: CFunction) -> &'static NativeEntry {
+    let mut g = NATIVES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.iter().find(|e| e.name == name) { return e; }
+    let e: &'static NativeEntry = Box::leak(Box::new(NativeEntry { name, f }));
+    g.push(e);
+    e
+}
+
+/// Number of distinct natives registered so far (all states share the table).
+pub fn native_count() -> usize {
+    NATIVES.lock().map(|g| g.len()).unwrap_or(0)
+}
+
+/// Lua 5.1 pseudo-index of the running C closure's first upvalue.
+const LUA_UPVALUE_1: c_int = LUA_GLOBALSINDEX - 1;
+
+/// The one C function every native is registered as: upvalue 1 is the `NativeEntry` address as
+/// an 8-byte Lua string (the Api has no pushlightuserdata; lua_Number is a 32-bit float, so an
+/// integer would not survive). `lua_tolstring` on a string does no conversion and no GC step.
+unsafe extern "C" fn native_shim(l: *mut LuaState) -> c_int {
+    let Some(api) = api() else { return 0 };
+    let mut len = 0usize;
+    let p = (api.tolstring)(l, LUA_UPVALUE_1, &mut len);
+    if p.is_null() || len != 8 { return 0; }
+    let addr = usize::from_le_bytes(core::ptr::read_unaligned(p as *const [u8; 8]));
+    if addr == 0 { return 0; }
+    let entry = &*(addr as *const NativeEntry);
+    let _g = crate::crash::enter_native(entry.name);
+    (entry.f)(l)
+}
+
+/// Register a global C function by name (through `native_shim`, see `NativeEntry`).
+pub unsafe fn set_global_fn(l: *mut LuaState, name: &'static str, f: CFunction) {
     if let Some(api) = api() {
+        let entry = intern(name, f);
         let mut v = name.as_bytes().to_vec();
         v.push(0);
-        (api.pushcclosure)(l, f, 0);
+        let raw = (entry as *const NativeEntry as usize).to_le_bytes();
+        (api.pushlstring)(l, raw.as_ptr() as *const c_char, raw.len());
+        (api.pushcclosure)(l, native_shim, 1);
         (api.setfield)(l, LUA_GLOBALSINDEX, v.as_ptr() as *const c_char);
     }
 }

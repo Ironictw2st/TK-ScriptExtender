@@ -304,6 +304,7 @@ unsafe fn ai_query(e: &Engine, h: &GenericDetour<BuildList>, iface: *mut c_void,
 
 unsafe extern "C" fn get2_detour(cco: *mut c_void, out: *mut c_void) {
     let Some(h) = GET2.get() else { return };
+    let _g = crate::crash::enter("cco_can_recruit_any");
     UI_DEPTH.with(|d| d.set(d.get() + 1));
     h.call(cco, out);
     UI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
@@ -311,6 +312,7 @@ unsafe extern "C" fn get2_detour(cco: *mut c_void, out: *mut c_void) {
 
 unsafe extern "C" fn get3_detour(cco: *mut c_void, out: *mut c_void, arg: *mut c_void) -> *mut c_void {
     let Some(h) = GET3.get() else { return out };
+    let _g = crate::crash::enter("cco_recruit_list");
     UI_DEPTH.with(|d| d.set(d.get() + 1));
     let r = h.call(cco, out, arg);
     UI_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
@@ -319,6 +321,7 @@ unsafe extern "C" fn get3_detour(cco: *mut c_void, out: *mut c_void, arg: *mut c
 
 unsafe extern "C" fn build_detour(iface: *mut c_void, out: *mut c_void, flag: u8) {
     let Some(h) = BUILD.get() else { return };
+    let _g = crate::crash::enter("recruit_list_build");
     let ai_mode = AI_MODE.load(Ordering::Relaxed);
     if ai_mode > 0 && AI_DEPTH.with(|d| d.get()) > 0 && UI_DEPTH.with(|d| d.get()) == 0 && readable(out as usize, 16) {
         if let Some(e) = ENGINE.get() { ai_query(e, h, iface, out, flag, ai_mode); return; }
@@ -419,6 +422,9 @@ pub fn install(t: &Table) {
         if crate::freeze::with_threads_frozen(build as usize, 16, || b.enable()).is_err() {
             log!("ui recruit cache: could not enable the list detour; cache stays off");
             return;
+        }
+        for (name, target) in [("cco_can_recruit_any", get2 as usize), ("cco_recruit_list", get3 as usize), ("recruit_list_build", build as usize)] {
+            crate::crash::hook_installed(name, "ui_recruit_cache_ms", target);
         }
         if ai_mode > 0 {
             // the scope comes from the planner detour in airecruit.rs

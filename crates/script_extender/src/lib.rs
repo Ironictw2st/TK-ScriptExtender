@@ -39,6 +39,7 @@ mod permcache;
 mod profiler;
 mod bundles;
 mod diplomacy;
+mod crash;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
 
@@ -81,6 +82,9 @@ fn bootstrap() {
         log!("address table does not match this build; doing nothing");
         return;
     };
+    // first, so a fault while a detour is being written is already reported
+    crash::install();
+    crash::boot("init");
     lua::init(&table);
     pool::init(&table);
     recruit::init(&table);
@@ -95,15 +99,25 @@ fn bootstrap() {
     bundles::init(&table);
     diplomacy::init(&table);
     build::apply_config();
+    crash::boot("autoresolve");
     autoresolve::install_hooks(&table);
+    crash::boot("income");
     income::install(&table);
+    crash::boot("perf");
     perf::install(&table);
+    crash::boot("airecruit");
     airecruit::install(&table);
+    crash::boot("permcache");
     permcache::install(&table);
+    crash::boot("fileprobe");
     fileprobe::install(&table);
+    crash::boot("diag");
     diag::install(&table);
+    crash::boot("followup");
     followup::install(&table);
+    crash::boot("hook");
     hook::install(&table);
+    crash::boot("complete");
     log!("bootstrap complete; waiting for the game's Lua to tick");
 }
 

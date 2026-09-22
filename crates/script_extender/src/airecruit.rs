@@ -101,6 +101,7 @@ unsafe fn snapshot(task: usize, base: usize) {
 
 unsafe extern "C" fn planner_detour(task: *mut c_void, ctx: *mut c_void) -> u64 {
     let Some(h) = HOOK.get() else { return 1 };
+    let _g = crate::crash::enter("cai_recruit_budget");
     let outer = crate::perf::ai_scope_enter();
     let r = h.call(task, ctx);
     crate::perf::ai_scope_exit(outer);
@@ -113,6 +114,10 @@ unsafe extern "C" fn planner_detour(task: *mut c_void, ctx: *mut c_void) -> u64 
 pub fn install(t: &Table) {
     let (base, _) = crate::process::main_module();
     let _ = ENGINE.set(unsafe { Engine { db_get: core::mem::transmute(t.get("db_get")), qualities_table: core::mem::transmute(t.get("unit_qualities_table")), base } });
+    if !crate::build::hook_enabled("ai_recruit_hook") {
+        log!("ai recruitment planner hook off (ai_recruit_hook=0 in script_extender.cfg): no AI recruitment trace, no AI scope for the caches");
+        return;
+    }
     // SAFETY: anchor-verified prologue `mov rax,rsp` / stack stores / pushes.
     unsafe {
         let planner: Planner = core::mem::transmute(t.get("cai_recruit_budget"));
@@ -126,6 +131,7 @@ pub fn install(t: &Table) {
             log!("ai recruitment trace: could not hook the planner");
             return;
         }
+        crate::crash::hook_installed("cai_recruit_budget", "ai_recruit_hook", planner as usize);
     }
     log!("ai recruitment planner hook installed (trace off until a script asks for it)");
 }
@@ -140,6 +146,7 @@ unsafe extern "C" fn se_ai_recruit_trace(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let on = (api.gettop)(l) >= 1 && (api.toboolean)(l, 1) != 0;
     let was = TRACE.swap(on, Ordering::Relaxed);
+    if on && HOOK.get().is_none() { log!("se_ai_recruit_trace: the planner hook is not installed (ai_recruit_hook=0 in script_extender.cfg); nothing will be recorded"); }
     if !on { if let Ok(mut q) = PASSES.lock() { q.clear(); } }
     (api.pushboolean)(l, was as c_int);
     1

@@ -279,10 +279,12 @@ unsafe fn walk(hook: &GenericDetour<Walk>, leaf: bool, a: [P; 10], inv: u64, las
 
 unsafe extern "C" fn group_detour(a0: P, a1: P, a2: P, a3: P, a4: P, a5: P, a6: P, a7: P, a8: P, a9: P, inv: u64, last: P) -> P {
     let Some(h) = GROUP.get() else { return a0 };
+    let _g = crate::crash::enter("dip_group_eval");
     walk(h, false, [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9], inv, last)
 }
 unsafe extern "C" fn leaf_detour(a0: P, a1: P, a2: P, a3: P, a4: P, a5: P, a6: P, a7: P, a8: P, a9: P, inv: u64, last: P) -> P {
     let Some(h) = LEAF.get() else { return a0 };
+    let _g = crate::crash::enter("dip_requirement_eval");
     walk(h, true, [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9], inv, last)
 }
 
@@ -290,6 +292,7 @@ unsafe fn component_count(negotiation: usize) -> u32 { rd(negotiation + 0x3c) }
 
 unsafe extern "C" fn add_detour(neg: P, comp: P, params: P, fa: P, fb: P) {
     let Some(h) = ADD.get() else { return };
+    let _g = crate::crash::enter("dip_deal_add");
     if !traced(crate::diag::in_scan()) { return h.call(neg, comp, params, fa, fb); }
     let before = component_count(neg as usize);
     let stack = exe_stack();
@@ -305,6 +308,7 @@ unsafe extern "C" fn add_detour(neg: P, comp: P, params: P, fa: P, fb: P) {
 
 unsafe extern "C" fn expand_detour(set: P, neg: P, mask: P, x: P, y: P) -> u64 {
     let Some(h) = EXPAND.get() else { return 0 };
+    let _g = crate::crash::enter("dip_deal_expand");
     if !traced(crate::diag::in_scan()) { return h.call(set, neg, mask, x, y); }
     let depth = EXPAND_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
     let before = component_count(neg as usize);
@@ -355,6 +359,7 @@ unsafe fn deal_info(deal: usize) -> String {
 
 unsafe extern "C" fn command_detour(stream: P, world: P) -> u64 {
     let Some(h) = COMMAND.get() else { return 0 };
+    let _g = crate::crash::enter("dip_command");
     if !TRACE.load(Ordering::Relaxed) { return h.call(stream, world); }
     let stack = exe_stack();
     if let Ok(mut guard) = STORE.lock() { push_event(guard.get_or_insert_with(Store::default), false, format!("COMMAND negotiation begins | {stack}")); }
@@ -368,6 +373,7 @@ unsafe extern "C" fn command_detour(stream: P, world: P) -> u64 {
 
 unsafe extern "C" fn lookup_detour(stream: P, out: *mut usize, ty: u32) -> P {
     let Some(h) = LOOKUP.get() else { return stream };
+    let _g = crate::crash::enter("dip_command_deal");
     let r = h.call(stream, out, ty);
     if ty == 0xa0 && IN_COMMAND.with(|c| c.get()) && TRACE.load(Ordering::Relaxed) {
         let deal = if readable(out as usize, 8) { *out } else { 0 };
@@ -379,6 +385,7 @@ unsafe extern "C" fn lookup_detour(stream: P, out: *mut usize, ty: u32) -> P {
 
 unsafe extern "C" fn notify_detour(mgr: P, deal: P, action: u32) -> u64 {
     let Some(h) = NOTIFY.get() else { return 0 };
+    let _g = crate::crash::enter("dip_notify");
     if action == 0xe && traced(crate::diag::in_scan()) {
         let text = format!("WAIT FOR PLAYER (0xe) {} | {}", deal_info(deal as usize), exe_stack());
         if let Ok(mut guard) = STORE.lock() { push_event(guard.get_or_insert_with(Store::default), false, text); }
@@ -388,6 +395,7 @@ unsafe extern "C" fn notify_detour(mgr: P, deal: P, action: u32) -> u64 {
 
 unsafe extern "C" fn action_detour(deal: P, action: u32, swap: u8) {
     let Some(h) = ACTION.get() else { return };
+    let _g = crate::crash::enter("dip_deal_action");
     if !traced(crate::diag::in_scan()) { return h.call(deal, action, swap); }
     let d = deal as usize;
     let (before, stack, id, comps) = (deal_state(d), exe_stack(), rd(d + 8), rd(d + 0x54));
@@ -401,6 +409,7 @@ unsafe extern "C" fn action_detour(deal: P, action: u32, swap: u8) {
 
 unsafe extern "C" fn apply_detour(ctx: P, deal: P) {
     let Some(h) = APPLY.get() else { return };
+    let _g = crate::crash::enter("dip_deal_apply");
     if !traced(crate::diag::in_scan()) { return h.call(ctx, deal); }
     let stack = exe_stack();
     h.call(ctx, deal);
@@ -475,6 +484,10 @@ pub fn install(t: &Table) {
             || !enable(action as usize, ac) || !enable(apply as usize, ap) {
             log!("diplomacy trace: could not enable the detours");
             return;
+        }
+        for (name, target) in [("dip_group_eval", group as usize), ("dip_requirement_eval", leaf as usize), ("dip_deal_add", add as usize), ("dip_deal_expand", expand as usize),
+            ("dip_deal_action", action as usize), ("dip_deal_apply", apply as usize), ("dip_command", command as usize), ("dip_command_deal", lookup as usize), ("dip_notify", notify as usize)] {
+            crate::crash::hook_installed(name, "diag_diplomacy", target);
         }
     }
     crate::dipui::install(t);

@@ -217,7 +217,7 @@ unsafe fn unwind_step(base: usize, rfs: &[(u32, u32, u32)], rip: usize, regs: &m
 }
 
 /// True when the bytes before `ret` look like a call instruction (so `ret` is a return address).
-unsafe fn follows_call(ret: usize) -> bool {
+pub(crate) unsafe fn follows_call(ret: usize) -> bool {
     let p = ret as *const u8;
     *p.sub(5) == 0xe8                                   // call rel32
         || (*p.sub(2) == 0xff && (*p.sub(1) & 0x38) == 0x10)   // call reg / [reg]

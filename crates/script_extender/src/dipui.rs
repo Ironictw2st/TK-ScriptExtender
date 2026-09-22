@@ -43,6 +43,7 @@ macro_rules! probe {
         static $static: OnceLock<GenericDetour<F2>> = OnceLock::new();
         unsafe extern "C" fn $detour(a: P, b: P) -> u64 {
             let Some(h) = $static.get() else { return 0 };
+            let _g = crate::crash::enter($label);
             if CTX.with(|c| c.get()) == 0 { return h.call(a, b); }
             // the predicate evaluator is handed {fn, 0}: name the predicate it is asked about
             let what = if $pred && !b.is_null() { format!("({:x})", rva(*(b as *const usize))) } else { String::new() };
@@ -119,6 +120,7 @@ pub fn install(t: &Table) {
                 log!("diplomacy ui trace: could not enable the detour on {name}");
                 return;
             }
+            crate::crash::hook_installed(name, "diag_diplomacy", target as usize);
         }
     }
     log!("diplomacy ui trace installed (what ProposeDeal / CanPropose ask)");

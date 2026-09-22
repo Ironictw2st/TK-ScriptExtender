@@ -53,6 +53,8 @@ unsafe fn ensure_registered(l: *mut LuaState) {
     }
     reg.push(lu);
     drop(reg);
+    let _g = crate::crash::enter("lua_gettop_register");
+    crate::crash::note_lua_thread();
     crate::pool::register(l);
     LAST_SEEN.store(lu, Ordering::Relaxed);
     log!("registered se_* functions into lua_State {:p}", l);
@@ -81,6 +83,7 @@ pub fn install(t: &Table) {
                     return;
                 }
                 let _ = HOOK.set(d);
+                crate::crash::hook_installed("lua_gettop", "-", target as usize);
                 log!("lua_gettop hook installed");
             }
             Err(e) => log!("failed to create lua_gettop hook: {e}"),

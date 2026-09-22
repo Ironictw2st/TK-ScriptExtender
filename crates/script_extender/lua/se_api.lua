@@ -1706,6 +1706,44 @@ function se.dump(v, indent)
 end
 
 ----------------------------------------------------------------------------------------------
+-- crash reporter (DLL 0.42+; script_extender.cfg diag_crash: 0 off, 1 on (default), 2 + trace)
+----------------------------------------------------------------------------------------------
+
+se.crash = se.crash or {}
+
+-- se.crash.mark(text) -> ok, message
+--   A breadcrumb for the DLL's crash report (se_crash.txt next to the DLL): when the game
+--   faults, the report lists the last 64 SE events of all threads, marks included, and the hook
+--   or native the faulting thread was in. 63 bytes of the text are kept. Put one around a
+--   suspect script action: se.crash.mark("before recruit " .. key).
+function se.crash.mark(text)
+	local okn, err = need("se_crash_mark")
+	if not okn then return false, err end
+	return se_crash_mark(str(text))
+end
+
+-- se.crash.info() -> { installed, level, natives, hooks, reports, repeats, dropped, last_code, last_rva, scope_overflow } | nil, message
+--   reports = crash reports written this session, repeats = faults suppressed as duplicates.
+function se.crash.info()
+	local okn, err = need("se_crash_info")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in str(se_crash_info()):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) or v end
+	t.installed = t.installed == 1
+	return t
+end
+
+-- se.crash.selftest([mode]) -> ok, message
+--   Writes a test report to se_crash.txt without faulting: mode 1 (default) from the current
+--   context directly, mode 2 through the exception handler (a private exception the handler
+--   dismisses; pauses the game while a debugger is attached).
+function se.crash.selftest(mode)
+	local okn, err = need("se_crash_selftest")
+	if not okn then return false, err end
+	return se_crash_selftest(num(mode) or 1)
+end
+
+----------------------------------------------------------------------------------------------
 -- diagnostics: which script listeners cost the time (DLL 0.35+)
 ----------------------------------------------------------------------------------------------
 
@@ -1913,6 +1951,8 @@ end
 function se.ui.fix_followup_button()
 	local okn, err = need("se_followup_propose")
 	if not okn then return false, err end
+	local installed, why = se_followup_propose("installed")
+	if not installed then return false, why end
 	local core = se.core or G("core")
 	if type(core) ~= "table" or type(core.add_listener) ~= "function" then return false, "core (event manager) is not available: set se.core = core first" end
 	pcall(function() core:remove_listener("se_followup_button") end)

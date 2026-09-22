@@ -65,7 +65,9 @@ cargo build --release          # target\release\script_extender.dll, injector.ex
 ```
 Workspace version in `Cargo.toml` (`se.version()` returns it). Crates: `script_extender`
 (cdylib, `retour` for the hook), `injector` (bin), `inject_core` (lib, Win32 only).
-Release profile: LTO thin, `panic = "abort"`, stripped. Rust stable, no other deps.
+Release profile: LTO thin, `panic = "abort"`, line tables only (0.42+: a `script_extender.pdb`
+is written next to the DLL and shipped with each release; the crash reporter prints DLL frames as
+`script_extender.dll+rva`, and the PDB of the same build names them). Rust stable, no other deps.
 
 ## 4. The public Lua API (embedded `lua/se_api.lua`)
 
@@ -87,6 +89,7 @@ a native is present. `se.version()` = DLL version.
 | Campaign AI | `cai_personality(key)` (model thread) | `cai_personality(key, personality_key)` | component `+0x10` key / `+0x30` runtime object from registry `*(ai_world+0xa70)`; persists |
 | Faction potential | `faction_potential(key)` | `faction_potential(key, value)` (-100..150) | FACTION `+0xee0` {base,bonus,roll} + `FUN_1419f5aa0`; persists |
 | Menu build number | `build_number()` -> {build, short, modified} | `build_number(build, short, modified)`; also auto-applied at injection from `<dll dir>\script_extender.cfg` (`build_number=`, `build_number_short=`, `build_modified=`) | GameCore = `*(*(DAT_143c53a28)+0x960)`; CA::Strings at `+0x90` (BuildNumber) / `+0xa0` (BuildNumberShort), byte `+0xea` IsBuildModified; composed once by FUN_1402e6740 ("v%d.%d.%d  Build %d.%d (modded)"). 0.18: cfg is read from the DLL folder or its parent, and the apply waits (background thread, up to 120 s) until GameCore holds the composed strings, so injecting seconds after launch is fine. Verified live through the mod manager. |
+| Crash reporter (0.42, `diag_crash`, on by default, not in the sync tag) | `se.crash.info()` | `se.crash.mark(text)`, `se.crash.selftest([mode])` | vectored exception handler (first-chance, CONTINUE_SEARCH) writes `se_crash.txt` next to the DLL: fault as module+RVA, registers, RtlVirtualUnwind stack (a frame without unwind info is a retour trampoline: popped), stack scan, the SE hook / native active on the thread (thread-local scope stack), last 64 SE events, installed hooks. Every native runs through one shim (`lua.rs native_shim`, upvalue = entry pointer as an 8-byte string). `diag_crash=2` streams every hook / native entry to `se_activity.txt`. `crash.rs` |
 | Diplomacy deals | (stock) | not wrapped: `cm:modify_faction(a):apply_automatic_diplomatic_deal(situation, query_faction_b, "faction_key:"..b)` after `can_apply_automatic_diplomatic_deal`; situations e.g. `data_defined_situation_war_proposer_to_recipient`, `..._peace`, `..._create_alliance_no_conditions`, `..._vassalise_recipient_forced` | vanilla `3k_campaign_diplomacy_manager.lua:555+` |
 | Buildings (0.19, forced build 0.23; damage/repair/destroy/forced construct verified live 0.23.3, completion after a turn pending) | `region_slots(region)`, `building_candidates(region, slot, {only_valid, all_chains})` | `building_damage(region, slot, pct)`, `building_repair(region, slot, {free})`, `building_destroy`, `building_construct(region, slot, level_key, {force=true, any_chain=true, free, turns, complete, pay_to_complete})` (upgrade/convert = target level key) | SLOT+0x318 manager M, M+0x20 building B (+0x20 record, health via FUN_141cc03c0/FUN_141cc0410), M+0x10 construction in progress; list = M vtable +0x130 (only_valid, 1, all_chains, 0, 0, 0) -> 0x30-byte entries (+0 record, +0x10 cost, +0x14 turns, +0x18 reason bits, +0x24 secondary cost); construct = M vtable +0x10 (M, entry*) on a copy of the entry (free zeroes the costs, turns overrides +0x14); repair/destroy/pay-to-complete = +0x40/+0x38/+0x28; notes/buildings.md |
 | Alliance names (0.20, pending) | `alliances()` -> cqi, name, members | `alliance_name(cqi, text, "inline"/"pointer")` | ALLIANCE +8 cqi, name = `*(+0x60)` UniString* else inline UniString at +0x68 (CcoDiplomacyAlliance.Name); UniString ctor FUN_140663120, swap FUN_140663ea0; persistence to verify |
@@ -170,6 +173,17 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   not in the sync tag. Default `0` = no hook at all.
 - Manager-relevant: cfg keys `recruit_perm_cache`, `ai_recruit_cache` are in the sync tag;
   profiler reports live in `dll\profiles\`, which the manager must not delete.
+- 0.42.0-beta.1 (2026-09-22): **crash reporter** (`crash.rs`, cfg `diag_crash`, default on, not
+  in the sync tag): on a fatal exception the DLL appends a report to `se_crash.txt` next to itself
+  (fault as module+RVA / Ghidra address, registers, unwound stack, stack scan, the hook or native
+  the faulting thread was in, the last 64 SE events, installed hooks); `diag_crash=2` also streams
+  every hook / native entry to `se_activity.txt`. Lua: `se.crash.mark/info/selftest`. Every native
+  now runs through one shim (`lua.rs`), so "which native" is known. New cfg switches
+  **`ai_recruit_hook`** and **`followup_hooks`** (default 1; `0` skips the planner detour / the
+  MEDIATE PEACE detours) for bisecting a crash: **both are in the sync tag** (seven keys now).
+  `tools/dump_crash.py` reads the fault-time context from a minidump (the thread's own context in
+  the dump is the dump writer's). Release builds ship `script_extender.pdb`. Manager notes: surface
+  `se_crash.txt` from the DLL folder in a bug report; the cfg writer must keep unknown keys.
 
 ## 7. When the game updates
 

@@ -185,7 +185,25 @@ pub fn sync_tag() -> String {
     feed(if income_on { "1" } else { "0" });
     feed("horde_income_category");
     feed(&income_category.to_string());
+    for key in ["ai_recruit_hook", "followup_hooks"] {
+        feed(key);
+        feed(if hook_enabled(key) { "1" } else { "0" });
+    }
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
+}
+
+/// Every key script_extender.cfg may contain (anything else is logged as unknown).
+pub const KNOWN_KEYS: &[&str] = &[
+    "build_number", "build_number_short", "build_modified",
+    "autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_hook", "followup_hooks",
+    "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
+    "diag_diplomacy", "diag_crash",
+];
+
+/// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns
+/// the hook off, so an absent key and a written default give the same sync tag.
+pub fn hook_enabled(key: &str) -> bool {
+    config_value(key).as_deref() != Some("0")
 }
 
 fn version_locked(text: &str) -> String {
@@ -211,7 +229,7 @@ pub fn apply_config() {
                 "build_number" => build = v.to_string(),
                 "build_number_short" => short = v.to_string(),
                 "build_modified" => modified = Some(v == "1" || v.eq_ignore_ascii_case("true")),
-                "autoresolve_hooks" | "horde_income" | "horde_income_category" | "ui_recruit_cache_ms" | "ai_recruit_cache" | "recruit_perm_cache" | "file_probe_cache_ms" | "diag_diplomacy" => {}
+                k if KNOWN_KEYS.contains(&k) => {}
                 _ => log!("config: unknown key '{k}' ignored"),
             }
         }

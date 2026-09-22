@@ -66,6 +66,7 @@ fn now_ms() -> u64 { START.get_or_init(Instant::now).elapsed().as_millis() as u6
 
 unsafe extern "C" fn can_propose_detour(cco: P, out: P) -> u64 {
     let Some(h) = CAN_PROPOSE.get() else { return 0 };
+    let _g = crate::crash::enter("dipui_can_propose");
     if let Some(e) = ENGINE.get() {
         let neg = rq(cco as usize + 0x218);
         if neg != 0 {
@@ -84,6 +85,7 @@ unsafe extern "C" fn can_propose_detour(cco: P, out: P) -> u64 {
 
 unsafe extern "C" fn propose_detour(cco: P, b: P) -> u64 {
     let Some(h) = PROPOSE.get() else { return 0 };
+    let _g = crate::crash::enter("dipui_propose_deal");
     ENGINE_PROPOSE_MS.store(now_ms(), Ordering::Relaxed);
     crate::dipui::around_propose("engine click", || h.call(cco, b))
 }
@@ -91,6 +93,7 @@ unsafe extern "C" fn propose_detour(cco: P, b: P) -> u64 {
 /// Per-frame campaign UI update, main thread: carry out a queued request once it has returned.
 unsafe extern "C" fn ui_update_detour(ui: P, x: P) -> u64 {
     let Some(h) = UI_UPDATE.get() else { return 0 };
+    let _g = crate::crash::enter("campaign_ui_update");
     let r = h.call(ui, x);
     let asked = REQUEST_MS.swap(0, Ordering::Relaxed);
     if asked == 0 { return r; }
@@ -122,6 +125,10 @@ pub fn install(t: &Table) {
             command_build: core::mem::transmute(t.get("dip_command_build")),
             command_send: core::mem::transmute(t.get("dipui_send")),
         });
+        if !crate::build::hook_enabled("followup_hooks") {
+            log!("follow-up button fix off (followup_hooks=0 in script_extender.cfg)");
+            return;
+        }
         for (name, slot, detour) in [("dipui_propose_deal", &PROPOSE, propose_detour as F2), ("dipui_can_propose", &CAN_PROPOSE, can_propose_detour as F2), ("campaign_ui_update", &UI_UPDATE, ui_update_detour as F2)] {
             let target: F2 = core::mem::transmute(t.get(name));
             let Ok(d) = GenericDetour::new(target, detour) else {
@@ -134,6 +141,7 @@ pub fn install(t: &Table) {
                 log!("follow-up button fix: could not enable the detour on {name}");
                 return;
             }
+            crate::crash::hook_installed(name, "followup_hooks", target as usize);
         }
     }
     log!("follow-up negotiation button fix installed (se_followup_propose)");
@@ -146,8 +154,15 @@ pub unsafe fn register(l: *mut LuaState) {
 unsafe extern "C" fn se_followup_propose(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let now = now_ms();
-    let (ok, msg) = if UI_UPDATE.get().is_none() {
-        (false, "not installed".to_string())
+    let installed = UI_UPDATE.get().is_some();
+    // se_followup_propose("installed") only asks whether the detours are in (nothing is queued)
+    if (api.gettop)(l) >= 1 && lua::to_str(l, 1) == "installed" {
+        (api.pushboolean)(l, installed as c_int);
+        lua::push_str(l, if installed { "installed" } else { "not installed (followup_hooks=0 in script_extender.cfg)" });
+        return 2;
+    }
+    let (ok, msg) = if !installed {
+        (false, "not installed (followup_hooks=0 in script_extender.cfg)".to_string())
     } else if DEAL.load(Ordering::Relaxed) == 0 {
         (false, "no negotiation popup has been shown yet".to_string())
     } else if now.saturating_sub(ENGINE_PROPOSE_MS.load(Ordering::Relaxed)) <= 500 {

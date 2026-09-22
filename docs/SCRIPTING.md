@@ -28,6 +28,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
+| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down |
 
 ---
 
@@ -67,9 +68,10 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of the five settings that can
+   it always ends up containing the DLL version and a fingerprint of the seven settings that can
    change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
-   `horde_income` and `horde_income_category` (`script_extender.cfg` text may use `{version}`
+   `horde_income`, `horde_income_category`, `ai_recruit_hook` and `followup_hooks`
+   (`script_extender.cfg` text may use `{version}`
    and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
    DLL, with another DLL version or with different hook settings shows a different build and
@@ -1350,6 +1352,45 @@ pass's data source, kept separate so a test or another script can replace it.
 
 ---
 
+### 3.18 Crash reporter
+
+Since 0.42.0-beta.1. On by default (`diag_crash=1` in `script_extender.cfg`; `0` turns it off,
+`2` adds a continuous activity trace). Nothing here changes the game: the DLL installs an
+exception handler that, when the process faults, appends a report to **`se_crash.txt` next to the
+DLL** before the game's own crash reporter runs. The report holds the fault as
+`Three_Kingdoms.exe+rva` (with the Ghidra address) or `script_extender.dll+rva`, the registers, a
+call stack unwound with the modules' own unwind tables, a scan of the stack for return addresses,
+**which SE hook or native the faulting thread was inside**, the last 64 SE events of all threads
+(hooks entered and left, natives called, `se.crash.mark` texts), and the list of installed hooks.
+That is what tells whether a crash is the DLL's or the game's. The game's minidumps still land in
+`%APPDATA%\The Creative Assembly\ThreeKingdoms\crash_report\` and `%LOCALAPPDATA%\CrashDumps`.
+
+The handler is first-chance: it also sees an exception the engine catches and survives. Such a
+report says so in its last line, and reports are written at most once per faulting address and
+at most eight per session. `se_crash.txt` is appended across sessions; delete it whenever you like.
+
+```lua
+se.crash.mark("before recruit " .. key)      -- a breadcrumb, 63 bytes kept
+local t = se.crash.info()                    -- { installed, level, natives, hooks, reports, ... }
+se.crash.selftest()                          -- writes a test report without faulting
+```
+
+- `se.crash.mark(text) -> ok, message`
+- `se.crash.info() -> table | nil, message`: `installed`, `level`, `natives` (registered),
+  `hooks` (installed detours), `reports`, `repeats` (duplicates suppressed), `dropped` (activity
+  events lost at level 2), `last_code`, `last_rva`, `scope_overflow`.
+- `se.crash.selftest([mode]) -> ok, message`: mode 1 (default) writes a report of the current
+  context directly; mode 2 raises a private exception that travels through the handler, which
+  dismisses it (the call returns normally; an attached debugger stops on it).
+
+Narrowing a crash down: every hook group has a cfg switch (`autoresolve_hooks`, `horde_income`,
+`ai_recruit_hook`, `followup_hooks`, `recruit_perm_cache`, `ui_recruit_cache_ms`,
+`file_probe_cache_ms`, `diag_diplomacy`); turn them off one at a time between sessions and keep
+the `se_crash.txt` of each. The first two and the two `*_hook(s)` switches are part of the
+multiplayer version lock.
+
+---
+
 ## 4. Recipes
 
 Each of these is a complete script. Console scripts live in `<game root>\lua_scripts\` and are
@@ -1656,9 +1697,13 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ai_recruit_cache` | `0` | diagnostic AI-planner list cache |
 | `file_probe_cache_ms` | `10000` (max 600000) | missing-directory cache for loose-file lookups |
 | `diag_diplomacy` | `0` | `1` diplomacy evaluation counters + validation trace on request, `2` trace recording from injection |
+| `diag_crash` | `1` | crash reporter (§3.18): `0` off, `1` `se_crash.txt` on a fault, `2` also the activity trace `se_activity.txt` |
+| `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
+| `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 
-**Five of them are part of the multiplayer version lock** — `autoresolve_hooks`,
-`ai_recruit_cache`, `recruit_perm_cache`, `horde_income` and `horde_income_category`. The DLL
+**Seven of them are part of the multiplayer version lock** — `autoresolve_hooks`,
+`ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,
+`ai_recruit_hook` and `followup_hooks`. The DLL
 hashes their *effective* values into the build string, so an absent key and an explicitly written
 default give the same tag, but two players with different values cannot join each other (§1).
 
@@ -1673,6 +1718,7 @@ These need no script. None of them changes what the game computes.
 | `file_probe_cache_ms` | `10000` | Before reading a file from a pack the engine looks for a loose copy in every search root (each subscribed mod folder, `data`, ...) and remembers nothing: zooming the camera in fired 1316 failed lookups in one burst. The DLL remembers for this long that a *directory* does not exist and answers lookups into it without a system call. A folder created while the game runs is seen after at most this time. `0` = off. |
 | `diag_diplomacy` | `0` | Diagnostics only, nothing is changed. `1`: the `dip_*` counters and the hooks behind `se.diag.diplomacy_trace`. `2`: the same, and the trace records from injection and rewrites `dip_trace.txt` next to the DLL every two seconds (for a session without a Lua console). |
 | `ai_recruit_cache` | `0` | Diagnostic (whole-list cache inside the AI's recruitment budget planner). Measured as not worth it; leave off. |
+| `diag_crash` | `1` | Diagnostics only, nothing is changed. `1`: the crash reporter (§3.18) writes `se_crash.txt` next to the DLL when the game faults. `2`: the same, and every hook entry / native call is also streamed to `se_activity.txt` next to the DLL (one line each; rotated at 32 MB) for a session that ends in a crash without a report. `0`: no exception handler at all. |
 
 Measured on a modded late campaign: end turn 76 s -> 45 s (horde income hook made cheap in
 0.32.4) -> about 30 s (permission tables, 0.34); turn 1 went 62 s -> 39 s.
@@ -1828,14 +1874,24 @@ Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `to
 - **Lua log** (in-game console environment): `lua_mod_log.txt` in the game root and the
   per-session `ironic_log_<faction>_<stamp>.txt` — the newest by modification time is the current
   one.
-- **Crash dumps**: `%LOCALAPPDATA%\CrashDumps`.
+- **Crash report of the DLL** (0.42+): `se_crash.txt` next to the DLL (§3.18); with
+  `diag_crash=2` also `se_activity.txt`.
+- **Crash dumps of the game**: `%APPDATA%\The Creative Assembly\ThreeKingdoms\crash_report\`
+  (`D<date>_T<time>.mdmp`; `%APPDATA%` already ends in `Roaming`, do not add it again) and
+  `%LOCALAPPDATA%\CrashDumps`. The `.stack.txt` beside each `.mdmp` only lists module names.
 
 ### Reporting a crash
 
-Send: the game build number, the DLL version (`se.version()`), the **DLL log** next to the DLL,
-the minidump from `%LOCALAPPDATA%\CrashDumps`, the Lua log, and the exact script that was running.
+Send, in this order of usefulness: **`se_crash.txt`** (the last block), the game's `.mdmp` from
+`crash_report\` of the same minute, the **DLL log** next to the DLL, the DLL version
+(`se.version()`), the Lua log, and the exact script that was running. The `se_crash.txt` block
+names the hook or native that was active on the faulting thread; "se scopes on this thread" empty
+and no `script_extender.dll` frame in the stack means the DLL was idle at the time. A block whose
+last line says "first-chance" for a session that did not end there was an exception the engine
+handled itself. `tools/dump_crash.py <file.mdmp>` in the workspace prints the fault-time
+registers and the stack of a minidump as module+RVA.
 Every crash the project has had so far came from an engine routine being handed the wrong object;
-the natives now validate vtables, back-pointers and registry round-trips and refuse instead of
+the natives validate vtables, back-pointers and registry round-trips and refuse instead of
 writing, so a refusal message is the expected outcome of a bad argument — a crash is a bug worth
 reporting.
 
@@ -1862,6 +1918,9 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.autoresolve.set_handler(fn)` | call fn(ctx) on every PendingBattle with a human player |
 | `se.available(native)` | is a given se_* native present in this Lua state |
 | `se.character(cqi)` | checked cm:query_character |
+| `se.crash.info()` | crash reporter state: installed, level, hooks, reports written |
+| `se.crash.mark(text)` | breadcrumb for the crash report |
+| `se.crash.selftest([mode])` | write a test crash report without faulting |
 | `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
 | `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0) |
 | `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |

@@ -142,6 +142,7 @@ unsafe fn destroy_master(e: &Engine, clear: &GenericDetour<MapClear>, m: Master)
 
 unsafe extern "C" fn core_detour(ctx: *mut c_void, out: *mut c_void, mask: u32, flag: u8) {
     let Some(h) = CORE.get() else { return };
+    let _g = crate::crash::enter("recruit_list_core");
     DEPTH.with(|d| d.set(d.get() + 1));
     h.call(ctx, out, mask, flag);
     let outermost = DEPTH.with(|d| { let v = d.get().saturating_sub(1); d.set(v); v == 0 });
@@ -156,6 +157,7 @@ unsafe extern "C" fn core_detour(ctx: *mut c_void, out: *mut c_void, mask: u32, 
 
 unsafe extern "C" fn build_detour(out: *mut c_void, desc: *mut c_void, list: *mut c_void) -> *mut c_void {
     let Some(h) = BUILD.get() else { return out };
+    let _g = crate::crash::enter("recruit_perm_map_build");
     let (Some(e), true) = (ENGINE.get(), DEPTH.with(|d| d.get()) == 1) else {
         UNSCOPED.fetch_add(1, Ordering::Relaxed);
         return h.call(out, desc, list);
@@ -212,6 +214,7 @@ unsafe extern "C" fn build_detour(out: *mut c_void, desc: *mut c_void, list: *mu
 
 unsafe extern "C" fn clear_detour(map: *mut c_void) {
     let Some(h) = CLEAR.get() else { return };
+    let _g = crate::crash::enter("recruit_perm_map_clear");
     let a = map as usize;
     let was_view = VIEWS.with(|v| {
         let mut v = v.borrow_mut();
@@ -260,6 +263,9 @@ pub fn install(t: &Table) {
         if crate::freeze::with_threads_frozen(core_fn as usize, 16, || c.enable()).is_err() {
             log!("recruit permission cache: could not hook the list routine; off");
             return;
+        }
+        for (name, target) in [("recruit_perm_map_clear", clear as usize), ("recruit_perm_map_build", build as usize), ("recruit_list_core", core_fn as usize)] {
+            crate::crash::hook_installed(name, "recruit_perm_cache", target);
         }
     }
     log!("recruit permission cache installed (mode {mode}: {})", if mode == 2 { "verify only" } else { "share" });

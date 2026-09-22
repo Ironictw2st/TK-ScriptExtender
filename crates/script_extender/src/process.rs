@@ -15,7 +15,7 @@ pub fn main_module() -> (usize, usize) {
 }
 
 /// Reads `OptionalHeader.SizeOfImage` (PE32+). Assumes a valid loaded image at `base`.
-unsafe fn image_size(base: usize) -> usize {
+pub(crate) unsafe fn image_size(base: usize) -> usize {
     if base == 0 {
         return 0;
     }

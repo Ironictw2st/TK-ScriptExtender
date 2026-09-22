@@ -34,6 +34,17 @@ pub fn line(msg: &str) {
     output_debug(msg);
 }
 
+/// Best-effort line for code that may be running while another thread holds the log (the crash
+/// reporter): the file only, never waits, allocates nothing.
+pub fn try_line(msg: &str) {
+    if let Some(Some(m)) = LOG.get() {
+        if let Ok(mut f) = m.try_lock() {
+            let _ = writeln!(f, "{msg}");
+            let _ = f.flush();
+        }
+    }
+}
+
 fn output_debug(msg: &str) {
     let mut w: Vec<u16> = format!("[SE] {msg}\n").encode_utf16().collect();
     w.push(0);

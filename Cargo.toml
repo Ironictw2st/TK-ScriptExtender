@@ -4,13 +4,16 @@ members = ["crates/script_extender", "crates/injector", "crates/inject_core"]
 
 [workspace.package]
 edition = "2021"
-version = "0.41.0"
+version = "0.42.0-beta.1"
 publish = false
 
-# Release profile: small stripped DLL, no unwinding across the FFI boundary.
+# Release profile: small DLL, no unwinding across the FFI boundary. Line tables only, so a
+# script_extender.pdb is written next to the DLL (the crash reporter prints DLL frames as
+# script_extender.dll+rva; the PDB of the same build turns them into function names). MSVC keeps
+# every symbol in the PDB, so the DLL itself is as small as the stripped builds were.
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = true
+debug = "line-tables-only"

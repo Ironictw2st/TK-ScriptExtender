@@ -383,6 +383,7 @@ unsafe fn dump_result(res: usize) {
 
 unsafe extern "C" fn compute_detour(pb: *mut c_void, night: u8) {
     let Some(hook) = COMPUTE_HOOK.get() else { return };
+    let _g = crate::crash::enter("ar_compute_results");
     let p = pb as usize;
     let slot = p + 0xc8 + (night as usize & 1) * 0x10;
     let before = if readable(slot, 0x10) { rd(slot + 4) } else { 0 };
@@ -744,6 +745,7 @@ pub fn install_hooks(t: &Table) {
                 }
                 let _ = COMPUTE_HOOK.set(d);
                 COMPUTE_TARGET.store(target as usize, std::sync::atomic::Ordering::SeqCst);
+                crate::crash::hook_installed("ar_compute_results", "autoresolve_hooks", target as usize);
                 log!("auto-resolve hook installed");
             }
             Err(e) => log!("failed to create the auto-resolve hook: {e}"),

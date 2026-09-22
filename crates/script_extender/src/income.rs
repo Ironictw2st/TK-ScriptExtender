@@ -202,6 +202,7 @@ unsafe fn holder_gdp_bonus(holder: usize, who: &str) -> Result<(f32, Vec<String>
 
 unsafe extern "C" fn update_income_detour(finance: *mut c_void, category: u32) {
     let Some(hook) = HOOK.get() else { return };
+    let _g = crate::crash::enter("finance_update_income");
     hook.call(finance, category);
     // Category names (exe table at 0x143308c..): 0 TAXES, 1 MINING, 2 TRADE, 3 MILITARY_FORCE.
     // MINING is unused in 3K: the engine never computes it (this routine writes 0 for it), the
@@ -272,6 +273,7 @@ pub fn install(t: &Table) {
                     return;
                 }
                 INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::crash::hook_installed("finance_update_income", "horde_income", target as usize);
                 log!("horde income hook installed");
             }
             Err(e) => log!("failed to create the horde income hook: {e}"),

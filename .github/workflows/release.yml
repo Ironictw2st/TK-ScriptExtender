@@ -1,7 +1,7 @@
 name: Release
 
 # Builds the script extender on a v* tag and publishes a GitHub Release with:
-#   script_extender.dll, injector.exe, manifest.json
+#   script_extender.dll, injector.exe, manifest.json, script_extender.pdb (symbols for se_crash.txt frames)
 # manifest.json = { version, game_exe_version, exe_timestamp, exe_size_of_image, sha256 } —
 # TK Mod Manager compares exe_timestamp / exe_size_of_image with the installed game's PE header
 # and only injects a DLL whose fingerprint matches.
@@ -67,6 +67,7 @@ jobs:
           Get-Content manifest.json
           Copy-Item target/release/script_extender.dll .
           Copy-Item target/release/injector.exe .
+          Copy-Item target/release/script_extender.pdb .
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -78,6 +79,7 @@ jobs:
             script_extender.dll
             injector.exe
             manifest.json
+            script_extender.pdb
 
   # Full releases also go to Nexus Mods (see nexus.yml); pre-releases stay on GitHub.
   nexus:
