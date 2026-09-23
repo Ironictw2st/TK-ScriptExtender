@@ -116,11 +116,10 @@ pub fn install(t: &Table) {
             };
             let _ = slot.set(d);
             let Some(d) = slot.get() else { return };
-            if crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()).is_err() {
-                log!("diplomacy ui trace: could not enable the detour on {name}");
+            if let Err(e) = crate::freeze::enable_detour(name, "diag_diplomacy", target as usize, d) {
+                log!("diplomacy ui trace: could not enable the detour on {name}: {e}");
                 return;
             }
-            crate::crash::hook_installed(name, "diag_diplomacy", target as usize);
         }
     }
     log!("diplomacy ui trace installed (what ProposeDeal / CanPropose ask)");

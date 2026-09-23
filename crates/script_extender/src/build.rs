@@ -169,7 +169,7 @@ pub fn config_value(key: &str) -> Option<String> {
 /// Version lock for multiplayer: the game build string always carries the DLL version and a
 /// fingerprint of every setting that changes the simulation, so two machines only see the same
 /// build when they run the same script extender with the same simulation settings.
-/// `{version}` / `{sync}` in the cfg text are replaced; text without `{version}` gets
+/// `{version}` / `{sync}` in the cfg text are replaced; text without both of them gets
 /// " [se <version>.<sync>]" appended; without any cfg text the game's own string is extended.
 pub fn sync_tag() -> String {
     let mut h: u32 = 0x811c9dc5;
@@ -185,7 +185,9 @@ pub fn sync_tag() -> String {
     feed(if income_on { "1" } else { "0" });
     feed("horde_income_category");
     feed(&income_category.to_string());
-    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws"] {
+    // save_chunking decides whether a large saved value survives a reload, so peers that differ
+    // in it diverge after the first save / load
+    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws", "save_chunking"] {
         feed(key);
         feed(if hook_enabled(key) { "1" } else { "0" });
     }
@@ -211,8 +213,11 @@ pub fn hook_enabled(key: &str) -> bool {
 
 fn version_locked(text: &str) -> String {
     let (version, sync) = (env!("CARGO_PKG_VERSION"), sync_tag());
-    if text.contains("{version}") {
+    if text.contains("{version}") && text.contains("{sync}") {
         text.replace("{version}", version).replace("{sync}", &sync)
+    } else if text.contains("{version}") {
+        // "{version}" alone would drop the sync hash: the lock tag is appended regardless
+        format!("{} [se {version}.{sync}]", text.replace("{version}", version))
     } else {
         format!("{text} [se {version}.{sync}]")
     }

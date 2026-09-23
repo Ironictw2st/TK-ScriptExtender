@@ -64,29 +64,40 @@ unsafe fn ensure_registered(l: *mut LuaState) {
         Ok(()) => log!("se_api.lua loaded into lua_State {:p}", l),
         Err(e) => log!("se_api.lua failed in lua_State {:p}: {e}", l),
     }
+    // the first state is where the natives list becomes known: refresh the inventory once
+    static NATIVES_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NATIVES_WRITTEN.swap(true, Ordering::Relaxed) {
+        crate::status::write_inventory();
+    }
 }
 
 const SE_API_SRC: &str = include_str!("../lua/se_api.lua");
 
-pub fn install(t: &Table) {
+/// false when the hook could not be installed (then no Lua state ever gets the API).
+pub fn install(t: &Table) -> bool {
     let target: GetTop = unsafe { core::mem::transmute(t.get("lua_gettop")) };
     // SAFETY: the target's first bytes were anchor-verified; lua_gettop has no RIP-relative
     // prologue, so the relocated trampoline is sound.
     unsafe {
         match GenericDetour::new(target, detour) {
             Ok(d) => {
-                // lua_gettop is 13 bytes long and hot: freeze the other threads and make sure
-                // none of them is executing inside it while the jump is written.
-                let enabled = crate::freeze::with_threads_frozen(target as usize, 16, || d.enable());
-                if let Err(e) = enabled {
-                    log!("failed to enable lua_gettop hook: {e}");
-                    return;
-                }
+                // Published before it is enabled: lua_gettop is hot, and a thread that enters the
+                // detour before HOOK is set would find no trampoline. lua_gettop is 13 bytes long:
+                // enable_detour freezes the other threads and keeps them out of it while the jump
+                // is written.
                 let _ = HOOK.set(d);
-                crate::crash::hook_installed("lua_gettop", "-", target as usize);
+                let Some(d) = HOOK.get() else { return false };
+                if let Err(e) = crate::freeze::enable_detour("lua_gettop", "-", target as usize, d) {
+                    log!("failed to enable lua_gettop hook: {e}");
+                    return false;
+                }
                 log!("lua_gettop hook installed");
+                true
             }
-            Err(e) => log!("failed to create lua_gettop hook: {e}"),
+            Err(e) => {
+                log!("failed to create lua_gettop hook: {e}");
+                false
+            }
         }
     }
 }

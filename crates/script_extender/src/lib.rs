@@ -41,6 +41,7 @@ mod bundles;
 mod diplomacy;
 mod crash;
 mod marriage;
+mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
 
@@ -57,7 +58,9 @@ pub extern "system" fn DllMain(hinst: *mut c_void, reason: u32, reserved: *mut c
         SELF_HMODULE.store(hinst as usize, Ordering::Relaxed);
         unsafe { DisableThreadLibraryCalls(hinst) };
         std::thread::spawn(|| {
-            let _ = std::panic::catch_unwind(bootstrap);
+            if std::panic::catch_unwind(bootstrap).is_err() {
+                status::refuse(status::REFUSED, "bootstrap panicked (see script_extender.log)");
+            }
         });
     }
     1
@@ -74,12 +77,14 @@ fn bootstrap() {
         .unwrap_or(false);
     if !host_ok {
         log!("host is not Three_Kingdoms.exe; doing nothing");
+        status::set_state(status::NOT_GAME);
         return;
     }
 
     let (base, size) = process::main_module();
     log!("main module base=0x{base:x} size=0x{size:x}");
     let Some(table) = addrs::resolve(base, size) else {
+        // resolve() has already published REFUSED and written se_inventory.json
         log!("address table does not match this build; doing nothing");
         return;
     };
@@ -119,9 +124,15 @@ fn bootstrap() {
     crash::boot("marriage");
     marriage::install(&table);
     crash::boot("hook");
-    hook::install(&table);
+    if !hook::install(&table) {
+        // without lua_gettop no Lua state ever gets the API: not "ready"
+        status::refuse(status::REFUSED, "lua_gettop hook failed");
+        return;
+    }
     crash::boot("complete");
-    log!("bootstrap complete; waiting for the game's Lua to tick");
+    status::set_state(status::READY);
+    status::write_inventory();
+    log!("bootstrap complete ({} patches); waiting for the game's Lua to tick", status::patch_count());
 }
 
 extern "system" {

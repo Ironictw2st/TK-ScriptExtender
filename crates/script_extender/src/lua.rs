@@ -117,6 +117,11 @@ pub fn native_count() -> usize {
     NATIVES.lock().map(|g| g.len()).unwrap_or(0)
 }
 
+/// Names of the natives registered so far, in registration order (status.rs inventory).
+pub fn native_names() -> Vec<&'static str> {
+    NATIVES.lock().map(|g| g.iter().map(|e| e.name).collect()).unwrap_or_default()
+}
+
 /// Lua 5.1 pseudo-index of the running C closure's first upvalue.
 const LUA_UPVALUE_1: c_int = LUA_GLOBALSINDEX - 1;
 

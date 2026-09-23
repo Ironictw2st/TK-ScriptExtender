@@ -441,8 +441,11 @@ fn click_watch() {
     }
 }
 
-unsafe fn enable<T: retour::Function>(target: usize, d: &GenericDetour<T>) -> bool {
-    crate::freeze::with_threads_frozen(target, 16, || d.enable()).is_ok()
+unsafe fn enable<T: retour::Function>(name: &'static str, target: usize, d: &GenericDetour<T>) -> bool {
+    match crate::freeze::enable_detour(name, "diag_diplomacy", target, d) {
+        Ok(()) => true,
+        Err(e) => { log!("diplomacy trace: {name}: {e}"); false }
+    }
 }
 
 /// Called by `diag::install` once its own detours are in (same cfg switch).
@@ -476,18 +479,14 @@ pub fn install(t: &Table) {
         };
         let (_, _, _) = (COMMAND.set(co), LOOKUP.set(lo), NOTIFY.set(no));
         let (Some(co), Some(lo), Some(no)) = (COMMAND.get(), LOOKUP.get(), NOTIFY.get()) else { return };
-        if !enable(command as usize, co) || !enable(lookup as usize, lo) || !enable(notify as usize, no) {
+        if !enable("dip_command", command as usize, co) || !enable("dip_command_deal", lookup as usize, lo) || !enable("dip_notify", notify as usize, no) {
             log!("diplomacy trace: could not enable the command detours");
             return;
         }
-        if !enable(group as usize, g) || !enable(leaf as usize, f) || !enable(add as usize, a) || !enable(expand as usize, x)
-            || !enable(action as usize, ac) || !enable(apply as usize, ap) {
+        if !enable("dip_group_eval", group as usize, g) || !enable("dip_requirement_eval", leaf as usize, f) || !enable("dip_deal_add", add as usize, a)
+            || !enable("dip_deal_expand", expand as usize, x) || !enable("dip_deal_action", action as usize, ac) || !enable("dip_deal_apply", apply as usize, ap) {
             log!("diplomacy trace: could not enable the detours");
             return;
-        }
-        for (name, target) in [("dip_group_eval", group as usize), ("dip_requirement_eval", leaf as usize), ("dip_deal_add", add as usize), ("dip_deal_expand", expand as usize),
-            ("dip_deal_action", action as usize), ("dip_deal_apply", apply as usize), ("dip_command", command as usize), ("dip_command_deal", lookup as usize), ("dip_notify", notify as usize)] {
-            crate::crash::hook_installed(name, "diag_diplomacy", target);
         }
     }
     crate::dipui::install(t);

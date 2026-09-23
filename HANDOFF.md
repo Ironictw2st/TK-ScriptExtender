@@ -1,7 +1,8 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current DLL: **0.40.0**, `Z:\RE\se_deploy\0.40.0\`
+(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.41.0**, `Z:\RE\se_deploy\0.41.0\`; pre-release line 0.42.0-beta.N (latest
+0.42.0-beta.4, `Z:\RE\se_deploy\0.42.0-beta.4\`)
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -10,16 +11,20 @@ Written 2026-09-17. Everything below was verified live on Total War: THREE KINGD
 
 A native DLL injected into the running `Three_Kingdoms.exe` that:
 
-1. fingerprints the exe (PE `TimeDateStamp 0x69ce4c84`, `SizeOfImage 0x4836000`) and verifies 53
+1. fingerprints the exe (PE `TimeDateStamp 0x69ce4c84`, `SizeOfImage 0x4836000`) and verifies 109
    engine addresses by their first 8 bytes plus 3 vtables by their slot-0 RVA (`src/addrs.rs`);
-   **on any mismatch it logs and does nothing** (safe on a patched game);
+   **on any mismatch it logs and does nothing** (safe on a patched game). The Epic build
+   (`TimeDateStamp 0x69ce4df8`) uses the same table;
 2. detours `lua_gettop` (a trampoline hook, installed with all other threads frozen) and, the
    first time each Lua state passes through it, registers the `se_*` C natives into that state's
    globals and runs the embedded `lua/se_api.lua`, which defines the public `se.query.*` /
    `se.modify.*` API (`src/hook.rs`);
 3. exposes named, high-level operations only (no generic peek/poke/call to Lua).
 
-**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (lobby check not yet verified on two machines). The manager must give both players the same DLL version and the same `autoresolve_hooks` / `horde_income*` cfg values.
+**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (lobby check not yet verified on two machines). The manager must give both players the same DLL version and the same simulation cfg values (the ten sync-tag keys listed in docs/SCRIPTING.md §1).
+Other native mods (ThreeKingdoms-Coop) can query the DLL through its exports `se_status()` /
+`se_version()` and read `se_inventory.json` next to it (anchors read, patches written); see
+docs/SCRIPTING.md "Coexisting with other native mods".
 Saves that used `se.modify.*` carry the results (they are ordinary engine state); the DLL is
 not needed to load them, only to keep using the API.
 
@@ -42,7 +47,7 @@ Rules that matter for a launcher:
   `lua_gettop` hook would stack on the first. Any DLL update means: quit game, start game,
   inject. The DLL keeps its own log next to itself: `<dll dir>\script_extender.log`
   (truncated on each injection; also mirrored to `OutputDebugString`).
-- Success line to check in the log: `all 53 addresses and 3 vtables verified` then
+- Success line to check in the log: `all 109 addresses and 3 vtables verified` then
   `lua_gettop hook installed`; per-state lines `registered se_* functions into lua_State ...`
   and `se_api.lua loaded into lua_State ...` appear once the game's Lua ticks (main menu state
   first, campaign state after a campaign loads).
@@ -200,6 +205,18 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   on the thread, the relatedness search answers "related" only for a shared blood ancestor within
   N generations; the verdict's close-kin test still applies. Distant-relative status and every
   other use of the search are unchanged. `se.query.marriage_hook()`; notes/family.md.
+- 0.42.0-beta.4 (2026-09-23): **coexistence with ThreeKingdoms-Coop** (review in
+  `script-extender-compatibility.md`). The unused `char_by_cqi` anchor (RVA 0x1457760) is gone:
+  coop detours that function, and with coop loaded first (its AGS proxy, then the manager) the
+  anchor check refused the whole table. Exports `se_status()` (0 booting / 1 ready / 2 refused /
+  3 not the game) and `se_version()` ("<version>.<sync>"), `se_inventory.json` next to the DLL
+  (anchors, patches with bytes before/after, natives), Lua `se.status()`. Hardening: every detour
+  is published before it is enabled (lua_gettop and auto-resolve were not), no patch is written
+  while a thread is still inside the target bytes, anchor mismatches that look like another
+  mod's detour say so in the log. Version lock: `{version}` without `{sync}` in cfg text no longer
+  drops the sync hash, and **`save_chunking` joins the sync tag (ten keys now)**. se_api.lua asks
+  `cm:query_model():is_multiplayer()` first (`cm:is_multiplayer()` reads false before
+  WorldCreated) and treats "unknown" as multiplayer; `tools/test_lua_mp_guard.py`.
 
 ## 7. When the game updates
 

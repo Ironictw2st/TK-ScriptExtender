@@ -42,11 +42,13 @@ extern "system" {
 
 /// Run `f` with all other threads suspended and none of them executing inside
 /// `[range_start, range_start + range_len)`. Threads caught inside the range are resumed
-/// briefly and re-suspended (up to a few attempts) before giving up on that thread.
-pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOnce() -> R) -> R {
+/// briefly and re-suspended (up to a few attempts). If one never leaves it, `f` is NOT run
+/// and Err is returned: patching bytes under a running instruction pointer is not safe.
+pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOnce() -> R) -> Result<R, String> {
     let pid = unsafe { GetCurrentProcessId() };
     let me = unsafe { GetCurrentThreadId() };
     let mut handles: Vec<*mut c_void> = Vec::new();
+    let mut stuck: Option<u32> = None;
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snap as usize != INVALID_HANDLE && !snap.is_null() {
@@ -84,9 +86,11 @@ pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOn
                                     SuspendThread(h);
                                 }
                                 if !ok {
-                                    log!("thread {} stuck inside patch range; leaving it running", e.th32_thread_id);
+                                    log!("thread {} stuck inside patch range 0x{range_start:x}; not patching", e.th32_thread_id);
+                                    stuck = Some(e.th32_thread_id);
                                     ResumeThread(h);
                                     CloseHandle(h);
+                                    break;
                                 } else {
                                     handles.push(h);
                                 }
@@ -104,13 +108,34 @@ pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOn
         }
     }
     let n = handles.len();
-    let r = f();
+    let r = if stuck.is_none() { Some(f()) } else { None };
     unsafe {
         for h in handles {
             ResumeThread(h);
             CloseHandle(h);
         }
     }
-    log!("patched with {n} other thread(s) frozen");
-    r
+    match (r, stuck) {
+        (Some(r), _) => {
+            log!("patched with {n} other thread(s) frozen");
+            Ok(r)
+        }
+        (None, tid) => Err(format!("thread {} stayed inside 0x{range_start:x}..+{range_len}", tid.unwrap_or(0))),
+    }
+}
+
+unsafe fn read16(addr: usize) -> [u8; 16] {
+    core::ptr::read_unaligned(addr as *const [u8; 16])
+}
+
+/// Enable one detour the safe way and account for it: other threads frozen and out of the first
+/// 16 bytes (else nothing is written), the bytes before / after recorded in the inventory
+/// (status.rs, what other native mods compare against) and the hook announced to crash.rs.
+/// Publish the detour's `OnceLock` BEFORE calling this: the detour runs as soon as the jump lands.
+pub unsafe fn enable_detour<T: retour::Function>(name: &'static str, cfg_key: &'static str, target: usize, d: &retour::GenericDetour<T>) -> Result<(), String> {
+    let before = read16(target);
+    with_threads_frozen(target, 16, || d.enable())?.map_err(|e| e.to_string())?;
+    crate::status::record_patch(name, cfg_key, target, before, read16(target));
+    crate::crash::hook_installed(name, cfg_key, target);
+    Ok(())
 }

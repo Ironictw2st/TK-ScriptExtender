@@ -413,18 +413,15 @@ pub fn install(t: &Table) {
         // stored before they are enabled: a detour must never run without its trampoline
         let (_, _, _) = (GET2.set(g2), GET3.set(g3), BUILD.set(b));
         let (Some(g2), Some(g3), Some(b)) = (GET2.get(), GET3.get(), BUILD.get()) else { return };
-        let r2 = crate::freeze::with_threads_frozen(get2 as usize, 16, || g2.enable());
-        let r3 = crate::freeze::with_threads_frozen(get3 as usize, 16, || g3.enable());
-        if r2.is_err() || r3.is_err() {
-            log!("ui recruit cache: could not enable the getter detours; cache stays off");
+        let r2 = crate::freeze::enable_detour("cco_can_recruit_any", "ui_recruit_cache_ms", get2 as usize, g2);
+        let r3 = crate::freeze::enable_detour("cco_recruit_list", "ui_recruit_cache_ms", get3 as usize, g3);
+        if let Err(e) = r2.and(r3) {
+            log!("ui recruit cache: could not enable the getter detours ({e}); cache stays off");
             return;
         }
-        if crate::freeze::with_threads_frozen(build as usize, 16, || b.enable()).is_err() {
-            log!("ui recruit cache: could not enable the list detour; cache stays off");
+        if let Err(e) = crate::freeze::enable_detour("recruit_list_build", "ui_recruit_cache_ms", build as usize, b) {
+            log!("ui recruit cache: could not enable the list detour ({e}); cache stays off");
             return;
-        }
-        for (name, target) in [("cco_can_recruit_any", get2 as usize), ("cco_recruit_list", get3 as usize), ("recruit_list_build", build as usize)] {
-            crate::crash::hook_installed(name, "ui_recruit_cache_ms", target);
         }
         if ai_mode > 0 {
             // the scope comes from the planner detour in airecruit.rs

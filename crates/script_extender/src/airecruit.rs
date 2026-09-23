@@ -127,11 +127,10 @@ pub fn install(t: &Table) {
         };
         let _ = HOOK.set(d);
         let Some(d) = HOOK.get() else { return };
-        if crate::freeze::with_threads_frozen(planner as usize, 16, || d.enable()).is_err() {
-            log!("ai recruitment trace: could not hook the planner");
+        if let Err(e) = crate::freeze::enable_detour("cai_recruit_budget", "ai_recruit_hook", planner as usize, d) {
+            log!("ai recruitment trace: could not hook the planner: {e}");
             return;
         }
-        crate::crash::hook_installed("cai_recruit_budget", "ai_recruit_hook", planner as usize);
     }
     log!("ai recruitment planner hook installed (trace off until a script asks for it)");
 }

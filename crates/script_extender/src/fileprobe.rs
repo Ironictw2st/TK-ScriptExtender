@@ -99,11 +99,10 @@ pub fn install(t: &Table) {
         // stored before it is enabled: the detour must never run without its trampoline
         let _ = HOOK.set(d);
         let Some(d) = HOOK.get() else { return };
-        if crate::freeze::with_threads_frozen(exists as usize, 16, || d.enable()).is_err() {
-            log!("file probe cache: could not enable the detour; off");
+        if let Err(e) = crate::freeze::enable_detour("file_exists", "file_probe_cache_ms", exists as usize, d) {
+            log!("file probe cache: could not enable the detour ({e}); off");
             return;
         }
-        crate::crash::hook_installed("file_exists", "file_probe_cache_ms", exists as usize);
     }
     log!("file probe cache installed (missing directories remembered for {ttl} ms)");
 }

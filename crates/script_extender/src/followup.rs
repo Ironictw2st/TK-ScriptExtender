@@ -137,11 +137,10 @@ pub fn install(t: &Table) {
             };
             let _ = slot.set(d);
             let Some(d) = slot.get() else { return };
-            if crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()).is_err() {
-                log!("follow-up button fix: could not enable the detour on {name}");
+            if let Err(e) = crate::freeze::enable_detour(name, "followup_hooks", target as usize, d) {
+                log!("follow-up button fix: could not enable the detour on {name}: {e}");
                 return;
             }
-            crate::crash::hook_installed(name, "followup_hooks", target as usize);
         }
     }
     log!("follow-up negotiation button fix installed (se_followup_propose)");

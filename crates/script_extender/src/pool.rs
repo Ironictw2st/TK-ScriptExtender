@@ -40,6 +40,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ping", se_ping);
     lua::set_global_fn(l, "se_version", se_version);
     lua::set_global_fn(l, "se_save_chunking", se_save_chunking);
+    lua::set_global_fn(l, "se_status", se_status);
     lua::set_global_fn(l, "se_log", se_log);
     lua::set_global_fn(l, "se_char_info", se_char_info);
     lua::set_global_fn(l, "se_release_to_pool", se_release_to_pool);
@@ -226,6 +227,16 @@ unsafe extern "C" fn se_log(l: *mut LuaState) -> c_int {
 unsafe extern "C" fn se_version(l: *mut LuaState) -> c_int {
     lua::push_str(l, env!("CARGO_PKG_VERSION"));
     1
+}
+
+/// se_status() -> state:integer, version:string ("<dll>.<sync>"), patches:integer. Same values
+/// as the C exports other DLLs read (status.rs); state 1 = ready.
+unsafe extern "C" fn se_status(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    (api.pushinteger)(l, crate::status::state() as _);
+    lua::push_str(l, crate::status::version_string());
+    (api.pushinteger)(l, crate::status::patch_count() as _);
+    3
 }
 
 /// se_save_chunking() -> bool : script_extender.cfg `save_chunking` (default on). se_api.lua splits

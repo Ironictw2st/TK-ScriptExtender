@@ -132,16 +132,14 @@ pub fn install(t: &Table) {
         // that nothing reads
         let (_, _) = (RELATED.set(r), VERDICT.set(v));
         let (Some(r), Some(v)) = (RELATED.get(), VERDICT.get()) else { return };
-        if crate::freeze::with_threads_frozen(related as usize, 16, || r.enable()).is_err() {
-            log!("marriage hook: could not enable the relatedness detour; off");
+        if let Err(e) = crate::freeze::enable_detour("family_related", "marriage_inlaws", related as usize, r) {
+            log!("marriage hook: could not enable the relatedness detour ({e}); off");
             return;
         }
-        if crate::freeze::with_threads_frozen(verdict as usize, 16, || v.enable()).is_err() {
-            log!("marriage hook: could not enable the verdict detour; off");
+        if let Err(e) = crate::freeze::enable_detour("marriage_verdict", "marriage_inlaws", verdict as usize, v) {
+            log!("marriage hook: could not enable the verdict detour ({e}); off");
             return;
         }
-        crate::crash::hook_installed("family_related", "marriage_inlaws", related as usize);
-        crate::crash::hook_installed("marriage_verdict", "marriage_inlaws", verdict as usize);
     }
     log!("marriage hook installed: relatives by marriage may marry; blood relatives within {n} generation(s) may not (plus the engine's close-kin rule)");
 }

@@ -252,20 +252,17 @@ pub fn install(t: &Table) {
         // stored before they are enabled: a detour must never run without its trampoline
         let (_, _, _) = (CLEAR.set(x), BUILD.set(b), CORE.set(c));
         let (Some(x), Some(b), Some(c)) = (CLEAR.get(), BUILD.get(), CORE.get()) else { return };
-        if crate::freeze::with_threads_frozen(clear as usize, 16, || x.enable()).is_err() {
-            log!("recruit permission cache: could not hook the map destructor; off");
+        if let Err(e) = crate::freeze::enable_detour("recruit_perm_map_clear", "recruit_perm_cache", clear as usize, x) {
+            log!("recruit permission cache: could not hook the map destructor ({e}); off");
             return;
         }
-        if crate::freeze::with_threads_frozen(build as usize, 16, || b.enable()).is_err() {
-            log!("recruit permission cache: could not hook the map builder; off");
+        if let Err(e) = crate::freeze::enable_detour("recruit_perm_map_build", "recruit_perm_cache", build as usize, b) {
+            log!("recruit permission cache: could not hook the map builder ({e}); off");
             return;
         }
-        if crate::freeze::with_threads_frozen(core_fn as usize, 16, || c.enable()).is_err() {
-            log!("recruit permission cache: could not hook the list routine; off");
+        if let Err(e) = crate::freeze::enable_detour("recruit_list_core", "recruit_perm_cache", core_fn as usize, c) {
+            log!("recruit permission cache: could not hook the list routine ({e}); off");
             return;
-        }
-        for (name, target) in [("recruit_perm_map_clear", clear as usize), ("recruit_perm_map_build", build as usize), ("recruit_list_core", core_fn as usize)] {
-            crate::crash::hook_installed(name, "recruit_perm_cache", target);
         }
     }
     log!("recruit permission cache installed (mode {mode}: {})", if mode == 2 { "verify only" } else { "share" });

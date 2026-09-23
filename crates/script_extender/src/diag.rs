@@ -149,12 +149,11 @@ pub fn install(t: &Table) {
         };
         let (_, _) = (DIP_EVAL.set(e), DIP_SCAN.set(s));
         let (Some(e), Some(s)) = (DIP_EVAL.get(), DIP_SCAN.get()) else { return };
-        if crate::freeze::with_threads_frozen(eval as usize, 16, || e.enable()).is_err() || crate::freeze::with_threads_frozen(scan as usize, 16, || s.enable()).is_err() {
-            log!("diplomacy diagnostic: could not enable the detours");
+        if let Err(err) = crate::freeze::enable_detour("dip_component_eval", "diag_diplomacy", eval as usize, e)
+            .and_then(|_| crate::freeze::enable_detour("cai_dip_scan", "diag_diplomacy", scan as usize, s)) {
+            log!("diplomacy diagnostic: could not enable the detours: {err}");
             return;
         }
-        crate::crash::hook_installed("dip_component_eval", "diag_diplomacy", eval as usize);
-        crate::crash::hook_installed("cai_dip_scan", "diag_diplomacy", scan as usize);
     }
     log!("diplomacy diagnostic installed (counters in se.query.perf(): dip_*)");
     crate::diptrace::install(t);

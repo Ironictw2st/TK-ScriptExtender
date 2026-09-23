@@ -54,8 +54,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     ("lua_pushvalue", 0x75d560, [0x48, 0x83, 0xec, 0x28, 0x4c, 0x8b, 0xd1, 0xe8]),
     // FACTION_CHARACTER_MANAGER::release_to_pool(mgr = faction+0xd60, details, flag)
     ("release_to_pool", 0x17c6130, [0x40, 0x53, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec]),
-    // character lookup by cqi in the model's table (*(model+0x3c18), &cqi)
-    ("char_by_cqi", 0x1457760, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x44, 0x8b, 0x1a]),
+    // RVA 0x1457760 (lookup by id in a model table, e.g. character by cqi) is deliberately NOT
+    // anchored: ThreeKingdoms-Coop detours its prologue, and an unused anchor there made the
+    // whole table refuse. If a native ever needs it, reach it through a verified call site.
     // CHARACTER::assignment(): non-null means the character holds a post
     ("char_assignment", 0x1a6add0, [0x48, 0x8b, 0x81, 0x60, 0x02, 0x00, 0x00, 0x48]),
     // CHARACTER::change_faction(char, faction, 0, 0): what Lua move_to_faction calls
@@ -221,9 +222,16 @@ unsafe fn read8(addr: usize) -> Option<[u8; 8]> {
     Some(core::ptr::read_unaligned(addr as *const [u8; 8]))
 }
 
+/// A prologue that starts with a jump is almost always someone else's detour (rel32 jmp, absolute
+/// `jmp [rip+0]`, `mov rax/r11, imm64; jmp reg`, `push imm32; ret`). Only used to word the log.
+fn looks_like_detour(b: &[u8; 8]) -> bool {
+    matches!(b, [0xe9, ..] | [0xff, 0x25, ..] | [0x48, 0xb8, ..] | [0x49, 0xbb, ..] | [0x68, _, _, _, _, 0xc3, ..])
+}
+
 /// Fingerprint the loaded image and verify every anchor. Returns None on any mismatch.
 pub fn resolve(base: usize, size: usize) -> Option<Table> {
     if base == 0 {
+        crate::status::refuse(crate::status::REFUSED, "main module not found");
         return None;
     }
     let (ts, soi) = unsafe {
@@ -236,27 +244,36 @@ pub fn resolve(base: usize, size: usize) -> Option<Table> {
     };
     log!("exe fingerprint: timestamp=0x{ts:x} size_of_image=0x{soi:x} (module size 0x{size:x})");
     match BUILDS.iter().find(|(t, s, _)| *t == ts && *s == soi) {
-        Some((_, _, store)) => log!("known build ({store})"),
+        Some((_, _, store)) => {
+            log!("known build ({store})");
+            crate::status::record_image(base, ts, soi, store);
+        }
         None => {
             log!("fingerprint mismatch: known builds are {BUILDS:x?}");
+            crate::status::record_image(base, ts, soi, "unknown");
+            crate::status::refuse(crate::status::REFUSED, &format!("unknown exe: timestamp 0x{ts:x}, size_of_image 0x{soi:x}"));
             return None;
         }
     }
     let mut map = HashMap::new();
-    let mut bad = 0;
+    let mut failed: Vec<&str> = Vec::new();
     for (name, rva, anchor) in ENTRIES {
         let addr = base + rva;
         match unsafe { read8(addr) } {
             Some(bytes) if &bytes == anchor => {
                 map.insert(*name, addr);
+                crate::status::record_anchor(name, *rva, Some(bytes), true);
             }
             Some(bytes) => {
-                log!("anchor mismatch for {name} at 0x{addr:x}: got {bytes:02x?}, want {anchor:02x?}");
-                bad += 1;
+                let hint = if looks_like_detour(&bytes) { " (looks like another mod's detour)" } else { "" };
+                log!("anchor mismatch for {name} at 0x{addr:x}: got {bytes:02x?}, want {anchor:02x?}{hint}");
+                crate::status::record_anchor(name, *rva, Some(bytes), false);
+                failed.push(*name);
             }
             None => {
                 log!("anchor unreadable for {name} at 0x{addr:x}");
-                bad += 1;
+                crate::status::record_anchor(name, *rva, None, false);
+                failed.push(*name);
             }
         }
     }
@@ -265,21 +282,25 @@ pub fn resolve(base: usize, size: usize) -> Option<Table> {
         match unsafe { read8(addr) } {
             Some(bytes) => {
                 let slot0 = usize::from_le_bytes(bytes);
-                if slot0.wrapping_sub(base) == *slot0_rva {
+                let ok = slot0.wrapping_sub(base) == *slot0_rva;
+                crate::status::record_vtable(name, *rva, Some(bytes), ok);
+                if ok {
                     map.insert(*name, addr);
                 } else {
                     log!("vtable anchor mismatch for {name} at 0x{addr:x}: slot0=0x{slot0:x}, want base+0x{slot0_rva:x}");
-                    bad += 1;
+                    failed.push(*name);
                 }
             }
             None => {
                 log!("vtable unreadable for {name} at 0x{addr:x}");
-                bad += 1;
+                crate::status::record_vtable(name, *rva, None, false);
+                failed.push(*name);
             }
         }
     }
-    if bad > 0 {
-        log!("{bad} anchor(s) failed; refusing to run");
+    if !failed.is_empty() {
+        log!("{} anchor(s) failed; refusing to run", failed.len());
+        crate::status::refuse(crate::status::REFUSED, &format!("anchor mismatch: {}", failed.join(", ")));
         return None;
     }
     log!("all {} addresses and {} vtables verified", ENTRIES.len(), VTABLES.len());

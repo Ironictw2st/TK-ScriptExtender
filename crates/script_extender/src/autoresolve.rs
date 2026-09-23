@@ -739,13 +739,14 @@ pub fn install_hooks(t: &Table) {
     unsafe {
         match GenericDetour::new(target, compute_detour) {
             Ok(d) => {
-                if let Err(e) = crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()) {
+                // stored before it is enabled: the detour must never run without its trampoline
+                let _ = COMPUTE_HOOK.set(d);
+                let Some(d) = COMPUTE_HOOK.get() else { return };
+                if let Err(e) = crate::freeze::enable_detour("ar_compute_results", "autoresolve_hooks", target as usize, d) {
                     log!("failed to enable the auto-resolve hook: {e}");
                     return;
                 }
-                let _ = COMPUTE_HOOK.set(d);
                 COMPUTE_TARGET.store(target as usize, std::sync::atomic::Ordering::SeqCst);
-                crate::crash::hook_installed("ar_compute_results", "autoresolve_hooks", target as usize);
                 log!("auto-resolve hook installed");
             }
             Err(e) => log!("failed to create the auto-resolve hook: {e}"),

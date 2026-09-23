@@ -268,12 +268,11 @@ pub fn install(t: &Table) {
                 // stored before it is enabled: the detour must never run without its trampoline
                 let _ = HOOK.set(d);
                 let Some(d) = HOOK.get() else { return };
-                if let Err(e) = crate::freeze::with_threads_frozen(target as usize, 16, || d.enable()) {
+                if let Err(e) = crate::freeze::enable_detour("finance_update_income", "horde_income", target as usize, d) {
                     log!("failed to enable the horde income hook: {e}");
                     return;
                 }
                 INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::crash::hook_installed("finance_update_income", "horde_income", target as usize);
                 log!("horde income hook installed");
             }
             Err(e) => log!("failed to create the horde income hook: {e}"),

@@ -58,6 +58,16 @@ function se.available(name)
 	return type(G(name)) == "function"
 end
 
+-- se.status() -> { state = "ready"|"booting"|"refused"|"not_game", version = "<dll>.<sync>",
+-- patches = n }. The same values the DLL exports to other native mods (se_status / se_version).
+function se.status()
+	local f = G("se_status")
+	if type(f) ~= "function" then return { state = "unknown", version = se.version(), patches = 0 } end
+	local st, v, n = f()
+	local names = { [0] = "booting", [1] = "ready", [2] = "refused", [3] = "not_game" }
+	return { state = names[st] or tostring(st), version = v, patches = n }
+end
+
 local function need(...)
 	for _, n in ipairs({ ... }) do
 		if type(G(n)) ~= "function" then return false, "native " .. n .. " is not available (DLL too old or not injected)" end
@@ -82,9 +92,16 @@ local function on_model(what, f, cb)
 	-- script runs everywhere, so the call is executed. Outside of one (UI clicks, the console,
 	-- timers) only this machine would change its model, so the call is refused instead of
 	-- being queued (wait_for_model_sp is single-player only).
-	local ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
+	-- cm:is_multiplayer() is a value the campaign manager stashes on WorldCreated and reads false
+	-- before it, so the model is asked first; if neither answers, the machine is treated as MP
+	-- (refuse rather than queue on one peer).
+	local ok_mp, mp = pcall(function() return cm:query_model():is_multiplayer() end)
+	if not ok_mp or type(mp) ~= "boolean" then
+		ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
+		if not ok_mp or type(mp) ~= "boolean" then mp = true end
+	end
 	local ok_can, can = pcall(function() return cm:can_modify() end)
-	if ok_mp and mp == true and not (ok_can and can == true) then
+	if mp == true and not (ok_can and can == true) then
 		return false, "refused in multiplayer: " .. what .. " was called outside a model callback (it would only run on this machine and desync)"
 	end
 	if ok_can and can == true then

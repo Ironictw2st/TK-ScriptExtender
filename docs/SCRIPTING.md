@@ -28,7 +28,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
-| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20) |
+| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock |
 
 ---
 
@@ -59,7 +59,10 @@ change at the same model tick. The API follows three rules so that it can be use
    from a UI click, a timer or the in-game console it returns
    `false, "refused in multiplayer: ... called outside a model callback ..."` instead of being
    queued: only that machine would change its model and the game would desync. In single player
-   such calls are still queued through `cm:wait_for_model_sp`.
+   such calls are still queued through `cm:wait_for_model_sp`. Since 0.42.0-beta.4 "multiplayer"
+   is asked from the model (`cm:query_model():is_multiplayer()`) first, because
+   `cm:is_multiplayer()` reads false until WorldCreated; when neither answers, the call is
+   treated as multiplayer and refused.
 2. **Nothing a synced script does may depend on which machine it runs on.** Do not branch on
    `cm:get_local_faction()` or on `ctx.*.is_local_player` in code that ends in a modify call;
    use `is_human` and faction keys. The auto-resolve handler is called for every battle with a
@@ -68,16 +71,25 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of the nine settings that can
+   it always ends up containing the DLL version and a fingerprint of the ten settings that can
    change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
    `horde_income`, `horde_income_category`, `ai_recruit_hook`, `followup_hooks`,
-   `marriage_inlaws` and `marriage_blood_generations`
+   `marriage_inlaws`, `marriage_blood_generations` and `save_chunking`
    (`script_extender.cfg` text may use `{version}`
-   and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
+   and `{sync}`; text without both gets ` [se <version>.<sync>]` appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
    DLL, with another DLL version or with different hook settings shows a different build and
    cannot join. This relies on the lobby's version check using that string: **not verified on
    two machines yet.**
+
+**Two ways a change reaches every machine.** (a) *Replicated local change*: the same model
+callback runs on every peer with the same arguments and each changes its own model once. This
+is the `se.modify.*` contract; do not wrap such a call in an "only the owning player" check.
+(b) *Command submission*: one client submits one engine command, which the engine orders and
+runs on every peer (the MEDIATE PEACE repair, `se.ui.fix_followup_button`, works this way). Never
+submit such a command from every peer. Decide which of the two a feature uses before writing it;
+a UI button that should change the model has to go through (b) or a synchronised event, never
+call `se.modify.*` straight from the click.
 
 Session-only state (auto-resolver variables, redefined bundles, income lines, emperor policy)
 has to be re-applied by the mod after loading, from a callback that runs on every machine.
@@ -103,6 +115,28 @@ end
 - `se.available(native_name)` -> `true` when that native exists in this Lua state. Use it to
   feature-gate against older DLL builds. Native names per feature are listed with each function
   below.
+- `se.status()` (0.42.0-beta.4) -> `{ state, version, patches }`: see §3.0.
+
+### Coexisting with other native mods
+
+The DLL patches only process memory and checks the first bytes of every engine function it
+uses. Since 0.42.0-beta.4 it no longer anchors functions it does not use, so a mod that detours
+one of those (ThreeKingdoms-Coop hooks RVA `0x1457760`) no longer stops it from starting.
+When a check still fails, the log says which function and whether its first bytes look like
+another mod's detour, and the DLL stays inert.
+
+Other native mods can ask whether the extender is up, without relying on load order:
+
+| Export (`script_extender.dll`) | Returns |
+|---|---|
+| `uint32_t se_status(void)` | 0 booting, 1 ready, 2 refused (unknown exe or anchor mismatch), 3 not the game |
+| `const char* se_version(void)` | `"<dll version>.<sync tag>"`, the pair the build string carries |
+
+`se_inventory.json` next to the DLL lists the exe fingerprint, every anchor read (name, RVA,
+bytes, ok), every patch the DLL wrote (name, cfg switch, RVA, patched length, bytes before and
+after) and the registered natives. It is written when the bootstrap ends and again after the
+first Lua state has been set up. Comparing it with another mod's list of writes shows
+write/write and write/anchor collisions before a game is played.
 
 ### Setup lines every script needs
 
@@ -234,9 +268,20 @@ DLL version string. Since 0.8 (returns `"unknown (DLL older than 0.8)"` on earli
 #### `se.available(native_name) -> boolean`
 True when the given `se_*` native exists in this Lua state.
 
+#### `se.status() -> { state, version, patches }`
+`state` is `"ready"`, `"booting"`, `"refused"`, `"not_game"` (or `"unknown"` on DLLs older than
+0.42.0-beta.4); `version` is `"<dll>.<sync>"`; `patches` is the number of code patches the
+DLL wrote. Since 0.42.0-beta.4. Native: `se_status`.
+
+```lua
+local st = se.status()
+ModLog("script extender " .. st.version .. " " .. st.state .. ", " .. tostring(st.patches) .. " patches")
+```
+
 #### `se.on_model(tag, f [, cb]) -> ok, message`
 Run `f` on the model thread (see §1). `f` returns `ok, message`. `cb(ok, msg)` is optional.
-Refuses in multiplayer.
+Refused in multiplayer outside a model callback; "multiplayer" comes from
+`cm:query_model():is_multiplayer()` first (0.42.0-beta.4), and is assumed when unreadable.
 
 #### `se.log(s)`
 Log through `se.logger` / `ModLog` / `se_log`, prefixed `[se] `.
