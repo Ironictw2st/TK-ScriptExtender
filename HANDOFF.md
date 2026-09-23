@@ -184,6 +184,14 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   `tools/dump_crash.py` reads the fault-time context from a minidump (the thread's own context in
   the dump is the dump writer's). Release builds ship `script_extender.pdb`. Manager notes: surface
   `se_crash.txt` from the DLL folder in a bug report; the cfg writer must keep unknown keys.
+- 0.42.0-beta.2 (2026-09-22): **save chunking** (se_api.lua, automatic, cfg `save_chunking`,
+  default on, not in the sync tag). The engine keeps at most ~64 KiB of one saved string and
+  `cm.saved_values` is saved as one string, so large campaigns lost every mod's saved values on the
+  next load. `campaign_manager:save_named_value` / `load_named_value` are wrapped on the class (at
+  se_api load, or as soon as the class and its methods are defined, via temporary metatables):
+  values above 60,000 bytes go to `<name>__se_<i>` entries plus a `--se_chunks:<n>:<len>` marker.
+  Chunked saves need the DLL to load their big values. `se.saves.info()`; offline test
+  `tools/test_save_chunking.py` (real vanilla lib_campaign_manager under lupa 5.1).
 
 ## 7. When the game updates
 

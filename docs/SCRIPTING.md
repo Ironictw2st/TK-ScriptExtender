@@ -28,7 +28,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
-| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down |
+| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19) |
 
 ---
 
@@ -1389,6 +1389,29 @@ Narrowing a crash down: every hook group has a cfg switch (`autoresolve_hooks`, 
 the `se_crash.txt` of each. The first two and the two `*_hook(s)` switches are part of the
 multiplayer version lock.
 
+### 3.19 Saved values larger than 64 KiB
+
+Since 0.42.0-beta.2. Automatic, nothing to call. The engine keeps at most about 65,536 bytes of
+one saved string, and the campaign manager writes the whole `cm.saved_values` store as one string.
+Once a campaign's saved values grow past that, the save holds a cut string, and on the next load
+every mod's saved values reset at once. With the DLL, `cm:save_named_value` and
+`cm:load_named_value` split any string or table that serialises above 60,000 bytes into numbered
+savegame entries (`<name>__se_1`, `<name>__se_2`, ...) plus a marker in its own entry, and join
+them again on load. That covers `saved_values` and every mod's own named values. Values below the
+limit are saved exactly as before, and saves made without the DLL load as before.
+
+A save written with chunking must be loaded with the DLL: without it, a chunked value loads as
+empty, which is the same reset that would have happened anyway. `save_chunking=0` in
+`script_extender.cfg` turns it off.
+
+```lua
+local t = se.saves.info()   -- { installed, enabled, path, chunked_saves, chunked_loads, last_name, last_len }
+```
+
+- `se.saves.info() -> table`: `installed` (the campaign manager's save and load functions are
+  wrapped in this Lua state), `enabled` (the cfg switch), `chunked_saves` / `chunked_loads` this
+  session, `last_name` / `last_len` of the last chunked value.
+
 ---
 
 ## 4. Recipes
@@ -1700,6 +1723,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `diag_crash` | `1` | crash reporter (§3.18): `0` off, `1` `se_crash.txt` on a fault, `2` also the activity trace `se_activity.txt` |
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
+| `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 
 **Seven of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,
@@ -2003,6 +2027,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.query.unit_quality(unit_key)` | the campaign AI's quality rows for a unit, and the best of them |
 | `se.query.world_leaders()` | faction keys holding an emperor seat |
 | `se.region(key)` | checked cm:query_region |
+| `se.saves.info()` | save chunking state (saved values above 64 KiB) |
 | `se.version()` | DLL version string |
 
 ### Values the module reads from you, and its own state

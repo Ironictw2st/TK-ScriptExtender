@@ -197,7 +197,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "build_number", "build_number_short", "build_modified",
     "autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_hook", "followup_hooks",
     "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
-    "diag_diplomacy", "diag_crash",
+    "diag_diplomacy", "diag_crash", "save_chunking",
 ];
 
 /// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns

@@ -2444,4 +2444,162 @@ function se.ai_recruit.disable()
 	return true
 end
 
+----------------------------------------------------------------------------------------------
+-- save chunking (DLL 0.42+): saved strings above the engine's 64 KiB cap
+----------------------------------------------------------------------------------------------
+-- context:save_string() keeps at most ~65,536 bytes. cm:saving_game writes the whole
+-- cm.saved_values store as ONE string, so once it grows past the cap the save holds a cut string,
+-- loadstring fails on the next load and load_values_from_string throws every mod's saved values
+-- away. Here campaign_manager:save_named_value / load_named_value are wrapped: a string or table
+-- that serialises above CHUNK bytes is written as numbered slots "<name>__se_<i>" plus a marker
+-- "--se_chunks:<n>:<len>" in its own slot, and joined again on load. Old saves carry no marker and
+-- load as before. Without the DLL a chunked value loads as empty (the same wipe as before).
+-- Installed automatically whenever the campaign manager class appears in this state;
+-- script_extender.cfg save_chunking=0 turns it off.
+
+se.saves = se.saves or {}
+local SV = se._saves or { installed = false, path = "not installed", chunked_saves = 0, chunked_loads = 0, last_name = "", last_len = 0, logged = {} }
+se._saves = SV
+local CHUNK = 60000
+local MARK = "--se_chunks:"
+
+local function chunking_on()
+	local f = G("se_save_chunking")
+	if type(f) ~= "function" then return true end
+	local ok, on = pcall(f)
+	return not ok or on ~= false
+end
+
+local function wrap_save(orig)
+	return function(self, name, value, ...)
+		if type(name) == "string" and (type(value) == "string" or type(value) == "table") and self.context and chunking_on() then
+			local s = value
+			if type(value) == "table" then
+				local ok, r = pcall(self.get_table_save_state, self, value)
+				s = ok and r or nil
+			end
+			if type(s) == "string" and #s > CHUNK then
+				local n = math.ceil(#s / CHUNK)
+				for i = 1, n do
+					orig(self, name .. "__se_" .. i, string.sub(s, (i - 1) * CHUNK + 1, i * CHUNK))
+				end
+				orig(self, name, MARK .. n .. ":" .. #s)
+				SV.chunked_saves = SV.chunked_saves + 1
+				SV.last_name, SV.last_len = name, #s
+				if not SV.logged[name] then
+					SV.logged[name] = true
+					log("save chunking: " .. name .. " " .. #s .. " bytes saved in " .. n .. " chunks")
+				end
+				return true
+			end
+		end
+		return orig(self, name, value, ...)
+	end
+end
+
+local function wrap_load(orig)
+	return function(self, name, default, ...)
+		if type(name) == "string" and (type(default) == "string" or type(default) == "table") and self.context then
+			local okr, raw = pcall(function() return self.context:load_string(name) end)
+			if okr and type(raw) == "string" and string.sub(raw, 1, #MARK) == MARK then
+				local n, len = string.match(raw, "^%-%-se_chunks:(%d+):(%d+)")
+				n, len = tonumber(n), tonumber(len)
+				local parts = {}
+				for i = 1, (n or 0) do
+					local okc, c = pcall(function() return self.context:load_string(name .. "__se_" .. i) end)
+					parts[i] = (okc and type(c) == "string") and c or ""
+				end
+				local s = table.concat(parts)
+				if not n or #s ~= len then
+					log("save chunking: " .. name .. " is chunked but incomplete (" .. #s .. " of " .. tostring(len) .. " bytes); using the default")
+					return default
+				end
+				SV.chunked_loads = SV.chunked_loads + 1
+				SV.last_name, SV.last_len = name, len
+				log("save chunking: " .. name .. " " .. len .. " bytes loaded from " .. n .. " chunks")
+				if type(default) == "string" then return s end
+				local f = loadstring(s)
+				if type(f) == "function" then
+					local okt, t = pcall(f)
+					if okt and type(t) == "table" then return t end
+				end
+				log("save chunking: " .. name .. " joined but did not convert into a table; using the default")
+				return default
+			end
+		end
+		return orig(self, name, default, ...)
+	end
+end
+
+-- Wrap one method as it appears; true once both are wrapped.
+local function wrap_class(class)
+	if rawget(class, "__se_chunking") then return true end
+	local s, l = rawget(class, "save_named_value"), rawget(class, "load_named_value")
+	if type(s) ~= "function" or type(l) ~= "function" then return false end
+	rawset(class, "save_named_value", wrap_save(s))
+	rawset(class, "load_named_value", wrap_load(l))
+	rawset(class, "__se_chunking", true)
+	SV.installed = true
+	log("save chunking installed (" .. SV.path .. ")")
+	return true
+end
+
+-- The class exists but its methods are still being defined: catch their definition.
+local function watch_class(class)
+	if wrap_class(class) then return end
+	if getmetatable(class) ~= nil then
+		SV.path = "not installed: the campaign manager class already has a metatable"
+		log("save chunking: " .. SV.path)
+		return
+	end
+	local mt = {}
+	mt.__newindex = function(t, k, v)
+		rawset(t, k, v)
+		if (k == "save_named_value" or k == "load_named_value") and wrap_class(t) and getmetatable(t) == mt then
+			setmetatable(t, nil)
+		end
+	end
+	setmetatable(class, mt)
+end
+
+function se.saves.install()
+	if SV.installed then return true, SV.path end
+	local class = G("campaign_manager")
+	if type(class) == "table" then
+		SV.path = "class present at load"
+		watch_class(class)
+		return SV.installed, SV.path
+	end
+	-- No class yet: watch the state's globals for its assignment.
+	if type(ENV) ~= "table" or rawget(ENV, "__se_chunking_watch") then return false, "waiting for the campaign manager" end
+	local prev = getmetatable(ENV)
+	local prev_newindex = type(prev) == "table" and prev.__newindex or nil
+	local mt = {}
+	if type(prev) == "table" then for k, v in pairs(prev) do mt[k] = v end end
+	mt.__newindex = function(t, k, v)
+		if prev_newindex then
+			if type(prev_newindex) == "function" then prev_newindex(t, k, v) else prev_newindex[k] = v end
+		else
+			rawset(t, k, v)
+		end
+		if k == "campaign_manager" and type(v) == "table" then
+			if getmetatable(t) == mt then setmetatable(t, prev) end
+			rawset(t, "__se_chunking_watch", nil)
+			SV.path = "class defined after load"
+			watch_class(v)
+		end
+	end
+	rawset(ENV, "__se_chunking_watch", true)
+	setmetatable(ENV, mt)
+	return false, "waiting for the campaign manager"
+end
+
+-- se.saves.info() -> { installed, path, chunked_saves, chunked_loads, last_name, last_len, enabled }
+function se.saves.info()
+	return { installed = SV.installed, path = SV.path, chunked_saves = SV.chunked_saves, chunked_loads = SV.chunked_loads,
+		last_name = SV.last_name, last_len = SV.last_len, enabled = chunking_on() }
+end
+
+pcall(se.saves.install)
+
 log("se_api loaded (dll " .. se.version() .. ")")

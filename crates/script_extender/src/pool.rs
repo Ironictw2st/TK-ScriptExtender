@@ -39,6 +39,7 @@ pub fn init(t: &Table) {
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ping", se_ping);
     lua::set_global_fn(l, "se_version", se_version);
+    lua::set_global_fn(l, "se_save_chunking", se_save_chunking);
     lua::set_global_fn(l, "se_log", se_log);
     lua::set_global_fn(l, "se_char_info", se_char_info);
     lua::set_global_fn(l, "se_release_to_pool", se_release_to_pool);
@@ -223,6 +224,14 @@ unsafe extern "C" fn se_log(l: *mut LuaState) -> c_int {
 /// se_version() -> "0.9.0"
 unsafe extern "C" fn se_version(l: *mut LuaState) -> c_int {
     lua::push_str(l, env!("CARGO_PKG_VERSION"));
+    1
+}
+
+/// se_save_chunking() -> bool : script_extender.cfg `save_chunking` (default on). se_api.lua splits
+/// saved strings above the engine's 64 KiB cap into chunks only while this is true.
+unsafe extern "C" fn se_save_chunking(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    (api.pushboolean)(l, crate::build::hook_enabled("save_chunking") as c_int);
     1
 }
 
