@@ -21,7 +21,7 @@ A native DLL injected into the running `Three_Kingdoms.exe` that:
    `se.modify.*` API (`src/hook.rs`);
 3. exposes named, high-level operations only (no generic peek/poke/call to Lua).
 
-**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (lobby check not yet verified on two machines). The manager must give both players the same DLL version and the same simulation cfg values (the ten sync-tag keys listed in docs/SCRIPTING.md §1).
+**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (verified on two machines 2026-09-23 with 0.42.0-beta.4: same DLL version joins, a different version is declined; a same-version / different-settings pair has not been tried). The manager must give both players the same DLL version and the same simulation cfg values (the ten sync-tag keys listed in docs/SCRIPTING.md §1).
 Other native mods (ThreeKingdoms-Coop) can query the DLL through its exports `se_status()` /
 `se_version()` and read `se_inventory.json` next to it (anchors read, patches written); see
 docs/SCRIPTING.md "Coexisting with other native mods".

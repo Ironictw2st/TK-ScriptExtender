@@ -79,8 +79,9 @@ change at the same model tick. The API follows three rules so that it can be use
    and `{sync}`; text without both gets ` [se <version>.<sync>]` appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
    DLL, with another DLL version or with different hook settings shows a different build and
-   cannot join. This relies on the lobby's version check using that string: **not verified on
-   two machines yet.**
+   cannot join. The lobby's version check does use that string: **verified on two machines
+   (2026-09-23, 0.42.0-beta.4): the same DLL version joins, a different version is declined.**
+   A pair with the same version but different settings has not been tried.
 
 **Two ways a change reaches every machine.** (a) *Replicated local change*: the same model
 callback runs on every peer with the same arguments and each changes its own model once. This
