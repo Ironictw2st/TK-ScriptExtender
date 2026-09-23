@@ -2594,6 +2594,20 @@ function se.saves.install()
 	return false, "waiting for the campaign manager"
 end
 
+-- se.query.marriage_hook() -> { installed, generations, verdicts, searches, blood_blocked, may_marry } | nil, message
+--   DLL 0.42.0-beta.3+: relatives by marriage may marry (script_extender.cfg marriage_inlaws,
+--   marriage_blood_generations). verdicts = pair checks the engine made, searches = relatedness
+--   searches answered by the DLL, blood_blocked = pairs refused as blood relatives within the
+--   configured generations, may_marry = pairs the engine accepted.
+function se.query.marriage_hook()
+	local okn, err = need("se_marriage_stats")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in str(se_marriage_stats()):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) or v end
+	t.installed = t.installed == 1
+	return t
+end
+
 -- se.saves.info() -> { installed, path, chunked_saves, chunked_loads, last_name, last_len, enabled }
 function se.saves.info()
 	return { installed = SV.installed, path = SV.path, chunked_saves = SV.chunked_saves, chunked_loads = SV.chunked_loads,

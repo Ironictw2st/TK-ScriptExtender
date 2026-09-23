@@ -192,6 +192,14 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   values above 60,000 bytes go to `<name>__se_<i>` entries plus a `--se_chunks:<n>:<len>` marker.
   Chunked saves need the DLL to load their big values. `se.saves.info()`; offline test
   `tools/test_save_chunking.py` (real vanilla lib_campaign_manager under lupa 5.1).
+- 0.42.0-beta.3 (2026-09-23): **relatives by marriage may marry** (`marriage.rs`, cfg
+  `marriage_inlaws` default 1 and `marriage_blood_generations` default 0, **both in the sync tag:
+  nine keys now**). The marriage verdict FUN_14141e7e0 refused any pair joined by a chain of
+  family links (FUN_1413d4c20: father / mother / spouse / +0x50 / children, unbounded), so one
+  marriage between two houses blocked every further one. Detours on both: while the verdict runs
+  on the thread, the relatedness search answers "related" only for a shared blood ancestor within
+  N generations; the verdict's close-kin test still applies. Distant-relative status and every
+  other use of the search are unchanged. `se.query.marriage_hook()`; notes/family.md.
 
 ## 7. When the game updates
 

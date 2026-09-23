@@ -185,10 +185,12 @@ pub fn sync_tag() -> String {
     feed(if income_on { "1" } else { "0" });
     feed("horde_income_category");
     feed(&income_category.to_string());
-    for key in ["ai_recruit_hook", "followup_hooks"] {
+    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws"] {
         feed(key);
         feed(if hook_enabled(key) { "1" } else { "0" });
     }
+    feed("marriage_blood_generations");
+    feed(&crate::marriage::generations().to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
 }
 
@@ -196,6 +198,7 @@ pub fn sync_tag() -> String {
 pub const KNOWN_KEYS: &[&str] = &[
     "build_number", "build_number_short", "build_modified",
     "autoresolve_hooks", "horde_income", "horde_income_category", "ai_recruit_hook", "followup_hooks",
+    "marriage_inlaws", "marriage_blood_generations",
     "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
     "diag_diplomacy", "diag_crash", "save_chunking",
 ];

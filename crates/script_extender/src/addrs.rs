@@ -176,6 +176,10 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // object (registry = *(*(*(cai_faction+0xc0)+0xd8)+0xa70)); FUN_141d56520(component, cai_faction)
     ("cai_personality_by_record", 0x1d3e390, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74]),
     ("cai_apply_component", 0x1d56520, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x83, 0x79]),
+    // notes/family.md: marriage verdict FUN_14141e7e0(family_mgr, famA, famB, mode) -> 0x22 = may
+    // marry, 1 = related (FUN_1413d4c20 found a path over father / mother / spouse / +0x50 / children)
+    ("marriage_verdict", 0x141e7e0, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c]),
+    ("family_related", 0x13d4c20, [0x48, 0x8b, 0xc4, 0x55, 0x56, 0x48, 0x8d, 0x68]),
 ];
 
 /// Vtables live in .rdata and hold relocated pointers, so they are verified by the RVA of

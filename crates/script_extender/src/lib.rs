@@ -40,6 +40,7 @@ mod profiler;
 mod bundles;
 mod diplomacy;
 mod crash;
+mod marriage;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
 
@@ -115,6 +116,8 @@ fn bootstrap() {
     diag::install(&table);
     crash::boot("followup");
     followup::install(&table);
+    crash::boot("marriage");
+    marriage::install(&table);
     crash::boot("hook");
     hook::install(&table);
     crash::boot("complete");

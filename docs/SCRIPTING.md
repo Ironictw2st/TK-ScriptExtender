@@ -28,7 +28,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
-| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19) |
+| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20) |
 
 ---
 
@@ -68,9 +68,10 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of the seven settings that can
+   it always ends up containing the DLL version and a fingerprint of the nine settings that can
    change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
-   `horde_income`, `horde_income_category`, `ai_recruit_hook` and `followup_hooks`
+   `horde_income`, `horde_income_category`, `ai_recruit_hook`, `followup_hooks`,
+   `marriage_inlaws` and `marriage_blood_generations`
    (`script_extender.cfg` text may use `{version}`
    and `{sync}`; otherwise ` [se <version>.<sync>]` is appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
@@ -1412,6 +1413,34 @@ local t = se.saves.info()   -- { installed, enabled, path, chunked_saves, chunke
   wrapped in this Lua state), `enabled` (the cfg switch), `chunked_saves` / `chunked_loads` this
   session, `last_name` / `last_len` of the last chunked value.
 
+### 3.20 Relatives by marriage may marry
+
+Since 0.42.0-beta.3. Automatic, nothing to call. The engine refuses a marriage between two
+characters whenever any chain of family links joins them, and that chain includes marriages. So
+after one marriage between two houses (Sun Jian's and Cao Cao's, say), every member of one family
+counts as related to every member of the other, and diplomacy says "There exist no two characters
+in these factions who can be married", although history has several marriages between the same
+houses.
+
+With the DLL, the marriage check alone ignores links through marriage: two characters are related
+for marriage purposes only if they share a blood ancestor within `marriage_blood_generations`
+generations (default 0: this test never blocks). The engine's own close-kin rule still applies on
+top, so parents, children, siblings and grandparents can never marry. Nothing else changes: the
+characters keep their distant-relative status and icon, family trees, faction-leader family
+membership and every other use of the family links behave as before. Both diplomacy marriages and
+the family-tree Marry actions follow the new rule, for the player and the AI.
+
+`marriage_inlaws=0` restores the engine's rule. Both keys are part of the multiplayer version lock.
+
+```lua
+local t = se.query.marriage_hook()   -- { installed, generations, verdicts, searches, blood_blocked, may_marry }
+```
+
+- `se.query.marriage_hook() -> table | nil, message`: `installed`, `generations` (the cfg value),
+  `verdicts` (pair checks the engine made), `searches` (relatedness answers given by the DLL),
+  `blood_blocked` (pairs refused as blood relatives within `generations`), `may_marry` (pairs the
+  engine accepted), all since injection.
+
 ---
 
 ## 4. Recipes
@@ -1724,10 +1753,12 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
+| `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
+| `marriage_blood_generations` | `0` | with `marriage_inlaws=1`: blood relatives sharing an ancestor within this many generations may not marry (0..6; 0 = only the engine's close-kin rule) |
 
-**Seven of them are part of the multiplayer version lock** — `autoresolve_hooks`,
+**Nine of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,
-`ai_recruit_hook` and `followup_hooks`. The DLL
+`ai_recruit_hook`, `followup_hooks`, `marriage_inlaws` and `marriage_blood_generations`. The DLL
 hashes their *effective* values into the build string, so an absent key and an explicitly written
 default give the same tag, but two players with different values cannot join each other (§1).
 
@@ -2015,6 +2046,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.query.faction_income(faction)` | script-side income lines and their total |
 | `se.query.faction_potential(key)` | potential value, base, bonus, roll |
 | `se.query.faction_xp_gain_percent(key)` | faction character-experience-gain percentage |
+| `se.query.marriage_hook()` | marriage hook state and counters (relatives by marriage) |
 | `se.query.horde_income_hook()` | whether the horde income hook is installed, and its income category |
 | `se.query.pending_battle()` | full pending-battle context incl. prediction |
 | `se.query.perf()` | counters of the DLL's caches and file probes |
