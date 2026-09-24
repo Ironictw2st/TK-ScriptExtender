@@ -33,6 +33,8 @@
 //!     the pending battle object that exists when it is set; the hook ignores every other battle
 //!   se_ar_recompute(q_faction) -> ok, msg   re-run the engine's compute routine for the current
 //!     pending battle so that the panel shows the planned outcome
+//!   se_duel_bonus_set("cqi:bonus|...") -> ok, msg   merge per-character duel power bonuses (0
+//!     removes); se_duel_bonus_clear() -> ok, msg; se_duel_bonus_info() -> "installed=1;entries=n"
 //!
 //! Result layout used by the hook (mapped live, 2026-09-18): alliance summary (0x68) = {+0 vector
 //! of INLINE army records, +0x10 men before, +0x18 men after, +0x20 men lost, +0x28 kills,
@@ -89,6 +91,9 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_ar_plan_get", se_ar_plan_get);
     lua::set_global_fn(l, "se_ar_plan_clear", se_ar_plan_clear);
     lua::set_global_fn(l, "se_ar_recompute", se_ar_recompute);
+    lua::set_global_fn(l, "se_duel_bonus_set", se_duel_bonus_set);
+    lua::set_global_fn(l, "se_duel_bonus_clear", se_duel_bonus_clear);
+    lua::set_global_fn(l, "se_duel_bonus_info", se_duel_bonus_info);
 }
 
 extern "system" {
@@ -720,6 +725,114 @@ unsafe fn apply_duels(pb: usize, res: usize, spec: &str) -> Result<String, Strin
     Ok(format!("duels {before} -> {}: {}", rd(res + 0x2c), report.join(", ")))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Duel power bonus (0.42). FUN_142264ad0(ctx, army, out) appends one side's candidates to `out`
+// {u32 cap, u32 count, data} as 16-byte entries {unit, i32 power, i32 unscaled}. power =
+// int(melee + missile) of FUN_141f48100: main_units melee_cp / missile_cp + rank bonus
+// (unit_stats_land_experience_bonuses) + top 10 special abilities' additional_*_cp weighted
+// 1.0 .. 0.1 (tweakers "Special Ability Max Count (CP)" / special_ability_cp_lowest_multiplier),
+// times a count-weighted condition average, plus banner adjustments; CEOs are never read. The
+// verdict in FUN_14226f320 uses only +8, so a bonus added here keeps the vanilla rules (stronger
+// wins, attacker on a tie, |diff| > autoresolver_duel_refuse_variable -> refused). The bonuses are
+// pushed by script, keyed by character cqi (`*(*(unit+0x10)+0x42c)`, the cqi duel records carry).
+// ---------------------------------------------------------------------------------------------
+
+type DuelCandidates = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+static DUEL_HOOK: OnceLock<GenericDetour<DuelCandidates>> = OnceLock::new();
+static DUEL_HOOK_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DUEL_BONUS: Mutex<Option<HashMap<u32, i32>>> = Mutex::new(None);
+const DUEL_BONUS_LIMIT: i32 = 2000;
+
+unsafe extern "C" fn duel_candidates_detour(ctx: *mut c_void, army: *mut c_void, out: *mut c_void) {
+    let Some(hook) = DUEL_HOOK.get() else { return };
+    let _g = crate::crash::enter("ar_duel_candidates");
+    let o = out as usize;
+    let before = rd(o + 4) as usize;
+    hook.call(ctx, army, out);
+    let bonus = match DUEL_BONUS.lock() {
+        Ok(g) => match g.as_ref() { Some(m) if !m.is_empty() => m.clone(), _ => return },
+        Err(_) => return,
+    };
+    let (count, data) = (rd(o + 4) as usize, rq(o + 8));
+    if count < before || count > 256 || !readable(data, count * 16) { return; }
+    for k in before..count {
+        let e = data + k * 16;
+        let u = rq(rq(e) + 0x10);
+        if !readable(u, 0x430) { continue; }
+        let cqi = rd(u + 0x42c);
+        let Some(&b) = bonus.get(&cqi) else { continue };
+        let power = core::ptr::read_unaligned((e + 8) as *const i32);
+        let new = power.saturating_add(b);
+        core::ptr::write_unaligned((e + 8) as *mut i32, new);
+        log!("ar_duel_candidates: character {cqi} duel power {power} -> {new}");
+    }
+}
+
+fn parse_duel_bonus(spec: &str) -> Result<Vec<(u32, i32)>, String> {
+    spec.split('|').filter(|r| !r.trim().is_empty()).map(|row| {
+        let (c, b) = row.split_once(':').ok_or_else(|| format!("'{row}' is not cqi:bonus"))?;
+        let cqi = c.trim().parse::<f64>().map_err(|_| format!("bad cqi '{c}'"))?;
+        let bonus = b.trim().parse::<f64>().map_err(|_| format!("bad bonus '{b}'"))?;
+        if !(cqi >= 1.0 && cqi < 4.0e9) || !bonus.is_finite() { return Err(format!("'{row}' out of range")); }
+        let bonus = bonus.round().clamp(-DUEL_BONUS_LIMIT as f64, DUEL_BONUS_LIMIT as f64) as i32;
+        Ok((cqi as u32, bonus))
+    }).collect()
+}
+
+unsafe extern "C" fn se_duel_bonus_set(l: *mut LuaState) -> c_int {
+    let spec = lua::to_str(l, 1);
+    let r: Result<String, String> = (|| {
+        if !DUEL_HOOK_ON.load(std::sync::atomic::Ordering::SeqCst) { return Err("the duel power hook is not installed".into()); }
+        if spec.len() > 65536 { return Err("bonus list is too long".into()); }
+        let rows = parse_duel_bonus(&spec)?;
+        let mut g = DUEL_BONUS.lock().map_err(|_| "state lock poisoned")?;
+        let map = g.get_or_insert_with(HashMap::new);
+        for (cqi, b) in &rows {
+            if *b == 0 { map.remove(cqi); } else { map.insert(*cqi, *b); }
+        }
+        Ok(format!("{} duel power bonuses merged, {} stored", rows.len(), map.len()))
+    })();
+    bool_result(l, r, "se_duel_bonus_set")
+}
+
+unsafe extern "C" fn se_duel_bonus_clear(l: *mut LuaState) -> c_int {
+    let r: Result<String, String> = (|| {
+        let n = DUEL_BONUS.lock().map_err(|_| "state lock poisoned")?.take().map(|m| m.len()).unwrap_or(0);
+        Ok(format!("{n} duel power bonuses cleared"))
+    })();
+    bool_result(l, r, "se_duel_bonus_clear")
+}
+
+unsafe extern "C" fn se_duel_bonus_info(l: *mut LuaState) -> c_int {
+    let n = DUEL_BONUS.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
+    let on = DUEL_HOOK_ON.load(std::sync::atomic::Ordering::SeqCst);
+    lua::push_str(l, &format!("installed={};entries={n}", on as u8));
+    1
+}
+
+unsafe fn install_duel_hook(t: &Table) {
+    if !crate::build::hook_enabled("duel_power_hook") {
+        log!("duel power hook disabled by script_extender.cfg");
+        return;
+    }
+    let target: DuelCandidates = core::mem::transmute(t.get("ar_duel_candidates"));
+    // SAFETY: anchor-verified prologue (push rdi/r12/r14/r15, sub rsp,0x38): no RIP-relative
+    // instruction in the relocated bytes.
+    match GenericDetour::new(target, duel_candidates_detour) {
+        Ok(d) => {
+            let _ = DUEL_HOOK.set(d);
+            let Some(d) = DUEL_HOOK.get() else { return };
+            if let Err(e) = crate::freeze::enable_detour("ar_duel_candidates", "duel_power_hook", target as usize, d) {
+                log!("failed to enable the duel power hook: {e}");
+                return;
+            }
+            DUEL_HOOK_ON.store(true, std::sync::atomic::Ordering::SeqCst);
+            log!("duel power hook installed");
+        }
+        Err(e) => log!("failed to create the duel power hook: {e}"),
+    }
+}
+
 pub fn install_hooks(t: &Table) {
     let _ = ENGINE.set(unsafe {
         Engine {
@@ -751,5 +864,22 @@ pub fn install_hooks(t: &Table) {
             }
             Err(e) => log!("failed to create the auto-resolve hook: {e}"),
         }
+        install_duel_hook(t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duel_bonus;
+
+    #[test]
+    fn duel_bonus_spec() {
+        assert_eq!(parse_duel_bonus("101:125|202:-10").unwrap(), vec![(101, 125), (202, -10)]);
+        // Lua's float formatting, rounding and the clamp
+        assert_eq!(parse_duel_bonus("1.2345e+06:62.5|7:99999").unwrap(), vec![(1_234_500, 63), (7, 2000)]);
+        assert_eq!(parse_duel_bonus("").unwrap(), vec![]);
+        assert!(parse_duel_bonus("101").is_err());
+        assert!(parse_duel_bonus("0:5").is_err());
+        assert!(parse_duel_bonus("5:nan").is_err());
     }
 }

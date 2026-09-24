@@ -2,7 +2,7 @@
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
 (Steam build 25370317) unless marked otherwise. Current stable DLL: **0.41.0**, `Z:\RE\se_deploy\0.41.0\`; pre-release line 0.42.0-beta.N (latest
-0.42.0-beta.4, `Z:\RE\se_deploy\0.42.0-beta.4\`)
+0.42.0-beta.5, `Z:\RE\se_deploy\0.42.0-beta.5\`)
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -21,7 +21,7 @@ A native DLL injected into the running `Three_Kingdoms.exe` that:
    `se.modify.*` API (`src/hook.rs`);
 3. exposes named, high-level operations only (no generic peek/poke/call to Lua).
 
-**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (verified on two machines 2026-09-23 with 0.42.0-beta.4: same DLL version joins, a different version is declined; a same-version / different-settings pair has not been tried). The manager must give both players the same DLL version and the same simulation cfg values (the ten sync-tag keys listed in docs/SCRIPTING.md §1).
+**Multiplayer is supported from 0.30** under lockstep rules: in multiplayer `se.modify.*` only runs inside model callbacks (never queued), synced logic must not depend on the local machine, and the game build string is always version-locked (`[se <version>.<sync>]`, sync = fingerprint of the simulation-relevant cfg keys) so only identical script extenders can share a lobby (verified on two machines 2026-09-23 with 0.42.0-beta.4: same DLL version joins, a different version is declined; a same-version / different-settings pair has not been tried). The manager must give both players the same DLL version and the same simulation cfg values (the eleven sync-tag keys listed in docs/SCRIPTING.md §1).
 Other native mods (ThreeKingdoms-Coop) can query the DLL through its exports `se_status()` /
 `se_version()` and read `se_inventory.json` next to it (anchors read, patches written); see
 docs/SCRIPTING.md "Coexisting with other native mods".
@@ -102,6 +102,7 @@ a native is present. `se.version()` = DLL version.
 | Attitude (0.22, pending) | `attitude(a, b)` -> standing | `attitude(a, b, level)` level -3..3 = the engine's small/medium/large attitude events (values from DB) | FUN_141b965e0(mgr, A, B); FUN_141b7cf60(mgr, A, B, level) = the `diplomatic_attitude_change` payload; treaty-component bias not done |
 | Income lines (0.22, script-side) | `faction_income(key)` | `faction_income(key, amount, label)`, `se.load_income_lines()` after a load | paid at FactionTurnStart via increase_treasury; not in the engine breakdown; force-scoped gdp hook not done (region GDP code not reached) |
 | Auto-resolve (0.24 read + tunables + plan; 0.25 simulation hook; **0.26.2: plan.casualties and plan.winner applied and verified live**; plan.bias and plan.duels stored only) | `pending_battle()` -> context, `autoresolve_prediction()`, `autoresolver_variable(key)`, `autoresolver_variables()`, `autoresolve_plan()` | `autoresolver_variable(key, value)`, `autoresolver_variables_reset()`, `autoresolve_plan(plan)`, `autoresolve_plan_clear()`, `se.autoresolve.set_handler(fn(ctx) -> plan)` (PendingBattle listener, local player battles only) | campaign variables = f32[774] at `*(world+0x3b58)` indexed by descriptor index (descriptor array RVA 0x3e33520, stride 0x78, name at +0x68); PB = `*(world+0x3b80)`, prediction in result `(*(PB+0xd0+night*0x10))[*(PB+0xe8)]`, side block +0x7c/+0x64, +8 casualties, +0xc enum; notes/autoresolve.md |
+| Duel power (0.42.0-beta.5; cfg `duel_power_hook`, sync tag) | `duel_power_hook()` -> `{installed, entries}` | `duel_power_bonus({[cqi] = bonus})` (merge, 0 removes, ±2000), `duel_power_bonus_clear()` | detour on the duel candidate builder FUN_142264ad0 (RVA 0x2264ad0): each new 16-byte entry {unit, i32 power, i32} gets `+bonus` for cqi `*(*(unit+0x10)+0x42c)` before FUN_14226f320 decides (stronger wins, attacker on a tie, gap > 150 refused); table not saved; natives `se_duel_bonus_set/clear/info`; consumer: 190E pack "Duel CEO" |
 
 Raw natives (all `se_*` globals) are listed at the top of each `src/*.rs` file; treat them as
 internal. Test/console scripts for every feature live in
@@ -217,6 +218,14 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   drops the sync hash, and **`save_chunking` joins the sync tag (ten keys now)**. se_api.lua asks
   `cm:query_model():is_multiplayer()` first (`cm:is_multiplayer()` reads false before
   WorldCreated) and treats "unknown" as multiplayer; `tools/test_lua_mp_guard.py`.
+- 0.42.0-beta.5 (2026-09-24): **per-character auto-resolve duel power bonus**. New detour
+  `ar_duel_candidates` on FUN_142264ad0 (cfg `duel_power_hook`, default on, **joins the sync tag:
+  eleven keys**; skipped with `autoresolve_hooks=0`), natives `se_duel_bonus_set/clear/info`,
+  Lua `se.modify.duel_power_bonus/_clear`, `se.query.duel_power_hook`. The vanilla duel power
+  formula (melee_cp + missile_cp + rank + weighted ability CP, CEOs never read) is in
+  notes/autoresolve.md. First consumer: the 190E pack's MCT option "190E Duel CEO" (equipped
+  CEOs by category / rarity / item). Its MCT values are per machine: multiplayer players must
+  match them (owner's decision, exception to the lockstep rule 2).
 
 ## 7. When the game updates
 

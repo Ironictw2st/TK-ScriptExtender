@@ -115,6 +115,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // 0.25 auto-resolve: FUN_14185e030(pending_battle, night) builds the simulator, runs it
     // and appends the result to the pending battle (prediction and resolve both come here)
     ("ar_compute_results", 0x185e030, [0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41]),
+    // 0.42 duel power: FUN_142264ad0(ctx, army, out) appends one side's duel candidates
+    // {unit, i32 power, i32 unscaled} to `out` (called twice by the duel roll FUN_14226f320)
+    ("ar_duel_candidates", 0x2264ad0, [0x40, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57]),
     // 0.28 horde income: FUN_141451510(finance, category) recomputes one income category
     ("finance_update_income", 0x1451510, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
     // 0.32 UI recruit cache: FUN_141934b40 = recruitment interface vfunc +0x88 (build the list of

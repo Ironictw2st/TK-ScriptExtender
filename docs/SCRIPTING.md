@@ -28,7 +28,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
-| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock |
+| 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock; beta.5: per-character auto-resolve duel power bonus (`se.modify.duel_power_bonus`, §3.14, cfg `duel_power_hook`) |
 
 ---
 
@@ -71,10 +71,10 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of the ten settings that can
+   it always ends up containing the DLL version and a fingerprint of the eleven settings that can
    change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
    `horde_income`, `horde_income_category`, `ai_recruit_hook`, `followup_hooks`,
-   `marriage_inlaws`, `marriage_blood_generations` and `save_chunking`
+   `marriage_inlaws`, `marriage_blood_generations`, `save_chunking` and `duel_power_hook`
    (`script_extender.cfg` text may use `{version}`
    and `{sync}`; text without both gets ` [se <version>.<sync>]` appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
@@ -1109,6 +1109,39 @@ Branch on `is_human` and faction keys, and seed any chance from `ctx.seed`.
 
 Forget the handler and clear the stored plan. The listeners stay registered but do nothing.
 
+#### Duel power (DLL 0.42.0-beta.5+)
+
+An auto-resolved duel is decided by **duel power** alone: each hero's power is
+`int(melee + missile)`, built from the hero unit's `main_units.melee_cp` / `missile_cp`
+(about 165 for strategists up to 815 for Lu Bu), the rank bonus
+(`unit_stats_land_experience_bonuses`, +10 per level), the top ten special abilities'
+`additional_melee_cp` / `additional_missile_cp` (weighted 1.0, 0.9 … 0.1) and a condition
+factor. Once two duelists are paired, no dice are rolled: the stronger one wins, the attacker
+wins a tie, and a gap above `autoresolver_duel_refuse_variable` (150) means the duel is refused.
+Equipment (CEOs) is never read. The functions below add a per-character bonus to that power
+**before** the engine decides, so the vanilla rules still apply. The bonus works in every
+auto-resolve, AI battles included, and in both the panel prediction and the result on click.
+
+#### `se.modify.duel_power_bonus({ [character_cqi] = bonus, ... }) -> ok, message`
+
+Merge bonuses into the DLL's table: an entry stays until you change it, and a bonus of `0` removes
+it. Values are clamped to ±2000. The table is **not saved**, so set it again at the first tick of
+every load, and clear it first: it survives loading another save in the same session.
+It changes the simulation, so in multiplayer call it from model events only (first tick, turn
+start, `CharacterCeoEquipped`, `PendingBattle` …) with values that are the same on every machine.
+Outside a model callback it is refused in multiplayer and queued in single player. Refused when
+`script_extender.cfg` has `duel_power_hook=0` or `autoresolve_hooks=0`.
+
+#### `se.modify.duel_power_bonus_clear() -> ok, message`
+
+Empty the table.
+
+#### `se.query.duel_power_hook() -> { installed, entries } | nil, message`
+
+`installed` is false when the hook is switched off in `script_extender.cfg`; `entries` is the
+number of characters that have a bonus. Every adjusted duelist is logged
+(`ar_duel_candidates: character <cqi> duel power <old> -> <new>`).
+
 ---
 
 ### 3.15 Performance counters and the profiler
@@ -1702,6 +1735,45 @@ log("set_handler -> " .. tostring(ok) .. " : " .. tostring(msg))
 -- since 0.27; plan.bias is stored but never applied.
 ```
 
+### 4.7a Weapons and mounts count in auto-resolve duels
+
+The 190E script extender pack ships this as the MCT option "190E Duel CEO", with a bonus table
+you can edit. The core of it:
+
+```lua
+-- se_recipe_duel_ceo.lua : equipped items add duel power (first tick + equip events)
+local BONUS = { ["3k_main_ancillary_weapon_trident_halberd"] = 80, ["3k_main_ancillary_mount_red_hare"] = 40 }
+
+if type(se) ~= "table" or type(se.modify.duel_power_bonus) ~= "function" then return end
+se.logger = ModLog
+se.core = core
+
+local function bonus_of(character)
+    local sum, list = 0, character:ceo_management():all_ceos_equipped_on_character()
+    for i = 0, list:num_items() - 1 do sum = sum + (BONUS[list:item_at(i):ceo_data_key()] or 0) end
+    return sum
+end
+
+local function refresh(characters)
+    local map = {}
+    for i = 0, characters:num_items() - 1 do
+        local c = characters:item_at(i)
+        map[c:command_queue_index()] = bonus_of(c)     -- 0 removes a stale entry
+    end
+    se.modify.duel_power_bonus(map)
+end
+
+cm:add_first_tick_callback(function()
+    se.modify.duel_power_bonus_clear()                 -- the DLL table outlives a save load
+    local factions = cm:query_model():world():faction_list()
+    for i = 0, factions:num_items() - 1 do refresh(factions:item_at(i):character_list()) end
+end)
+core:add_listener("recipe_duel_ceo", "CharacterCeoEquipped", true, function(context)
+    local c = context:query_character()
+    se.modify.duel_power_bonus({ [c:command_queue_index()] = bonus_of(c) })
+end, true)
+```
+
 ### 4.8 A per-turn income line that survives loading
 
 ```lua
@@ -1801,10 +1873,12 @@ values optionally quoted; an unknown key is logged and ignored.
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
 | `marriage_blood_generations` | `0` | with `marriage_inlaws=1`: blood relatives sharing an ancestor within this many generations may not marry (0..6; 0 = only the engine's close-kin rule) |
+| `duel_power_hook` | `1` | per-character auto-resolve duel power bonus (§3.14); `0` = no hook (`se.modify.duel_power_bonus` refuses) |
 
-**Nine of them are part of the multiplayer version lock** — `autoresolve_hooks`,
+**Eleven of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,
-`ai_recruit_hook`, `followup_hooks`, `marriage_inlaws` and `marriage_blood_generations`. The DLL
+`ai_recruit_hook`, `followup_hooks`, `marriage_inlaws`, `marriage_blood_generations`,
+`save_chunking` and `duel_power_hook`. The DLL
 hashes their *effective* values into the build string, so an absent key and an explicitly written
 default give the same tag, but two players with different values cannot join each other (§1).
 

@@ -1665,6 +1665,44 @@ function se.autoresolve.clear_handler()
 	return se.modify.autoresolve_plan_clear()
 end
 
+-- se.modify.duel_power_bonus({ [character_cqi] = bonus, ... }) (DLL 0.42.0-beta.5+)
+--   Adds `bonus` to the character's auto-resolve duel power before the engine decides the duel
+--   (vanilla power = main_units melee_cp + missile_cp + rank + special abilities; stronger wins,
+--   a gap above autoresolver_duel_refuse_variable = refused). Entries are merged into the DLL's
+--   table and stay until changed; bonus 0 removes an entry; values are clamped to +-2000. Applies
+--   to every auto-resolve, AI battles included. Not saved: set it again after a load (first tick).
+function se.modify.duel_power_bonus(map)
+	local okn, err = need("se_duel_bonus_set")
+	if not okn then return false, err end
+	if type(map) ~= "table" then return false, "map must be a table { [cqi] = bonus }" end
+	local rows = {}
+	for cqi, bonus in pairs(map) do
+		local c, b = num(cqi), num(bonus)
+		if not c or not b then return false, "map entries must be numbers (got " .. str(cqi) .. " = " .. str(bonus) .. ")" end
+		rows[#rows + 1] = str(c) .. ":" .. str(b)
+	end
+	if #rows == 0 then return true, "nothing to set" end
+	local spec = table.concat(rows, "|")
+	return on_model("duel_power_bonus", function() return se_duel_bonus_set(spec) end)
+end
+
+function se.modify.duel_power_bonus_clear()
+	local okn, err = need("se_duel_bonus_clear")
+	if not okn then return false, err end
+	return on_model("duel_power_bonus_clear", function() return se_duel_bonus_clear() end)
+end
+
+-- se.query.duel_power_hook() -> { installed, entries } | nil, message
+--   installed = false when script_extender.cfg has duel_power_hook=0 (or autoresolve_hooks=0).
+function se.query.duel_power_hook()
+	local okn, err = need("se_duel_bonus_info")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in str(se_duel_bonus_info()):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) or v end
+	t.installed = t.installed == 1
+	return t
+end
+
 ----------------------------------------------------------------------------------------------
 -- diagnostics
 ----------------------------------------------------------------------------------------------
