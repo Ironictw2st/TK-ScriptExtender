@@ -29,6 +29,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.40 | stable release of everything above, horde income on by default |
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
 | 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock; beta.5: per-character auto-resolve duel power bonus (`se.modify.duel_power_bonus`, §3.14, cfg `duel_power_hook`) |
+| **0.43** | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings |
 
 ---
 
@@ -1139,8 +1140,64 @@ Empty the table.
 #### `se.query.duel_power_hook() -> { installed, entries } | nil, message`
 
 `installed` is false when the hook is switched off in `script_extender.cfg`; `entries` is the
-number of characters that have a bonus. Every adjusted duelist is logged
-(`ar_duel_candidates: character <cqi> duel power <old> -> <new>`).
+number of characters that have a bonus; `formula` (0.43+) is true while a stats formula is
+active. Every adjusted duelist is logged
+(`ar_duel_candidates: character <cqi> duel power vanilla <old> -> <new> [breakdown]`).
+
+#### `se.modify.duel_power_formula(f) -> ok, message` (DLL 0.43.0+)
+
+Replace (or blend) vanilla duel power with a weighted sum of the duelist's **own stats**. These are
+the numbers on the unit card, with attributes, skills, equipment and effects already applied. The
+engine builds them for every auto-resolve duelist, and the DLL reads them from that object; no
+engine code is called.
+
+```lua
+se.modify.duel_power_formula({
+    vanilla = 0,          -- weight on the vanilla power (0 = replace it, 1 = keep it and add)
+    abilities = 1,        -- weight on the vanilla special-ability term (top 10, 1.0 .. 0.1)
+    health = 0.02,        -- per current hit point
+    health_scale = true,  -- multiply the stat and ability terms by the health fraction
+    refuse = 600,         -- optional: duel refusal gap while the formula is active
+    stats = { stat_melee_damage_base = 0.5, stat_melee_damage_ap = 1, stat_armour = 4,
+              stat_melee_defence = 10, stat_charge_bonus = 0.5 },
+})
+```
+
+`power = vanilla × old + (Σ weight × stat + abilities × ability_cp) × (health % if health_scale)
++ health × current_hp`, then the `duel_power_bonus` of the character is added. The stat value is
+the card value: base + modifier. For example, Cao Cao in one overhaul has armour 65, Melee Evasion
+(`stat_melee_defence`) 10 + 5, melee damage 885 + 274, AP 188, charge 161 + 50 and 18,360 hit
+points.
+
+- Stat keys are the exe's own names; `se.query.duel_stat_names()` lists them.
+- Stats outside a unit's stat block (e.g. `stat_weapon_damage`) are refused.
+- Weights are limited to ±10000.
+- Duelists more than the refusal gap apart never fight, and **the game then shows the weaker
+  hero as the winner**. The gap is `autoresolver_duel_refuse_variable`, 150 by default. Stat-based
+  power spreads heroes much wider than the fixed values, so pass `refuse` (the 190E Duels tab uses
+  600). The duel roll reads its own copy of the variables, which
+  `se.modify.autoresolver_variable` does not reach. That is why the gap travels with the formula:
+  the DLL writes it into the roll's copy and restores the game's value when the formula is cleared.
+- Like `duel_power_bonus`, the formula changes the simulation: in multiplayer it runs only from
+  model callbacks with the same values on every machine, and it is not saved.
+
+#### `se.modify.duel_power_formula_clear() -> ok, message`
+
+Back to vanilla duel power (the bonuses stay).
+
+#### `se.query.duel_power_formula() -> string`
+
+The active formula as sent to the DLL (`""` when none).
+
+#### `se.query.duel_stat_names() -> { stat_armour = 3, ... } | nil, message`
+
+Every stat of a unit's stat block, by the exe's names.
+
+#### `se.query.duel_last(cqi) -> string | nil`
+
+The character's most recent auto-resolve duel candidacy with the formula breakdown, e.g.
+`vanilla 1300 -> 1652 [melee_damage_base=1159.3 melee_damage_ap=188 armour=65 ... hp=18360/18360]`.
+Use it to tune weights: open a pre-battle panel, then read the heroes' lines.
 
 ---
 

@@ -1,8 +1,8 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.41.0**, `Z:\RE\se_deploy\0.41.0\`; pre-release line 0.42.0-beta.N (latest
-0.42.0-beta.5, `Z:\RE\se_deploy\0.42.0-beta.5\`)
+(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.41.0**, `Z:\RE\se_deploy\0.41.0\`; latest build **0.43.0** (not tagged yet),
+`Z:\RE\se_deploy\0.43.0\`; the 0.42.0-beta.N pre-release line precedes it
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -102,7 +102,7 @@ a native is present. `se.version()` = DLL version.
 | Attitude (0.22, pending) | `attitude(a, b)` -> standing | `attitude(a, b, level)` level -3..3 = the engine's small/medium/large attitude events (values from DB) | FUN_141b965e0(mgr, A, B); FUN_141b7cf60(mgr, A, B, level) = the `diplomatic_attitude_change` payload; treaty-component bias not done |
 | Income lines (0.22, script-side) | `faction_income(key)` | `faction_income(key, amount, label)`, `se.load_income_lines()` after a load | paid at FactionTurnStart via increase_treasury; not in the engine breakdown; force-scoped gdp hook not done (region GDP code not reached) |
 | Auto-resolve (0.24 read + tunables + plan; 0.25 simulation hook; **0.26.2: plan.casualties and plan.winner applied and verified live**; plan.bias and plan.duels stored only) | `pending_battle()` -> context, `autoresolve_prediction()`, `autoresolver_variable(key)`, `autoresolver_variables()`, `autoresolve_plan()` | `autoresolver_variable(key, value)`, `autoresolver_variables_reset()`, `autoresolve_plan(plan)`, `autoresolve_plan_clear()`, `se.autoresolve.set_handler(fn(ctx) -> plan)` (PendingBattle listener, local player battles only) | campaign variables = f32[774] at `*(world+0x3b58)` indexed by descriptor index (descriptor array RVA 0x3e33520, stride 0x78, name at +0x68); PB = `*(world+0x3b80)`, prediction in result `(*(PB+0xd0+night*0x10))[*(PB+0xe8)]`, side block +0x7c/+0x64, +8 casualties, +0xc enum; notes/autoresolve.md |
-| Duel power (0.42.0-beta.5; cfg `duel_power_hook`, sync tag) | `duel_power_hook()` -> `{installed, entries}` | `duel_power_bonus({[cqi] = bonus})` (merge, 0 removes, ±2000), `duel_power_bonus_clear()` | detour on the duel candidate builder FUN_142264ad0 (RVA 0x2264ad0): each new 16-byte entry {unit, i32 power, i32} gets `+bonus` for cqi `*(*(unit+0x10)+0x42c)` before FUN_14226f320 decides (stronger wins, attacker on a tie, gap > 150 refused); table not saved; natives `se_duel_bonus_set/clear/info`; consumer: 190E pack "Duel CEO" |
+| Duel power (0.42.0-beta.5; cfg `duel_power_hook`, sync tag) | `duel_power_hook()` -> `{installed, entries}` | `duel_power_bonus({[cqi] = bonus})` (merge, 0 removes, ±2000), `duel_power_bonus_clear()` | detour on the duel candidate builder FUN_142264ad0 (RVA 0x2264ad0): each new 16-byte entry {unit, i32 power, i32} gets `+bonus` for cqi `*(*(unit+0x10)+0x42c)` before FUN_14226f320 decides (stronger wins, attacker on a tie, gap > 150 refused); table not saved; natives `se_duel_bonus_set/clear/info`; consumer: 190E pack "Duel CEO"; **0.43.0**: `duel_power_formula({vanilla, abilities, health, health_scale, stats={stat_name=w}})` / `_clear()`, `query.duel_power_formula()`, `duel_stat_names()`, `duel_last(cqi)`: power = weighted sum of the candidate's own stat block `U+0xc0+id*0xc` {i32 base, f32 mod} (card value = base+mod) + hit points from U's entity vector (+0x78 hp, +0x7c fraction); ability term via FUN_141f50780 (anchor `ar_ability_cp`) |
 
 Raw natives (all `se_*` globals) are listed at the top of each `src/*.rs` file; treat them as
 internal. Test/console scripts for every feature live in
@@ -226,6 +226,19 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   notes/autoresolve.md. First consumer: the 190E pack's MCT option "190E Duel CEO" (equipped
   CEOs by category / rarity / item). Its MCT values are per machine: multiplayer players must
   match them (owner's decision, exception to the lockstep rule 2).
+- 0.43.0 (2026-09-25): **duel power from the duelist's real stats**. The auto-resolve duel
+  candidate is a unit-details object built by the same stat builder as the unit card
+  (FUN_1414951e0 -> FUN_141ff65e0 -> FUN_140a38320), so its stat block (armour, melee evasion,
+  damage, AP, charge, morale, ...) and hit points are read in the existing duel hook; no engine
+  call except the vanilla ability weighting (new anchor `ar_ability_cp`, FUN_141f50780). Verified
+  live against Cao Cao's unit card. Natives `se_duel_formula_set/clear/get`, `se_duel_stat_names`,
+  `se_duel_last`; rides on `duel_power_hook` (no new sync key). 190E consumer: the Duels tab's
+  "Duel power" dropdown, default Hero stats (owner's decision; Vanilla reverts).
+  The duel roll reads its tunables from its own array at ctx+0x155b4 (not *(world+0x3b58), which
+  se.modify.autoresolver_variable writes, so that API likely never reached the simulation - open
+  item); the formula's `refuse` gap is written there inside the duel hook and restored on clear.
+  A refused duel is shown by the game as won by the weaker hero. Verified live 2026-09-25: Cao Cao
+  1750 vs Yuan Huan 1232 refused at 150 (Yuan Huan "won"), fought at 600 (Cao Cao won).
 
 ## 7. When the game updates
 

@@ -118,6 +118,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // 0.42 duel power: FUN_142264ad0(ctx, army, out) appends one side's duel candidates
     // {unit, i32 power, i32 unscaled} to `out` (called twice by the duel roll FUN_14226f320)
     ("ar_duel_candidates", 0x2264ad0, [0x40, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57]),
+    // 0.42 duel formula: FUN_141f50780(abilities vector, f32 pair*, max count) adds the weighted
+    // additional_melee_cp / additional_missile_cp of a unit's top special abilities (called only)
+    ("ar_ability_cp", 0x1f50780, [0x48, 0x8b, 0xc4, 0x44, 0x89, 0x40, 0x18, 0x48]),
     // 0.28 horde income: FUN_141451510(finance, category) recomputes one income category
     ("finance_update_income", 0x1451510, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
     // 0.32 UI recruit cache: FUN_141934b40 = recruitment interface vfunc +0x88 (build the list of

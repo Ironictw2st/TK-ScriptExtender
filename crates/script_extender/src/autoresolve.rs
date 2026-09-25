@@ -34,7 +34,11 @@
 //!   se_ar_recompute(q_faction) -> ok, msg   re-run the engine's compute routine for the current
 //!     pending battle so that the panel shows the planned outcome
 //!   se_duel_bonus_set("cqi:bonus|...") -> ok, msg   merge per-character duel power bonuses (0
-//!     removes); se_duel_bonus_clear() -> ok, msg; se_duel_bonus_info() -> "installed=1;entries=n"
+//!     removes); se_duel_bonus_clear() -> ok, msg; se_duel_bonus_info() -> "installed=1;entries=n;formula=0|1"
+//!   se_duel_formula_set("vanilla=0;abilities=1;health=0.01;health_scale=1;stat_armour=2;...")
+//!     replaces duel power by a weighted sum of the candidate's own stats (0.43.0); an
+//!     optional refuse=<gap> is written into the duel roll's own variable array (ctx+0x155b4);
+//!     se_duel_formula_clear(), se_duel_formula_get(), se_duel_stat_names(), se_duel_last(cqi)
 //!
 //! Result layout used by the hook (mapped live, 2026-09-18): alliance summary (0x68) = {+0 vector
 //! of INLINE army records, +0x10 men before, +0x18 men after, +0x20 men lost, +0x28 kills,
@@ -94,6 +98,11 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_duel_bonus_set", se_duel_bonus_set);
     lua::set_global_fn(l, "se_duel_bonus_clear", se_duel_bonus_clear);
     lua::set_global_fn(l, "se_duel_bonus_info", se_duel_bonus_info);
+    lua::set_global_fn(l, "se_duel_formula_set", se_duel_formula_set);
+    lua::set_global_fn(l, "se_duel_formula_clear", se_duel_formula_clear);
+    lua::set_global_fn(l, "se_duel_formula_get", se_duel_formula_get);
+    lua::set_global_fn(l, "se_duel_stat_names", se_duel_stat_names);
+    lua::set_global_fn(l, "se_duel_last", se_duel_last);
 }
 
 extern "system" {
@@ -749,23 +758,298 @@ unsafe extern "C" fn duel_candidates_detour(ctx: *mut c_void, army: *mut c_void,
     let o = out as usize;
     let before = rd(o + 4) as usize;
     hook.call(ctx, army, out);
-    let bonus = match DUEL_BONUS.lock() {
-        Ok(g) => match g.as_ref() { Some(m) if !m.is_empty() => m.clone(), _ => return },
-        Err(_) => return,
-    };
+    let bonus = DUEL_BONUS.lock().ok().and_then(|g| g.as_ref().filter(|m| !m.is_empty()).cloned());
+    let formula = DUEL_FORMULA.lock().ok().and_then(|g| g.clone());
+    apply_refuse(ctx as usize, formula.as_ref().and_then(|f| f.refuse));
+    if bonus.is_none() && formula.is_none() { return; }
     let (count, data) = (rd(o + 4) as usize, rq(o + 8));
     if count < before || count > 256 || !readable(data, count * 16) { return; }
     for k in before..count {
         let e = data + k * 16;
         let u = rq(rq(e) + 0x10);
-        if !readable(u, 0x430) { continue; }
+        if !readable(u, DUEL_U_SIZE) { continue; }
         let cqi = rd(u + 0x42c);
-        let Some(&b) = bonus.get(&cqi) else { continue };
-        let power = core::ptr::read_unaligned((e + 8) as *const i32);
-        let new = power.saturating_add(b);
-        core::ptr::write_unaligned((e + 8) as *mut i32, new);
-        log!("ar_duel_candidates: character {cqi} duel power {power} -> {new}");
+        let vanilla = core::ptr::read_unaligned((e + 8) as *const i32);
+        let mut power = vanilla;
+        let mut detail = String::new();
+        if let Some(f) = formula.as_deref() {
+            let (p, d) = formula_power(f, u, vanilla);
+            power = p;
+            detail = d;
+        }
+        let b = bonus.as_ref().and_then(|m| m.get(&cqi).copied()).unwrap_or(0);
+        power = power.saturating_add(b);
+        if power == vanilla && formula.is_none() { continue; }
+        core::ptr::write_unaligned((e + 8) as *mut i32, power);
+        let line = format!("vanilla {vanilla} -> {power}{}{}", if b != 0 { format!(" (bonus {b:+})") } else { String::new() },
+            if detail.is_empty() { String::new() } else { format!(" [{detail}]") });
+        log!("ar_duel_candidates: character {cqi} duel power {line}");
+        if let Ok(mut g) = DUEL_LAST.lock() {
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.len() > 4096 { m.clear(); }
+            m.insert(cqi, line);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Duel formula (0.43.0). The candidate U is a unit-details object built by the campaign
+// unit stat builder (FUN_1414951e0 -> FUN_141ff65e0 -> FUN_140a38320, the same one the unit card
+// uses): stat id i at U + 0xc0 + i*0xc = {i32 base, f32 modifier}, card value = base + modifier
+// (ids from the exe's stat name table at .data 0x3c066b0, {char* name, u64 id}); U+0 = vector of
+// 0x88-byte entities {+0x78 u32 max hit points, +0x7c f32 health fraction}. Verified on the unit
+// card 2026-09-25 (notes/autoresolve.md "Unit stats on the duel candidate"). The formula reads
+// memory only; the one engine call is the ability term (FUN_141f50780, the vanilla weighting).
+// ---------------------------------------------------------------------------------------------
+
+const DUEL_U_SIZE: usize = 0x430;
+const STAT_BLOCK: usize = 0xc0;
+const STAT_STRIDE: usize = 0xc;
+const STAT_BLOCK_COUNT: u32 = 0x38;
+const RVA_STAT_NAMES: usize = 0x3c066b0;
+const RVA_ABILITY_MAX_COUNT: usize = 0x406ca20;
+const ENTITY_STRIDE: usize = 0x88;
+const FORMULA_WEIGHT_LIMIT: f64 = 1.0e4;
+/// The duel roll reads its tunables from ITS OWN copy: FUN_140958a50(ctx, idx) =
+/// `*(f32*)(ctx + 0x155b4 + idx*4)`, ctx = the first argument of the candidate builder (= *sim).
+/// This is not the array at *(world+0x3b58) that se_ar_variable_set writes (live 2026-09-25: roll
+/// array refuse 150 while the world array said 600).
+const CTX_VARS: usize = 0x155b4;
+const IDX_REFUSE: usize = 0x2dd;
+/// (ctx, the game's own refuse value) while a formula overrides it
+static REFUSE_SAVED: Mutex<Option<(usize, f32)>> = Mutex::new(None);
+
+/// Put the formula's refusal gap into the roll's variable array (called right before the roll
+/// reads it), or the game's value back once no formula asks for one.
+unsafe fn apply_refuse(ctx: usize, want: Option<f32>) {
+    let slot = ctx + CTX_VARS + IDX_REFUSE * 4;
+    if ctx == 0 || !readable(slot, 4) { return; }
+    let cur = core::ptr::read_unaligned(slot as *const f32);
+    if !cur.is_finite() || !(0.0..=1.0e6).contains(&cur) { return; }
+    let Ok(mut saved) = REFUSE_SAVED.lock() else { return };
+    match want {
+        Some(v) => {
+            if saved.map(|(c, _)| c) != Some(ctx) { *saved = Some((ctx, cur)); }
+            if cur != v {
+                core::ptr::write_unaligned(slot as *mut f32, v);
+                log!("ar_duel_candidates: duel refusal gap {cur} -> {v}");
+            }
+        }
+        None => {
+            if let Some((c, orig)) = *saved {
+                if c == ctx && cur != orig {
+                    core::ptr::write_unaligned(slot as *mut f32, orig);
+                    log!("ar_duel_candidates: duel refusal gap back to the game value {orig}");
+                }
+                *saved = None;
+            }
+        }
+    }
+}
+
+struct Formula {
+    refuse: Option<f32>,
+    vanilla: f32,
+    abilities: f32,
+    health: f32,
+    health_scale: bool,
+    stats: Vec<(u32, String, f32)>,
+    text: String,
+}
+
+type AbilityCp = unsafe extern "C" fn(usize, *mut f32, u32);
+static ABILITY_CP: OnceLock<AbilityCp> = OnceLock::new();
+static DUEL_FORMULA: Mutex<Option<std::sync::Arc<Formula>>> = Mutex::new(None);
+static DUEL_LAST: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
+static STAT_NAMES: OnceLock<Result<Vec<(String, u32)>, String>> = OnceLock::new();
+
+unsafe fn c_str(p: usize) -> Option<String> {
+    if !readable(p, 1) { return None; }
+    let mut s = Vec::new();
+    for i in 0..64 {
+        if !readable(p + i, 1) { return None; }
+        let c = *((p + i) as *const u8);
+        if c == 0 { break; }
+        s.push(c);
+    }
+    String::from_utf8(s).ok()
+}
+
+/// (name, id) of every stat the exe knows, read from its own name table; refused unless the
+/// table looks exactly like build 1.7.2.0's (70 entries, stat_armour = 3, stat_melee_defence = 0x16).
+unsafe fn stat_names() -> Result<&'static Vec<(String, u32)>, String> {
+    STAT_NAMES
+        .get_or_init(|| {
+            let (base, _) = crate::process::main_module();
+            let mut v = Vec::new();
+            for n in 0..128 {
+                let e = base + RVA_STAT_NAMES + n * 16;
+                let p = rq(e);
+                if p == 0 { break; }
+                let name = c_str(p).ok_or_else(|| format!("stat name table entry {n} unreadable"))?;
+                if !(name.starts_with("stat_") || name.starts_with("scalar_")) {
+                    return Err(format!("stat name table entry {n} is '{name}'; layout mismatch"));
+                }
+                v.push((name, rd(e + 8)));
+            }
+            let id = |k: &str| v.iter().find(|(n, _)| n == k).map(|(_, i)| *i);
+            if v.len() != 70 || id("stat_armour") != Some(3) || id("stat_melee_defence") != Some(0x16) {
+                return Err(format!("stat name table not as expected ({} entries)", v.len()));
+            }
+            Ok(v)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+fn parse_formula(spec: &str, names: &[(String, u32)]) -> Result<Formula, String> {
+    let mut f = Formula { refuse: None, vanilla: 0.0, abilities: 0.0, health: 0.0, health_scale: false, stats: Vec::new(), text: spec.to_string() };
+    for kv in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').ok_or_else(|| format!("'{kv}' is not key=weight"))?;
+        let (k, v) = (k.trim(), v.trim());
+        let w = v.parse::<f64>().map_err(|_| format!("bad weight '{v}' for {k}"))?;
+        if !w.is_finite() || w.abs() > FORMULA_WEIGHT_LIMIT { return Err(format!("weight {w} for {k} out of range")); }
+        match k {
+            "vanilla" => f.vanilla = w as f32,
+            "abilities" => f.abilities = w as f32,
+            "health" => f.health = w as f32,
+            "health_scale" => f.health_scale = w != 0.0,
+            "refuse" => {
+                if !(0.0..=1.0e5).contains(&w) { return Err(format!("refuse gap {w} out of range (0..100000)")); }
+                f.refuse = Some(w as f32);
+            }
+            _ => {
+                let id = names.iter().find(|(n, _)| n == k).map(|(_, i)| *i)
+                    .ok_or_else(|| format!("unknown stat '{k}'"))?;
+                if id >= STAT_BLOCK_COUNT { return Err(format!("{k} (id {id:#x}) is not part of a unit's stat block")); }
+                if w != 0.0 { f.stats.push((id, k.to_string(), w as f32)); }
+            }
+        }
+    }
+    Ok(f)
+}
+
+unsafe fn stat_value(u: usize, id: u32) -> f32 {
+    let e = u + STAT_BLOCK + id as usize * STAT_STRIDE;
+    if !readable(e, 8) { return 0.0; }
+    let base = core::ptr::read_unaligned(e as *const i32) as f32;
+    let modifier = core::ptr::read_unaligned((e + 4) as *const f32);
+    let v = base + if modifier.is_finite() { modifier } else { 0.0 };
+    if v.is_finite() { v } else { 0.0 }
+}
+
+/// (current hit points, max hit points) over the unit's entities.
+unsafe fn unit_health(u: usize) -> (f32, f32) {
+    let (count, data) = (rd(u + 4) as usize, rq(u + 8));
+    if count == 0 || count > 256 || !readable(data, count * ENTITY_STRIDE) { return (0.0, 0.0); }
+    let (mut cur, mut max) = (0.0f32, 0.0f32);
+    for i in 0..count {
+        let e = data + i * ENTITY_STRIDE;
+        let hp = rd(e + 0x78) as f32;
+        let frac = core::ptr::read_unaligned((e + 0x7c) as *const f32);
+        let frac = if frac.is_finite() { frac.clamp(0.0, 1.0) } else { 0.0 };
+        max += hp;
+        cur += hp * frac;
+    }
+    (cur, max)
+}
+
+unsafe fn ability_cp(u: usize) -> f32 {
+    let Some(f) = ABILITY_CP.get() else { return 0.0 };
+    let v = u + 0x398;
+    let (n, data) = (rd(v + 4), rq(v + 8));
+    if n == 0 { return 0.0; }
+    if n > 256 || !readable(data, n as usize * 0x108) { return 0.0; }
+    let (base, _) = crate::process::main_module();
+    let max = match rd(base + RVA_ABILITY_MAX_COUNT) { m @ 1..=64 => m, _ => 10 };
+    let mut pair = [0.0f32; 2];
+    f(v, pair.as_mut_ptr(), max);
+    let s = pair[0] + pair[1];
+    if s.is_finite() { s } else { 0.0 }
+}
+
+/// power = vanilla * w_vanilla + [Σ w * stat + w_abilities * abilities] (* health fraction when
+/// health_scale) + w_health * current hit points.
+unsafe fn formula_power(f: &Formula, u: usize, vanilla: i32) -> (i32, String) {
+    let (hp_cur, hp_max) = unit_health(u);
+    let frac = if hp_max > 0.0 { hp_cur / hp_max } else { 1.0 };
+    let mut parts = Vec::new();
+    let mut body = 0.0f32;
+    for (id, name, w) in &f.stats {
+        let v = stat_value(u, *id);
+        body += w * v;
+        parts.push(format!("{}={}", name.trim_start_matches("stat_"), v));
+    }
+    if f.abilities != 0.0 {
+        let a = ability_cp(u);
+        body += f.abilities * a;
+        parts.push(format!("abilities={a}"));
+    }
+    if f.health_scale { body *= frac; }
+    let hp_term = f.health * hp_cur;
+    if f.health != 0.0 || f.health_scale { parts.push(format!("hp={hp_cur}/{hp_max}")); }
+    let p = f.vanilla * vanilla as f32 + body + hp_term;
+    let p = if p.is_finite() { (p.round() as f64).clamp(i32::MIN as f64, i32::MAX as f64) as i32 } else { vanilla };
+    (p, parts.join(" "))
+}
+
+unsafe extern "C" fn se_duel_formula_set(l: *mut LuaState) -> c_int {
+    let spec = lua::to_str(l, 1);
+    let r: Result<String, String> = (|| {
+        if !DUEL_HOOK_ON.load(std::sync::atomic::Ordering::SeqCst) { return Err("the duel power hook is not installed".into()); }
+        if spec.len() > 8192 { return Err("formula is too long".into()); }
+        let f = parse_formula(&spec, stat_names()?)?;
+        let summary = format!("duel formula set: vanilla {} abilities {} health {} health_scale {} refuse {} + {} stats",
+            f.vanilla, f.abilities, f.health, f.health_scale, f.refuse.map(|r| r.to_string()).unwrap_or_else(|| "game".into()), f.stats.len());
+        *DUEL_FORMULA.lock().map_err(|_| "state lock poisoned")? = Some(std::sync::Arc::new(f));
+        Ok(summary)
+    })();
+    bool_result(l, r, "se_duel_formula_set")
+}
+
+unsafe extern "C" fn se_duel_formula_clear(l: *mut LuaState) -> c_int {
+    let r: Result<String, String> = (|| {
+        let had = DUEL_FORMULA.lock().map_err(|_| "state lock poisoned")?.take().is_some();
+        Ok(if had { "duel formula cleared (vanilla duel power)".into() } else { "no duel formula was set".into() })
+    })();
+    bool_result(l, r, "se_duel_formula_clear")
+}
+
+/// se_duel_formula_get() -> spec of the active formula, "" when none
+unsafe extern "C" fn se_duel_formula_get(l: *mut LuaState) -> c_int {
+    let s = DUEL_FORMULA.lock().ok().and_then(|g| g.as_ref().map(|f| f.text.clone())).unwrap_or_default();
+    lua::push_str(l, &s);
+    1
+}
+
+/// se_duel_stat_names() -> "stat_accuracy=0;stat_ammo=1;..." (only ids inside the stat block)
+unsafe extern "C" fn se_duel_stat_names(l: *mut LuaState) -> c_int {
+    match stat_names() {
+        Ok(v) => {
+            let s = v.iter().filter(|(_, i)| *i < STAT_BLOCK_COUNT).map(|(n, i)| format!("{n}={i}")).collect::<Vec<_>>().join(";");
+            lua::push_str(l, &s);
+            1
+        }
+        Err(e) => {
+            if let Some(api) = lua::api() { (api.pushnil)(l); }
+            lua::push_str(l, &e);
+            2
+        }
+    }
+}
+
+/// se_duel_last(cqi) -> "vanilla 1300 -> 1450 [armour=65 ...]" of the character's last duel roll
+unsafe extern "C" fn se_duel_last(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tonumber)(l, 1);
+    let s = if cqi.is_finite() && cqi >= 1.0 {
+        DUEL_LAST.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(cqi as u32)).cloned()))
+    } else { None };
+    match s {
+        Some(s) => lua::push_str(l, &s),
+        None => (api.pushnil)(l),
+    }
+    1
 }
 
 fn parse_duel_bonus(spec: &str) -> Result<Vec<(u32, i32)>, String> {
@@ -806,7 +1090,8 @@ unsafe extern "C" fn se_duel_bonus_clear(l: *mut LuaState) -> c_int {
 unsafe extern "C" fn se_duel_bonus_info(l: *mut LuaState) -> c_int {
     let n = DUEL_BONUS.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
     let on = DUEL_HOOK_ON.load(std::sync::atomic::Ordering::SeqCst);
-    lua::push_str(l, &format!("installed={};entries={n}", on as u8));
+    let formula = DUEL_FORMULA.lock().ok().map(|g| g.is_some()).unwrap_or(false);
+    lua::push_str(l, &format!("installed={};entries={n};formula={}", on as u8, formula as u8));
     1
 }
 
@@ -815,6 +1100,7 @@ unsafe fn install_duel_hook(t: &Table) {
         log!("duel power hook disabled by script_extender.cfg");
         return;
     }
+    let _ = ABILITY_CP.set(core::mem::transmute(t.get("ar_ability_cp")));
     let target: DuelCandidates = core::mem::transmute(t.get("ar_duel_candidates"));
     // SAFETY: anchor-verified prologue (push rdi/r12/r14/r15, sub rsp,0x38): no RIP-relative
     // instruction in the relocated bytes.
@@ -870,7 +1156,7 @@ pub fn install_hooks(t: &Table) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duel_bonus;
+    use super::{parse_duel_bonus, parse_formula};
 
     #[test]
     fn duel_bonus_spec() {
@@ -881,5 +1167,22 @@ mod tests {
         assert!(parse_duel_bonus("101").is_err());
         assert!(parse_duel_bonus("0:5").is_err());
         assert!(parse_duel_bonus("5:nan").is_err());
+    }
+
+    #[test]
+    fn duel_formula_spec() {
+        let names: Vec<(String, u32)> = vec![("stat_armour".into(), 3), ("stat_melee_defence".into(), 0x16), ("stat_weapon_damage".into(), 0x39)];
+        let f = parse_formula("vanilla=0; abilities=1; health=0.01; health_scale=1; stat_armour=2; stat_melee_defence=0", &names).unwrap();
+        assert_eq!((f.vanilla, f.abilities, f.health, f.health_scale), (0.0, 1.0, 0.01, true));
+        assert_eq!(f.stats.len(), 1); // zero weights are dropped
+        assert_eq!((f.stats[0].0, f.stats[0].2), (3, 2.0));
+        assert!(parse_formula("stat_nope=1", &names).is_err());
+        assert!(parse_formula("stat_weapon_damage=1", &names).is_err()); // outside the stat block
+        assert!(parse_formula("stat_armour=1e9", &names).is_err());
+        assert!(parse_formula("stat_armour", &names).is_err());
+        assert!(parse_formula("", &names).unwrap().stats.is_empty());
+        assert_eq!(parse_formula("refuse=600", &names).unwrap().refuse, Some(600.0));
+        assert!(parse_formula("refuse=-1", &names).is_err());
+        assert_eq!(parse_formula("stat_armour=1", &names).unwrap().refuse, None);
     }
 }

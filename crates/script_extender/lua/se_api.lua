@@ -1692,15 +1692,88 @@ function se.modify.duel_power_bonus_clear()
 	return on_model("duel_power_bonus_clear", function() return se_duel_bonus_clear() end)
 end
 
--- se.query.duel_power_hook() -> { installed, entries } | nil, message
---   installed = false when script_extender.cfg has duel_power_hook=0 (or autoresolve_hooks=0).
+-- se.query.duel_power_hook() -> { installed, entries, formula } | nil, message
+--   installed = false when script_extender.cfg has duel_power_hook=0 (or autoresolve_hooks=0);
+--   formula = true while se.modify.duel_power_formula is active (DLL 0.43.0+).
 function se.query.duel_power_hook()
 	local okn, err = need("se_duel_bonus_info")
 	if not okn then return nil, err end
 	local t = {}
 	for k, v in str(se_duel_bonus_info()):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) or v end
 	t.installed = t.installed == 1
+	t.formula = t.formula == 1
 	return t
+end
+
+-- se.modify.duel_power_formula(f) (DLL 0.43.0+): duel power becomes a weighted sum of the
+-- duelist's own stats - the numbers of the unit card, with attributes, skills, equipment and
+-- effects applied - instead of the unit's fixed main_units combat potential.
+--   f = { vanilla = 0,          -- weight on the vanilla power (0 = replace it)
+--         abilities = 1,        -- weight on the vanilla special-ability term
+--         health = 0.01,        -- per current hit point
+--         health_scale = true,  -- multiply the stat and ability terms by the health fraction
+--         refuse = 600,         -- optional duel refusal gap while the formula is active (the
+--                               -- game's value, 150, comes back when it is cleared)
+--         stats = { stat_armour = 1, stat_melee_defence = 2, stat_melee_damage_base = 0.1, ... } }
+--   Stat keys are the exe's names (se.query.duel_stat_names()). The per-character bonus of
+--   se.modify.duel_power_bonus still adds on top. Not saved: set it again at every first tick.
+function se.modify.duel_power_formula(f)
+	local okn, err = need("se_duel_formula_set")
+	if not okn then return false, err end
+	if type(f) ~= "table" then return false, "formula must be a table" end
+	local parts = {}
+	local function put(k, v)
+		local n = num(v)
+		if n == nil then return false end
+		parts[#parts + 1] = k .. "=" .. str(n)
+		return true
+	end
+	for _, k in ipairs({ "vanilla", "abilities", "health", "refuse" }) do
+		if f[k] ~= nil and not put(k, f[k]) then return false, k .. " must be a number" end
+	end
+	if f.health_scale ~= nil then parts[#parts + 1] = "health_scale=" .. (f.health_scale and "1" or "0") end
+	if f.stats ~= nil and type(f.stats) ~= "table" then return false, "stats must be a table { stat_name = weight }" end
+	local keys = {}
+	for k in pairs(f.stats or {}) do keys[#keys + 1] = k end
+	table.sort(keys) -- same text on every machine
+	for _, k in ipairs(keys) do
+		if type(k) ~= "string" or not put(k, f.stats[k]) then return false, "stats." .. str(k) .. " must be a number" end
+	end
+	local spec = table.concat(parts, ";")
+	return on_model("duel_power_formula", function() return se_duel_formula_set(spec) end)
+end
+
+function se.modify.duel_power_formula_clear()
+	local okn, err = need("se_duel_formula_clear")
+	if not okn then return false, err end
+	return on_model("duel_power_formula_clear", function() return se_duel_formula_clear() end)
+end
+
+-- se.query.duel_power_formula() -> encoded formula ("" when none)
+function se.query.duel_power_formula()
+	local okn, err = need("se_duel_formula_get")
+	if not okn then return nil, err end
+	return str(se_duel_formula_get())
+end
+
+-- se.query.duel_stat_names() -> { stat_armour = 3, stat_melee_defence = 22, ... } | nil, message
+function se.query.duel_stat_names()
+	local okn, err = need("se_duel_stat_names")
+	if not okn then return nil, err end
+	local s, e = se_duel_stat_names()
+	if not s then return nil, e end
+	local t = {}
+	for k, v in str(s):gmatch("([%w_]+)=([^;]*)") do t[k] = tonumber(v) end
+	return t
+end
+
+-- se.query.duel_last(cqi) -> "vanilla 1300 -> 1450 [armour=65 ... hp=18360/18360]" | nil
+--   The breakdown of the character's most recent auto-resolve duel candidacy (prediction or
+--   result), for tuning a formula.
+function se.query.duel_last(cqi)
+	local okn, err = need("se_duel_last")
+	if not okn then return nil, err end
+	return se_duel_last(num(cqi))
 end
 
 ----------------------------------------------------------------------------------------------
