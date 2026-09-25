@@ -239,6 +239,11 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   item); the formula's `refuse` gap is written there inside the duel hook and restored on clear.
   A refused duel is shown by the game as won by the weaker hero. Verified live 2026-09-25: Cao Cao
   1750 vs Yuan Huan 1232 refused at 150 (Yuan Huan "won"), fought at 600 (Cao Cao won).
+- 0.43.0-beta.2 (2026-09-25): **multiplayer desync fix**. beta.1 wrote the refusal gap into the
+  roll's tunables from the candidate hook and left it there; the prediction that runs when a
+  battle starts then changed model state on one machine and MP desynced at the first fight. The
+  gap now lives only for the duration of the duel roll (new detour `ar_duel_roll` on FUN_14226f320:
+  set, call, restore), so the model is byte-identical afterwards.
 
 ## 7. When the game updates
 

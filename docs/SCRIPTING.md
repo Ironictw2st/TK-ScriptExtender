@@ -1177,7 +1177,9 @@ points.
   power spreads heroes much wider than the fixed values, so pass `refuse` (the 190E Duels tab uses
   600). The duel roll reads its own copy of the variables, which
   `se.modify.autoresolver_variable` does not reach. That is why the gap travels with the formula:
-  the DLL writes it into the roll's copy and restores the game's value when the formula is cleared.
+  the DLL sets it in the roll's copy for the duration of each duel roll only and puts the game's
+  value back right after. The model is unchanged afterwards, which multiplayer requires; 0.43.0-beta.1
+  left it changed and desynced at the first battle.
 - Like `duel_power_bonus`, the formula changes the simulation: in multiplayer it runs only from
   model callbacks with the same values on every machine, and it is not saved.
 

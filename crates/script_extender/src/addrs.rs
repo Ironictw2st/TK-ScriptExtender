@@ -121,6 +121,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // 0.42 duel formula: FUN_141f50780(abilities vector, f32 pair*, max count) adds the weighted
     // additional_melee_cp / additional_missile_cp of a unit's top special abilities (called only)
     ("ar_ability_cp", 0x1f50780, [0x48, 0x8b, 0xc4, 0x44, 0x89, 0x40, 0x18, 0x48]),
+    // 0.43 duel roll FUN_14226f320(sim): the formula's refusal gap is set for the duration of
+    // this call only (ctx = *sim; tunables at ctx+0x155b4) and restored when it returns
+    ("ar_duel_roll", 0x226f320, [0x48, 0x8b, 0xc4, 0x48, 0x89, 0x48, 0x08, 0x55]),
     // 0.28 horde income: FUN_141451510(finance, category) recomputes one income category
     ("finance_update_income", 0x1451510, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
     // 0.32 UI recruit cache: FUN_141934b40 = recruitment interface vfunc +0x88 (build the list of

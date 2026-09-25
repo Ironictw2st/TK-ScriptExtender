@@ -37,7 +37,8 @@
 //!     removes); se_duel_bonus_clear() -> ok, msg; se_duel_bonus_info() -> "installed=1;entries=n;formula=0|1"
 //!   se_duel_formula_set("vanilla=0;abilities=1;health=0.01;health_scale=1;stat_armour=2;...")
 //!     replaces duel power by a weighted sum of the candidate's own stats (0.43.0); an
-//!     optional refuse=<gap> is written into the duel roll's own variable array (ctx+0x155b4);
+//!     optional refuse=<gap> is set in the duel roll's own variable array (ctx+0x155b4) for the
+//!     duration of the roll only (FUN_14226f320 detour; the model is unchanged afterwards);
 //!     se_duel_formula_clear(), se_duel_formula_get(), se_duel_stat_names(), se_duel_last(cqi)
 //!
 //! Result layout used by the hook (mapped live, 2026-09-18): alliance summary (0x68) = {+0 vector
@@ -760,7 +761,6 @@ unsafe extern "C" fn duel_candidates_detour(ctx: *mut c_void, army: *mut c_void,
     hook.call(ctx, army, out);
     let bonus = DUEL_BONUS.lock().ok().and_then(|g| g.as_ref().filter(|m| !m.is_empty()).cloned());
     let formula = DUEL_FORMULA.lock().ok().and_then(|g| g.clone());
-    apply_refuse(ctx as usize, formula.as_ref().and_then(|f| f.refuse));
     if bonus.is_none() && formula.is_none() { return; }
     let (count, data) = (rd(o + 4) as usize, rq(o + 8));
     if count < before || count > 256 || !readable(data, count * 16) { return; }
@@ -813,37 +813,36 @@ const FORMULA_WEIGHT_LIMIT: f64 = 1.0e4;
 /// The duel roll reads its tunables from ITS OWN copy: FUN_140958a50(ctx, idx) =
 /// `*(f32*)(ctx + 0x155b4 + idx*4)`, ctx = the first argument of the candidate builder (= *sim).
 /// This is not the array at *(world+0x3b58) that se_ar_variable_set writes (live 2026-09-25: roll
-/// array refuse 150 while the world array said 600).
+/// array refuse 150 while the world array said 600). Written only inside duel_roll_detour.
 const CTX_VARS: usize = 0x155b4;
 const IDX_REFUSE: usize = 0x2dd;
-/// (ctx, the game's own refuse value) while a formula overrides it
-static REFUSE_SAVED: Mutex<Option<(usize, f32)>> = Mutex::new(None);
+type DuelRoll = unsafe extern "C" fn(*mut c_void);
+static ROLL_HOOK: OnceLock<GenericDetour<DuelRoll>> = OnceLock::new();
 
-/// Put the formula's refusal gap into the roll's variable array (called right before the roll
-/// reads it), or the game's value back once no formula asks for one.
-unsafe fn apply_refuse(ctx: usize, want: Option<f32>) {
+/// FUN_14226f320(sim), the duel roll. The formula's refusal gap is written into the roll's own
+/// tunables for the duration of this call and the game's value is put back when it returns, so
+/// the model is byte-identical afterwards. 0.43.0-beta.1 wrote it persistently from the candidate
+/// hook: the prediction that runs when a battle starts then changed model state on one machine
+/// only, and multiplayer desynced at once (reported 2026-09-25).
+unsafe extern "C" fn duel_roll_detour(sim: *mut c_void) {
+    let Some(hook) = ROLL_HOOK.get() else { return };
+    let _g = crate::crash::enter("ar_duel_roll");
+    let want = DUEL_FORMULA.lock().ok().and_then(|g| g.as_ref().and_then(|f| f.refuse));
+    let ctx = rq(sim as usize);
     let slot = ctx + CTX_VARS + IDX_REFUSE * 4;
-    if ctx == 0 || !readable(slot, 4) { return; }
-    let cur = core::ptr::read_unaligned(slot as *const f32);
-    if !cur.is_finite() || !(0.0..=1.0e6).contains(&cur) { return; }
-    let Ok(mut saved) = REFUSE_SAVED.lock() else { return };
-    match want {
-        Some(v) => {
-            if saved.map(|(c, _)| c) != Some(ctx) { *saved = Some((ctx, cur)); }
-            if cur != v {
+    let saved = match want {
+        Some(v) if ctx != 0 && readable(slot, 4) => {
+            let cur = core::ptr::read_unaligned(slot as *const f32);
+            if cur.is_finite() && (0.0..=1.0e6).contains(&cur) {
                 core::ptr::write_unaligned(slot as *mut f32, v);
-                log!("ar_duel_candidates: duel refusal gap {cur} -> {v}");
-            }
+                Some(cur)
+            } else { None }
         }
-        None => {
-            if let Some((c, orig)) = *saved {
-                if c == ctx && cur != orig {
-                    core::ptr::write_unaligned(slot as *mut f32, orig);
-                    log!("ar_duel_candidates: duel refusal gap back to the game value {orig}");
-                }
-                *saved = None;
-            }
-        }
+        _ => None,
+    };
+    hook.call(sim);
+    if let Some(cur) = saved {
+        core::ptr::write_unaligned(slot as *mut f32, cur);
     }
 }
 
@@ -1114,8 +1113,26 @@ unsafe fn install_duel_hook(t: &Table) {
             }
             DUEL_HOOK_ON.store(true, std::sync::atomic::Ordering::SeqCst);
             log!("duel power hook installed");
+            install_roll_hook(t);
         }
         Err(e) => log!("failed to create the duel power hook: {e}"),
+    }
+}
+
+unsafe fn install_roll_hook(t: &Table) {
+    let target: DuelRoll = core::mem::transmute(t.get("ar_duel_roll"));
+    // SAFETY: anchor-verified prologue (mov rax,rsp; mov [rax+8],rcx; push rbp; push r12;
+    // lea rbp,[rax-0x28]): no RIP-relative instruction in the relocated bytes.
+    match GenericDetour::new(target, duel_roll_detour) {
+        Ok(d) => {
+            let _ = ROLL_HOOK.set(d);
+            let Some(d) = ROLL_HOOK.get() else { return };
+            match crate::freeze::enable_detour("ar_duel_roll", "duel_power_hook", target as usize, d) {
+                Ok(()) => log!("duel roll hook installed (refusal gap scoped to the roll)"),
+                Err(e) => log!("failed to enable the duel roll hook: {e} (formula refusal gaps are ignored)"),
+            }
+        }
+        Err(e) => log!("failed to create the duel roll hook: {e}"),
     }
 }
 
