@@ -190,6 +190,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // marry, 1 = related (FUN_1413d4c20 found a path over father / mother / spouse / +0x50 / children)
     ("marriage_verdict", 0x141e7e0, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c]),
     ("family_related", 0x13d4c20, [0x48, 0x8b, 0xc4, 0x55, 0x56, 0x48, 0x8d, 0x68]),
+    // notes/prebattle_delegate.md: PRE_BATTLE_VOTING_SYSTEM record vote FUN_14191aed0(sys, faction,
+    // vote, flag); vote 2 = Delegate (autoresolve)
+    ("prebattle_set_vote", 0x191aed0, [0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x57]),
 ];
 
 /// Vtables live in .rdata and hold relocated pointers, so they are verified by the RVA of
