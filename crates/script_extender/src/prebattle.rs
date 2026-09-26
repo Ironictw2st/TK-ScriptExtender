@@ -15,6 +15,13 @@
 //!
 //! script_extender.cfg: `prebattle_single_delegate` (default 1; 0 = no hook, vanilla voting). It
 //! changes the simulation, so it is in the sync tag.
+//!
+//! Post-battle Continue works the same way: CCQ_SET_READY_FOR_POST_BATTLE_ORDERS runs
+//! FUN_141878720(pending_battle_manager, faction, ready) which sets the faction's byte in a list
+//! {count +0x164, data +0x168} of 0x18-byte entries (+0x10 = ready) and, with more than one
+//! human, fires the "all ready" event once every entry is set. After a Continue that leaves
+//! others not ready, they are marked ready and the routine runs once more for the same faction,
+//! so the check fires. cfg `postbattle_single_continue` (default 1), also in the sync tag.
 
 use crate::addrs::Table;
 use crate::log;
@@ -26,8 +33,10 @@ use std::sync::OnceLock;
 type P = *mut c_void;
 type SetVote = unsafe extern "C" fn(P, P, i32, u8);
 type FactionByKey = unsafe extern "C" fn(P, P) -> P;
+type SetReady = unsafe extern "C" fn(P, P, u8);
 
 static SET_VOTE: OnceLock<GenericDetour<SetVote>> = OnceLock::new();
+static SET_READY: OnceLock<GenericDetour<SetReady>> = OnceLock::new();
 static FACTION_BY_KEY: AtomicUsize = AtomicUsize::new(0);
 static VOTES: AtomicU64 = AtomicU64::new(0);
 static FILLED: AtomicU64 = AtomicU64::new(0);
@@ -82,7 +91,55 @@ unsafe extern "C" fn set_vote_detour(sys: P, faction: P, vote: i32, flag: u8) {
     log!("pre-battle vote: faction 0x{:x} delegated (flag {flag}); recorded the same vote for {} other faction(s) that had not voted", faction as usize, others.len());
 }
 
+const READY_ENTRY_SIZE: usize = 0x18;
+
+unsafe extern "C" fn set_ready_detour(pbm: P, faction: P, ready: u8) {
+    let Some(h) = SET_READY.get() else { return };
+    h.call(pbm, faction, ready);
+    if ready == 0 { return; }
+    let _g = crate::crash::enter_quiet("postbattle_ready");
+    let (count, data) = (rd(pbm as usize + 0x164), rq(pbm as usize + 0x168));
+    if data == 0 || count > MAX_VOTERS || !readable(data, count as usize * READY_ENTRY_SIZE) { return; }
+    let mut forced = 0;
+    for i in 0..count as usize {
+        let flag = (data + i * READY_ENTRY_SIZE + 0x10) as *mut u8;
+        if *flag == 0 {
+            *flag = 1;
+            forced += 1;
+        }
+    }
+    if forced == 0 { return; }
+    // again for the same faction: its own entry is already set, so this only runs the
+    // "everyone ready" check that the first call stopped at
+    h.call(pbm, faction, 1);
+    log!("post-battle continue: faction 0x{:x} is ready; marked {forced} other faction(s) ready", faction as usize);
+}
+
+fn install_continue(t: &Table) {
+    if !crate::build::hook_enabled("postbattle_single_continue") {
+        log!("post-battle continue hook off (postbattle_single_continue=0 in script_extender.cfg): every human continues");
+        return;
+    }
+    // SAFETY: anchor-verified prologue (mov [rsp+8],rbx; push rdi; sub rsp,20; movzx edi,r8b):
+    // no RIP-relative operand in the relocated bytes.
+    unsafe {
+        let target: SetReady = core::mem::transmute(t.get("postbattle_set_ready"));
+        let Ok(d) = GenericDetour::new(target, set_ready_detour) else {
+            log!("post-battle continue hook: could not create the detour");
+            return;
+        };
+        let _ = SET_READY.set(d);
+        let Some(d) = SET_READY.get() else { return };
+        if let Err(e) = crate::freeze::enable_detour("postbattle_set_ready", "postbattle_single_continue", target as usize, d) {
+            log!("post-battle continue hook: could not enable the detour ({e}); off");
+            return;
+        }
+    }
+    log!("post-battle continue hook installed: one human's Continue clears the post-battle screen for every human");
+}
+
 pub fn install(t: &Table) {
+    install_continue(t);
     if !crate::build::hook_enabled("prebattle_single_delegate") {
         log!("pre-battle delegate hook off (prebattle_single_delegate=0 in script_extender.cfg): every human votes");
         return;

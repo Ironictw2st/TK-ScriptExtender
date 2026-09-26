@@ -193,6 +193,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // notes/prebattle_delegate.md: PRE_BATTLE_VOTING_SYSTEM record vote FUN_14191aed0(sys, faction,
     // vote, flag); vote 2 = Delegate (autoresolve)
     ("prebattle_set_vote", 0x191aed0, [0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x57]),
+    // CCQ_SET_READY_FOR_POST_BATTLE_ORDERS: FUN_141878720(pending_battle_mgr, faction, ready) =
+    // post-battle Continue; fires the "all ready" event once every human faction is ready
+    ("postbattle_set_ready", 0x1878720, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
 ];
 
 /// Vtables live in .rdata and hold relocated pointers, so they are verified by the RVA of
