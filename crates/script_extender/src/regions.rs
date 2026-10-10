@@ -3,6 +3,11 @@
 //! stops at 511 regions. The exe splits the key inline in ~85 functions (region_sites.rs, found by
 //! tools/regions/). cfg `map_region_bits = 10` rewrites every one of them for keys written as
 //! `region | area << 10` (1023 regions, 63 areas per region). Default 9 = vanilla, nothing patched.
+//! The same table moves the AI's region-pair caches (owner object at world+0xa80: i32[512][512] at
+//! +0x1e8, u8[512][512] at +0x1001e8, indexed by the region key) to a 1024 stride in an object grown
+//! from 0x1401e8 to 0x5001e8 bytes: without it every pair past 511 is recomputed without memoisation and
+//! the AI precompute never ends. The allocation size is patched too, so the DLL must be injected
+//! before a campaign creates that object (main menu / first window).
 //!
 //! The site anchors are checked here, only when the feature is on: a mismatch (other build, another
 //! mod's patch) turns the feature off instead of refusing the whole DLL. All or nothing.
