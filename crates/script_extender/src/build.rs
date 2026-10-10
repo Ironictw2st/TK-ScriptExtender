@@ -193,6 +193,9 @@ pub fn sync_tag() -> String {
     }
     feed("marriage_blood_generations");
     feed(&crate::marriage::generations().to_string());
+    // a map keyed `region | area << 10` read with 9-bit masks plans AI moves against the wrong regions
+    feed("map_region_bits");
+    feed(&crate::regions::bits().to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
 }
 
@@ -203,6 +206,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "marriage_inlaws", "marriage_blood_generations",
     "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
     "diag_diplomacy", "diag_crash", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue",
+    "map_region_bits",
 ];
 
 /// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns

@@ -42,6 +42,7 @@ mod diplomacy;
 mod crash;
 mod marriage;
 mod prebattle;
+mod regions;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
@@ -126,6 +127,8 @@ fn bootstrap() {
     marriage::install(&table);
     crash::boot("prebattle");
     prebattle::install(&table);
+    crash::boot("regions");
+    regions::install(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"
