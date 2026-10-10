@@ -43,6 +43,7 @@ mod crash;
 mod marriage;
 mod prebattle;
 mod regions;
+mod region_sites;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);

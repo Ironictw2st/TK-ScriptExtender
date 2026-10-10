@@ -1936,7 +1936,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `duel_power_hook` | `1` | per-character auto-resolve duel power bonus (§3.14); `0` = no hook (`se.modify.duel_power_bonus` refuses) |
 | `prebattle_single_delegate` | `1` | multiplayer pre-battle: one human's Delegate (autoresolve) vote counts for every human in the battle; `0` = every human must click Delegate |
 | `postbattle_single_continue` | `1` | multiplayer post-battle: one human's Continue clears the post-battle screen for every human (an unmade captive choice falls back to the default); `0` = every human must click Continue |
-| `map_region_bits` | `9` | experimental: `10` reads campaign-map area keys as `region \| area << 10` (up to 1023 regions, 64 areas per region) for maps whose map_data / hlp_data were written that way; `9` = vanilla (511 regions). Must match the map |
+| `map_region_bits` | `9` | experimental: `10` reads campaign-map area keys as `region \| area << 10` (up to 1023 regions, 63 areas per region; the exe splits the key in ~85 functions, all rewritten) for maps whose map_data / hlp_data were written that way; `9` = vanilla (511 regions). Must match the map |
 
 **Fourteen of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,

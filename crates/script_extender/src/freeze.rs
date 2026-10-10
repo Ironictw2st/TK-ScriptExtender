@@ -45,6 +45,13 @@ extern "system" {
 /// briefly and re-suspended (up to a few attempts). If one never leaves it, `f` is NOT run
 /// and Err is returned: patching bytes under a running instruction pointer is not safe.
 pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOnce() -> R) -> Result<R, String> {
+    with_threads_frozen_ranges(&[(range_start, range_len)], f)
+}
+
+/// `with_threads_frozen` for several patch ranges at once (one suspend / resume round for all).
+pub fn with_threads_frozen_ranges<R>(ranges: &[(usize, usize)], f: impl FnOnce() -> R) -> Result<R, String> {
+    let (range_start, _) = ranges.first().copied().unwrap_or((0, 0));
+    let inside = |rip: usize| ranges.iter().any(|&(s, l)| rip >= s && rip < s + l);
     let pid = unsafe { GetCurrentProcessId() };
     let me = unsafe { GetCurrentThreadId() };
     let mut handles: Vec<*mut c_void> = Vec::new();
@@ -77,7 +84,7 @@ pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOn
                                     } else {
                                         0
                                     };
-                                    if rip < range_start || rip >= range_start + range_len {
+                                    if !inside(rip) {
                                         ok = true;
                                         break;
                                     }
@@ -120,7 +127,7 @@ pub fn with_threads_frozen<R>(range_start: usize, range_len: usize, f: impl FnOn
             log!("patched with {n} other thread(s) frozen");
             Ok(r)
         }
-        (None, tid) => Err(format!("thread {} stayed inside 0x{range_start:x}..+{range_len}", tid.unwrap_or(0))),
+        (None, tid) => Err(format!("thread {} stayed inside a patch range (first 0x{range_start:x}, {} ranges)", tid.unwrap_or(0), ranges.len())),
     }
 }
 

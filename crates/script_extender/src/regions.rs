@@ -1,23 +1,16 @@
 //! Campaign maps with more than 511 regions (notes/map_regions.md). map_data.esf / hlp_data.esf
-//! store an area key as u16 `region | area << 9`; CA's builder stops at 511 regions. The exe
-//! never splits the key on the load / movement / hover paths; only five `and r, 0x1ff`
-//! instructions (AI-side, the 0x141d2xxxx block) take the region out of it. cfg
-//! `map_region_bits = 10` widens those masks to 0x3ff, for maps written as `region | area << 10`
-//! (1023 regions, 64 areas per region). Default 9 = vanilla, nothing patched.
+//! store an area key as u16 `region | area << 9` (0x1ff region / 0x7f area = none); CA's builder
+//! stops at 511 regions. The exe splits the key inline in ~85 functions (region_sites.rs, found by
+//! tools/regions/). cfg `map_region_bits = 10` rewrites every one of them for keys written as
+//! `region | area << 10` (1023 regions, 63 areas per region). Default 9 = vanilla, nothing patched.
+//!
+//! The site anchors are checked here, only when the feature is on: a mismatch (other build, another
+//! mod's patch) turns the feature off instead of refusing the whole DLL. All or nothing.
 
 use crate::addrs::Table;
 use crate::log;
+use crate::region_sites::SITES;
 use core::ffi::c_void;
-
-/// (anchor name, offset of the mask's high byte inside the instruction)
-/// `81 e2/e7/e1 ff 01 00 00` = and r32, 0x1ff (imm32 at +2); `25 ff 01 00 00` = and eax, 0x1ff.
-const SITES: &[(&str, usize)] = &[
-    ("region_mask_a", 3),
-    ("region_mask_b", 3),
-    ("region_mask_c", 3),
-    ("region_mask_d", 2),
-    ("region_mask_e", 3),
-];
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
@@ -25,6 +18,7 @@ extern "system" {
     fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
     fn FlushInstructionCache(process: *mut c_void, addr: *const c_void, size: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
+    fn IsBadReadPtr(lp: *const c_void, ucb: usize) -> i32;
 }
 
 /// cfg `map_region_bits`: 9 (vanilla) or 10. Anything else reads as 9. Also hashed by the sync tag.
@@ -35,6 +29,7 @@ pub fn bits() -> u32 {
     }
 }
 
+/// Write one byte of code; false if the page could not be made writable.
 unsafe fn write_byte(addr: usize, v: u8) -> bool {
     let mut old = 0u32;
     if VirtualProtect(addr as *mut c_void, 1, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
@@ -43,7 +38,6 @@ unsafe fn write_byte(addr: usize, v: u8) -> bool {
     core::ptr::write_volatile(addr as *mut u8, v);
     let mut tmp = 0u32;
     VirtualProtect(addr as *mut c_void, 1, old, &mut tmp);
-    FlushInstructionCache(GetCurrentProcess(), addr as *const c_void, 1);
     true
 }
 
@@ -53,33 +47,62 @@ pub fn install(t: &Table) {
         log!("map regions: vanilla 9-bit area keys (map_region_bits not 10); nothing patched");
         return;
     }
-    let high = (((1u32 << bits) - 1) >> 8) as u8;
-    // all or nothing: a map keyed one way read by masks of both widths would be worse than vanilla
-    let mut done: Vec<(&'static str, usize, [u8; 16])> = Vec::new();
-    for (name, hi_off) in SITES {
-        let insn = t.get(name);
-        let before = unsafe { core::ptr::read_unaligned(insn as *const [u8; 16]) };
-        // the anchor (8 bytes at the instruction) was verified at bootstrap; threads are kept out
-        // of the instruction while its immediate changes
-        let r = crate::freeze::with_threads_frozen(insn, 6, || unsafe { write_byte(insn + hi_off, high) });
-        match r {
-            Ok(true) => done.push((name, insn, before)),
-            Ok(false) => { log!("map regions: VirtualProtect failed at 0x{insn:x} ({name})"); break; }
-            Err(e) => { log!("map regions: {name} not patched ({e})"); break; }
+    let base = t.base();
+    // 1. every anchor first: one mismatch and nothing is written
+    let mut bad = 0;
+    for (rva, anchor, off, old, _) in SITES {
+        let addr = base + *rva as usize;
+        let ok = unsafe {
+            IsBadReadPtr(addr as *const c_void, 8) == 0
+                && core::ptr::read_unaligned(addr as *const [u8; 8]) == *anchor
+                && anchor[*off as usize] == *old
+        };
+        if !ok {
+            if bad < 8 {
+                let got = unsafe { core::ptr::read_unaligned(addr as *const [u8; 8]) };
+                log!("map regions: anchor mismatch at Three_Kingdoms.exe+0x{rva:x}: got {got:02x?}, want {anchor:02x?}");
+            }
+            bad += 1;
         }
     }
-    if done.len() != SITES.len() {
-        for (name, insn, before) in &done {
-            let hi_off = SITES.iter().find(|(n, _)| n == name).map(|(_, o)| *o).unwrap_or(0);
-            let ok = crate::freeze::with_threads_frozen(*insn, 6, || unsafe { write_byte(insn + hi_off, before[hi_off]) });
-            log!("map regions: reverted {name} ({})", if matches!(ok, Ok(true)) { "ok" } else { "FAILED" });
-        }
-        log!("map regions: widening failed; vanilla 9-bit masks kept. A map with more than 511 regions will misbehave in AI turns");
+    if bad > 0 {
+        log!("map regions: {bad}/{} anchors differ; 10-bit area keys OFF (a map with more than 511 regions will crash)", SITES.len());
         return;
     }
-    for (name, insn, before) in &done {
-        let after = unsafe { core::ptr::read_unaligned(*insn as *const [u8; 16]) };
-        crate::status::record_patch(name, "map_region_bits", *insn, *before, after);
+    // 2. all bytes in one freeze, threads kept out of every patched instruction
+    let first = base + SITES[0].0 as usize;
+    let before = unsafe { core::ptr::read_unaligned(first as *const [u8; 16]) };
+    let ranges: Vec<(usize, usize)> = SITES.iter().map(|(rva, ..)| (base + *rva as usize, 8)).collect();
+    let r = crate::freeze::with_threads_frozen_ranges(&ranges, || unsafe {
+        let mut written = 0usize;
+        for (rva, _, off, _, new) in SITES {
+            if !write_byte(base + *rva as usize + *off as usize, *new) {
+                break;
+            }
+            written += 1;
+        }
+        if written != SITES.len() {
+            // put back what was changed: half-patched decoders are worse than vanilla
+            for (rva, _, off, old, _) in &SITES[..written] {
+                write_byte(base + *rva as usize + *off as usize, *old);
+            }
+        }
+        FlushInstructionCache(GetCurrentProcess(), core::ptr::null(), 0);
+        written
+    });
+    match r {
+        Ok(n) if n == SITES.len() => {}
+        Ok(n) => {
+            log!("map regions: VirtualProtect failed after {n} of {} sites; reverted, 10-bit area keys OFF", SITES.len());
+            return;
+        }
+        Err(e) => {
+            log!("map regions: not patched ({e}); 10-bit area keys OFF");
+            return;
+        }
     }
-    log!("map regions: {} region masks widened to 0x{:x} ({bits}-bit region, {}-bit area keys)", SITES.len(), (1u32 << bits) - 1, 16 - bits);
+    // the inventory lists the first site; the full table is region_sites.rs
+    let after = unsafe { core::ptr::read_unaligned(first as *const [u8; 16]) };
+    crate::status::record_patch("map_region_keys", "map_region_bits", first, before, after);
+    log!("map regions: {} area-key sites rewritten for {bits}-bit region / {}-bit area keys (region mask 0x{:x})", SITES.len(), 16 - bits, (1u32 << bits) - 1);
 }
