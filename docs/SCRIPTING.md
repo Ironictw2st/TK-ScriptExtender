@@ -30,6 +30,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
 | 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock; beta.5: per-character auto-resolve duel power bonus (`se.modify.duel_power_bonus`, §3.14, cfg `duel_power_hook`) |
 | **0.43** | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings |
+| 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 
 ---
 
@@ -1310,12 +1311,12 @@ the one that was shown and still waiting, and not when the engine handled the cl
 later popups of the same batch do work). The recipient then accepts or refuses as in the
 unmodified game; cancel is untouched. Needs `se.core = core`; hand over
 `se.UIComponent = UIComponent` so the listener can check the popup. Natives: `se_followup_propose`.
-Since 0.41.0. **From 0.44 it is on by default**: `se_api` calls `se.ui.fix_followup_button()` itself
+Since 0.41.0. **From 0.44.0-beta.2 it is on by default**: `se_api` calls `se.ui.fix_followup_button()` itself
 as soon as the game's `core` exists, so a mod no longer has to (turn it off with `followup_hooks=0`).
 Calling it again is harmless (it replaces the listener). The DLL must be injected before the popup
 is built: injecting while the dead popup is already on screen cannot repair that popup.
 
-Before 0.44 a mod had to switch it on itself:
+Before 0.44.0-beta.2 a mod had to switch it on itself:
 
 ```lua
 cm:add_first_tick_callback(function()
@@ -1344,7 +1345,7 @@ record. `se.dilemma.choice_order(context)` returns the keys in `choice()` order.
 
 Call them **inside the listener**, while the event is alive: the engine builds the event on its
 own stack, so a context kept for a later `cm:callback` is dead. Read only; the same on every
-client. Natives: `se_dilemma_choice`. Since 0.44.
+client. Natives: `se_dilemma_choice`. Since 0.44.0-beta.2.
 
 ```lua
 core:add_listener("my_dilemma", "DilemmaChoiceMadeEvent",
@@ -2197,7 +2198,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.crash.mark(text)` | breadcrumb for the crash report |
 | `se.crash.selftest([mode])` | write a test crash report without faulting |
 | `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
-| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44 |
+| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44.0-beta.2 |
 | `se.dilemma.choice_key(context)` | real choice key of a `DilemmaChoiceMadeEvent` click (also `choice_order`, `choice`) |
 | `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |
 | `se.diag.diplomacy_report()` | write dip_trace.txt, log the blocked evaluations |
