@@ -2742,6 +2742,76 @@ function se.saves.info()
 		last_name = SV.last_name, last_len = SV.last_len, enabled = chunking_on() }
 end
 
+----------------------------------------------------------------------------------------------
+-- dilemmas (DLL 0.44+)
+----------------------------------------------------------------------------------------------
+
+se.dilemma = se.dilemma or {}
+
+-- se.dilemma.choice(context) -> key, index, order | nil, message
+--   Inside a DilemmaChoiceMadeEvent listener only (the engine's event lives on its stack for the
+--   duration of the call). context:choice() is the position in the generated dilemma's own
+--   choice list, which is not FIRST..FOURTH order; this reads the list itself:
+--   key = "FIRST".."FOURTH" of the chosen record, index = context:choice(),
+--   order = the keys in the order choice() indexes ({"SECOND","FIRST","FOURTH","THIRD"}).
+--   Read only; the same on every client.
+local function dilemma_choice(context)
+	local okn, err = need("se_dilemma_choice")
+	if not okn then return nil, err end
+	return G("se_dilemma_choice")(context)
+end
+se.dilemma.choice = dilemma_choice
+
+-- se.dilemma.choice_key(context) -> "FIRST".."FOURTH" | nil, message
+function se.dilemma.choice_key(context)
+	local key, idx = dilemma_choice(context)
+	if key == nil then return nil, idx end
+	return key
+end
+
+-- se.dilemma.choice_order(context) -> { keys in choice() order } | nil, message
+function se.dilemma.choice_order(context)
+	local key, idx, order = dilemma_choice(context)
+	if key == nil then return nil, idx end
+	return order
+end
+
 pcall(se.saves.install)
+
+-- MEDIATE PEACE repair, on by default (0.44+): register se.ui.fix_followup_button() as soon as the
+-- game's event manager exists, so no mod has to call it. Off with followup_hooks=0 in
+-- script_extender.cfg. CA's lib_header assigns the global `core` only after the libraries are
+-- loaded, so when it is not there yet this watches the state's globals for that assignment.
+local function auto_followup()
+	local function install(core)
+		se.core = se.core or core
+		local ok, msg = se.ui.fix_followup_button()
+		if ok then log("follow-up button fix enabled automatically") elseif msg then log("follow-up button fix not enabled: " .. str(msg)) end
+	end
+	local f = G("se_followup_propose")
+	if type(f) ~= "function" or not f("installed") then return end
+	local core = G("core")
+	if type(core) == "table" and type(core.add_listener) == "function" then return install(core) end
+	if type(ENV) ~= "table" or rawget(ENV, "__se_followup_watch") then return end
+	local prev = getmetatable(ENV)
+	local prev_newindex = type(prev) == "table" and prev.__newindex or nil
+	local mt = {}
+	if type(prev) == "table" then for k, v in pairs(prev) do mt[k] = v end end
+	mt.__newindex = function(t, k, v)
+		if prev_newindex then
+			if type(prev_newindex) == "function" then prev_newindex(t, k, v) else prev_newindex[k] = v end
+		else
+			rawset(t, k, v)
+		end
+		if k == "core" and type(v) == "table" then
+			if getmetatable(t) == mt then setmetatable(t, prev) end
+			rawset(t, "__se_followup_watch", nil)
+			pcall(install, v)
+		end
+	end
+	rawset(ENV, "__se_followup_watch", true)
+	setmetatable(ENV, mt)
+end
+pcall(auto_followup)
 
 log("se_api loaded (dll " .. se.version() .. ")")

@@ -43,6 +43,7 @@ mod crash;
 mod marriage;
 mod prebattle;
 mod navalland;
+mod dilemma;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
@@ -106,6 +107,7 @@ fn bootstrap() {
     alliances::init(&table);
     bundles::init(&table);
     diplomacy::init(&table);
+    dilemma::init(&table);
     build::apply_config();
     crash::boot("autoresolve");
     autoresolve::install_hooks(&table);

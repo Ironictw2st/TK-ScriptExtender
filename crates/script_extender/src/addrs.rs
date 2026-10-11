@@ -215,6 +215,8 @@ const VTABLES: &[(&str, usize, usize)] = &[
     ("recruit_item_vtable", 0x349c220, 0x18fd920),
     // campaign UNIT (read live from a QUERY_UNIT script object: *(obj+0x18))
     ("unit_vtable", 0x346e000, 0x148f400),
+    // DilemmaChoiceMadeEvent (built on the stack by FUN_14144c680; slot 2 returns its name)
+    ("dilemma_choice_event_vtable", 0x3484938, 0x1768690),
 ];
 
 pub struct Table {

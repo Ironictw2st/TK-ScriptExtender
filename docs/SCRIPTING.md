@@ -1310,7 +1310,12 @@ the one that was shown and still waiting, and not when the engine handled the cl
 later popups of the same batch do work). The recipient then accepts or refuses as in the
 unmodified game; cancel is untouched. Needs `se.core = core`; hand over
 `se.UIComponent = UIComponent` so the listener can check the popup. Natives: `se_followup_propose`.
-Since 0.41.0.
+Since 0.41.0. **From 0.44 it is on by default**: `se_api` calls `se.ui.fix_followup_button()` itself
+as soon as the game's `core` exists, so a mod no longer has to (turn it off with `followup_hooks=0`).
+Calling it again is harmless (it replaces the listener). The DLL must be injected before the popup
+is built: injecting while the dead popup is already on screen cannot repair that popup.
+
+Before 0.44 a mod had to switch it on itself:
 
 ```lua
 cm:add_first_tick_callback(function()
@@ -1319,6 +1324,37 @@ cm:add_first_tick_callback(function()
     se.UIComponent = UIComponent
     se.ui.fix_followup_button()
 end)
+```
+
+#### `se.dilemma.choice_key(context) -> key | nil, message`
+
+`DilemmaChoiceMadeEvent`'s `context:choice()` is the clicked button's position in the engine's own
+choice list, not the `choice_key` order (FIRST=0, SECOND=1, THIRD=2, FOURTH=3). The engine keeps a
+dilemma's choices in a small hash map keyed by the choice key:
+- every 4-choice dilemma is SECOND, FIRST, FOURTH, THIRD;
+- a 3-choice dilemma always puts FIRST first, then SECOND and THIRD in the load order of their
+  payload rows (either way round);
+- a FIRST/SECOND dilemma is always in order.
+
+Script that branches on `choice()` therefore runs the wrong branch for many dilemmas. The DB
+payloads are always right, because they are bound to the record.
+`se.dilemma.choice_key(context)` returns the real key (`"FIRST"`..`"FOURTH"`) of the clicked
+record. `se.dilemma.choice_order(context)` returns the keys in `choice()` order.
+`se.dilemma.choice(context)` returns `key, index, order` together.
+
+Call them **inside the listener**, while the event is alive: the engine builds the event on its
+own stack, so a context kept for a later `cm:callback` is dead. Read only; the same on every
+client. Natives: `se_dilemma_choice`. Since 0.44.
+
+```lua
+core:add_listener("my_dilemma", "DilemmaChoiceMadeEvent",
+    function(context) return context:dilemma() == "my_dilemma_key" end,
+    function(context)
+        local key = se.dilemma.choice_key(context)   -- "FIRST".."FOURTH", or nil + message
+        if key == "FIRST" then
+            -- reward for the FIRST record
+        end
+    end, true)
 ```
 
 #### `se.diag.diplomacy_trace(on [, include_ai]) -> was_on`
@@ -2161,7 +2197,8 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.crash.mark(text)` | breadcrumb for the crash report |
 | `se.crash.selftest([mode])` | write a test crash report without faulting |
 | `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
-| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0) |
+| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44 |
+| `se.dilemma.choice_key(context)` | real choice key of a `DilemmaChoiceMadeEvent` click (also `choice_order`, `choice`) |
 | `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |
 | `se.diag.diplomacy_report()` | write dip_trace.txt, log the blocked evaluations |
 | `se.diag.diplomacy_trace(on [, include_ai])` | record the engine's treaty-component validations |
