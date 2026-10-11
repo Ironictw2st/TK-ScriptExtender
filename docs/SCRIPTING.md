@@ -7,8 +7,9 @@ KINGDOMS **build 1.7.2.0**. Audience: mod authors who already know 3K campaign s
 Sources of truth for this document: `crates/script_extender/lua/se_api.lua` (signatures),
 the DLL sources under `crates/script_extender/src/` (defaults, refusals), `HANDOFF.md`
 (injection rules, version history), `notes/*.md` (behaviour, live verification). Current DLL
-version at the time of writing: **0.41.0** (2026-09-20): 0.40.0 (the 0.37 beta line on the stable
-channel) plus the MEDIATE PEACE button repair and the diplomacy trace.
+version at the time of writing: **0.45.0** (2026-10-11): 0.43.0 plus the 0.44 pre-release line
+(battles on water fought as land battles, the real dilemma choice key, the MEDIATE PEACE repair on
+by default) and a fix that keeps that repair out of the ordinary diplomacy screen.
 
 ### Which DLL version a feature needs
 
@@ -27,10 +28,11 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.36 | AI recruitment trace (`se.ai_recruit.trace/report`, `se.query.ai_recruitment/unit_quality`) |
 | 0.37 | AI recruitment policy (`se.ai_recruit.plan/execute/enable`) |
 | 0.40 | stable release of everything above, horde income on by default |
-| **0.41** | the current stable release: repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
+| 0.41 | repair of the dead MEDIATE PEACE button (`se.ui.fix_followup_button`), diplomacy validation trace (`se.diag.diplomacy_*`), profiler timeline |
 | 0.42 (pre-release) | crash reporter `se_crash.txt` (`diag_crash`, on by default; `se.crash.*`, §3.18), the switches `ai_recruit_hook` and `followup_hooks` for narrowing a crash down; beta.2: saved values larger than 64 KiB survive a save (§3.19); beta.3: relatives by marriage may marry (§3.20); beta.4: coexistence with other native mods (ThreeKingdoms-Coop), `se.status()`, the multiplayer check asks the model first, `save_chunking` joins the version lock; beta.5: per-character auto-resolve duel power bonus (`se.modify.duel_power_bonus`, §3.14, cfg `duel_power_hook`) |
-| **0.43** | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings |
+| 0.43 | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings; multiplayer: one human's Delegate vote counts for every human (`prebattle_single_delegate`), one Continue clears the post-battle screen for every human (`postbattle_single_continue`) |
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
+| **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
 
 ---
 
@@ -1316,6 +1318,13 @@ as soon as the game's `core` exists, so a mod no longer has to (turn it off with
 Calling it again is harmless (it replaces the listener). The DLL must be injected before the popup
 is built: injecting while the dead popup is already on screen cannot repair that popup.
 
+**Fixed in 0.45.0:** in 0.44.0-beta.2 the repair also acted in the ordinary diplomacy screen, which
+runs through the same engine code. Adding an item there (for example another faction's mount) sent
+the half-built deal at once, so it came back "deal rejected" before money could be added. From
+0.45.0 the DLL only proposes a deal that is waiting in a follow-up negotiation node (DB key ending
+in `_proposed_by_active_faction`; the ordinary negotiation uses `approach_*` nodes). It checks again
+right before sending. A click anywhere else is ignored.
+
 Before 0.44.0-beta.2 a mod had to switch it on itself:
 
 ```lua
@@ -2198,7 +2207,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.crash.mark(text)` | breadcrumb for the crash report |
 | `se.crash.selftest([mode])` | write a test crash report without faulting |
 | `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
-| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44.0-beta.2 |
+| `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44.0-beta.2, limited to the follow-up popup from 0.45.0 |
 | `se.dilemma.choice_key(context)` | real choice key of a `DilemmaChoiceMadeEvent` click (also `choice_order`, `choice`) |
 | `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |
 | `se.diag.diplomacy_report()` | write dip_trace.txt, log the blocked evaluations |

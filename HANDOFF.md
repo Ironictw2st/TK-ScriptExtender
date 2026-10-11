@@ -1,8 +1,8 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.41.0**, `Z:\RE\se_deploy\0.41.0\`; latest build **0.43.0** (not tagged yet),
-`Z:\RE\se_deploy\0.43.0\`; the 0.42.0-beta.N pre-release line precedes it
+(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.45.0** (2026-10-11, tag `v0.45.0`; the code of the untagged
+0.44.0-beta.3); previous stable 0.43.0; the next pre-release line is 0.46.0-beta.N
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -244,6 +244,37 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   battle starts then changed model state on one machine and MP desynced at the first fight. The
   gap now lives only for the duration of the duel roll (new detour `ar_duel_roll` on FUN_14226f320:
   set, call, restore), so the model is byte-identical afterwards.
+- 0.43.0-beta.3 (2026-09-26): **multiplayer pre-battle, one Delegate vote for everyone**. Detour on
+  the PRE_BATTLE_VOTING_SYSTEM record-vote routine FUN_14191aed0 (anchor `prebattle_set_vote`):
+  after a Delegate (autoresolve, vote 2) vote, the engine routine records the same vote for every
+  other human faction that has not voted. cfg `prebattle_single_delegate` (default 1, sync tag).
+  Verified in MP on two machines.
+- 0.43.0-beta.4 (2026-09-26): **multiplayer post-battle, one Continue for everyone**. Detour on
+  FUN_141878720 (CCQ_SET_READY_FOR_POST_BATTLE_ORDERS, anchor `postbattle_set_ready`): the other
+  human factions are marked ready, so the all-ready event fires on every machine; an unmade captive
+  choice falls back to the default. cfg `postbattle_single_continue` (default 1, sync tag).
+  Verified in MP on two machines. notes/prebattle_delegate.md.
+- **0.43.0 stable (2026-09-26)** = the beta.4 code.
+- 0.44.0-beta.1 (2026-10-06): **battles on water are fought as land battles** (`naval_to_land`,
+  default 1, sync tag). 3K has no naval battle assets: a pending battle of sea type 11..14 has
+  START disabled, and forcing it crashes. Four detours: determine_battle_type (RVA 0x19b5d00) maps
+  sea types to land_normal; could_ever_play_battle_on_battle_map (0x1859890) stops disabling START;
+  build_battle_setup (0x1863930) + is_commanding_force_on_sea (0x1a67080) answer "not at sea" only
+  inside a land battle setup on the same thread. Verified in game 2026-10-05 (190E, Yellow River).
+- 0.44.0-beta.2 (2026-10-11): **real dilemma choice key**. `DilemmaChoiceMadeEvent:choice()` is the
+  button's position in the generated dilemma, not FIRST..FOURTH order. `se.dilemma.choice_key /
+  choice_order / choice` read the event's choice entries (event+0x64/+0x68, key enum at
+  entry+0x30; vtable anchor `dilemma_choice_event_vtable`). Read-only; call inside the listener.
+  Also: `se_api` calls `se.ui.fix_followup_button()` itself once `core` exists (gated by
+  `followup_hooks`), so the MEDIATE PEACE repair needs no mod script. Both verified in game.
+- 0.44.0-beta.3 (2026-10-11, not tagged): **fix for a beta.2 regression**. CanPropose
+  (FUN_142f48cd0) also runs for the ordinary diplomacy screen. The automatic listener fired on its
+  `button_accept`, so the DLL proposed the half-built deal the moment the player added an item
+  ("deal rejected", no counter-offer). `followup.rs` now remembers a deal only when its node key
+  ends in `_proposed_by_active_faction` (only the follow-up nodes have a `ui` self-transition in
+  the vanilla DB). Any other negotiation clears it, and the check runs again before sending.
+- **0.45.0 stable (2026-10-11)** = the 0.44.0-beta.3 code. The beta.3 fix was released before an
+  in-game check.
 
 ## 7. When the game updates
 
