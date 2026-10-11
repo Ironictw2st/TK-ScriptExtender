@@ -138,7 +138,7 @@ unsafe fn ca_string(sp: usize) -> String {
     if raw.iter().all(|c| c.is_ascii_graphic()) { String::from_utf8_lossy(raw).into_owned() } else { String::new() }
 }
 
-unsafe fn record_key(rec: usize) -> String {
+pub(crate) unsafe fn record_key(rec: usize) -> String {
     if rec == 0 || rec % 8 != 0 || !readable(rec, 0x20) { return String::new(); }
     let s = ca_string(rec + 8);
     if !s.is_empty() { return s; }

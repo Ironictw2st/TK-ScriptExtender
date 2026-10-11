@@ -7,7 +7,8 @@
 //!   FUN_142f48cd0 CanPropose(cco, out)   runs when a negotiation UI is built. `cco` is a temporary
 //!       (gone by the time of a click: 0.41.0-beta.9), so what is remembered is what ProposeDeal
 //!       would use: deal = FUN_142f71b40(*(cco+0x218)), queue = *(*(*(*(cco+0x218)+8)+0x2188)+0x80),
-//!       plus the deal's id (+8) and state record (+0x48) to recognise it later
+//!       plus the deal's id (+8) and state record (+0x48) to recognise it later; only for a deal in
+//!       a `*_proposed_by_active_faction` node (the popup), never the diplomacy screen's negotiation
 //!   FUN_142f8bf40 ProposeDeal(cco)       remembers when the engine ran it by itself
 //!   FUN_141b3f3b0(buf, deal, op)         builds the 0x38-byte command {vtable, deal, op, 0, 0, 0, 0}
 //!   FUN_142f256e0(queue, command)        sends it
@@ -62,6 +63,14 @@ unsafe fn readable(p: usize, n: usize) -> bool { p >= 0x10000 && IsBadReadPtr(p 
 unsafe fn rq(p: usize) -> usize { if readable(p, 8) { core::ptr::read_unaligned(p as *const usize) } else { 0 } }
 unsafe fn rd(p: usize) -> u32 { if readable(p, 4) { core::ptr::read_unaligned(p as *const u32) } else { 0 } }
 
+/// The popup's deal waits in a `*_proposed_by_active_faction` node (the only nodes of the vanilla
+/// DB with a `ui` self-transition, both follow-up types). The diplomacy screen's own negotiation
+/// runs through the same CanPropose but sits in an `approach_*` node: it must never be proposed
+/// by us (0.44.0-beta.2 sent the player's half-built deal on any `button_accept` click).
+unsafe fn is_followup_deal(deal: usize) -> bool {
+    crate::diptrace::record_key(rq(deal + 0x48)).ends_with("_proposed_by_active_faction")
+}
+
 fn now_ms() -> u64 { START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 10_000 }
 
 unsafe extern "C" fn can_propose_detour(cco: P, out: P) -> u64 {
@@ -73,10 +82,16 @@ unsafe extern "C" fn can_propose_detour(cco: P, out: P) -> u64 {
             let deal = (e.negotiation_deal)(neg as P) as usize;
             let queue = rq(rq(rq(neg + 8) + 0x2188) + 0x80);
             if deal != 0 && queue != 0 && readable(deal, 0x60) {
-                DEAL.store(deal, Ordering::Relaxed);
-                DEAL_ID.store(rd(deal + 8) as u64, Ordering::Relaxed);
-                DEAL_STATE.store(rq(deal + 0x48), Ordering::Relaxed);
-                QUEUE.store(queue, Ordering::Relaxed);
+                if is_followup_deal(deal) {
+                    DEAL.store(deal, Ordering::Relaxed);
+                    DEAL_ID.store(rd(deal + 8) as u64, Ordering::Relaxed);
+                    DEAL_STATE.store(rq(deal + 0x48), Ordering::Relaxed);
+                    QUEUE.store(queue, Ordering::Relaxed);
+                } else {
+                    // an ordinary negotiation (diplomacy screen): forget any earlier popup, so a
+                    // click there can never propose the deal the player is still building
+                    DEAL.store(0, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -101,7 +116,7 @@ unsafe extern "C" fn ui_update_detour(ui: P, x: P) -> u64 {
     let now = now_ms();
     let (deal, queue) = (DEAL.load(Ordering::Relaxed), QUEUE.load(Ordering::Relaxed));
     // still the deal that was shown, still waiting in the state it was shown in
-    let same = deal != 0 && readable(deal, 0x60) && rd(deal + 8) as u64 == DEAL_ID.load(Ordering::Relaxed) && rq(deal + 0x48) == DEAL_STATE.load(Ordering::Relaxed);
+    let same = deal != 0 && readable(deal, 0x60) && rd(deal + 8) as u64 == DEAL_ID.load(Ordering::Relaxed) && rq(deal + 0x48) == DEAL_STATE.load(Ordering::Relaxed) && is_followup_deal(deal);
     if !same || !readable(queue, 8) || now.saturating_sub(asked) > 1000 || now.saturating_sub(ENGINE_PROPOSE_MS.load(Ordering::Relaxed)) <= 500 {
         log!("follow-up button fix: request dropped (deal {deal:#x} unchanged {same})");
         return r;
