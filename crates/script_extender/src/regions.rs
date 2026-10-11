@@ -16,57 +16,6 @@ use crate::addrs::Table;
 use crate::log;
 use crate::region_sites::SITES;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, Ordering};
-use retour::GenericDetour;
-use std::sync::OnceLock;
-
-/// FUN_141da4760(component, parent): registers `parent` in the BDI component's owner map and
-/// recurses into the component's owned list (+0xa8). Past 512 regions the startpos holds belief
-/// references in a list class whose ids are never resolved after load, so a raw id (e.g. 0x2070)
-/// arrives here instead of a pointer. Such entries are skipped (notes/map_regions.md).
-type BdiPropagate = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
-static BDI_PROPAGATE: OnceLock<GenericDetour<BdiPropagate>> = OnceLock::new();
-static BDI_SKIPPED: AtomicU64 = AtomicU64::new(0);
-const BDI_PROPAGATE_RVA: usize = 0x1da4760;
-const BDI_PROPAGATE_ANCHOR: [u8; 8] = [0x40, 0x53, 0x48, 0x83, 0xec, 0x40, 0x80, 0xb9];
-
-unsafe extern "C" fn bdi_propagate_detour(component: *mut c_void, parent: *mut c_void) -> u64 {
-    if (component as usize) < 0x10000 {
-        if BDI_SKIPPED.fetch_add(1, Ordering::Relaxed) < 8 {
-            log!("map regions: skipped unresolved BDI reference 0x{:x}", component as usize);
-        }
-        return 0;
-    }
-    match BDI_PROPAGATE.get() {
-        Some(d) => d.call(component, parent),
-        None => 0,
-    }
-}
-
-/// Install the guard (only with map_region_bits = 10).
-fn install_bdi_guard(base: usize) {
-    let target = base + BDI_PROPAGATE_RVA;
-    let got = unsafe { core::ptr::read_unaligned(target as *const [u8; 8]) };
-    if got != BDI_PROPAGATE_ANCHOR {
-        log!("map regions: BDI guard anchor mismatch at +0x{BDI_PROPAGATE_RVA:x}: got {got:02x?}; guard off");
-        return;
-    }
-    // SAFETY: anchor-verified prologue (push rbx; sub rsp,40; cmp byte [rcx+0xf0],2): no RIP-relative
-    // operand in the relocated bytes.
-    unsafe {
-        let f: BdiPropagate = core::mem::transmute(target);
-        let Ok(d) = GenericDetour::new(f, bdi_propagate_detour) else {
-            log!("map regions: BDI guard: could not create the detour");
-            return;
-        };
-        let _ = BDI_PROPAGATE.set(d);
-        let Some(d) = BDI_PROPAGATE.get() else { return };
-        match crate::freeze::enable_detour("bdi_propagate", "map_region_bits", target, d) {
-            Ok(()) => log!("map regions: BDI guard installed (unresolved belief references past 512 regions are skipped)"),
-            Err(e) => log!("map regions: BDI guard: could not enable ({e})"),
-        }
-    }
-}
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
@@ -160,6 +109,5 @@ pub fn install(t: &Table) {
     // the inventory lists the first site; the full table is region_sites.rs
     let after = unsafe { core::ptr::read_unaligned(first as *const [u8; 16]) };
     crate::status::record_patch("map_region_keys", "map_region_bits", first, before, after);
-    install_bdi_guard(base);
     log!("map regions: {} area-key sites rewritten for {bits}-bit region / {}-bit area keys (region mask 0x{:x})", SITES.len(), 16 - bits, (1u32 << bits) - 1);
 }
