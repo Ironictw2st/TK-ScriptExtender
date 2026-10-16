@@ -295,6 +295,13 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   in the diplomacy screen (items both ways, CONFIRM, MAKE THIS WORK counter-offer) sends nothing
   early and the SE never acts. Not tested: removing an item before CONFIRM, the final PROPOSE of a
   countered deal.
+- 0.46.0-beta.3 (2026-10-16, TEST BUILD, not tagged): crash on right-clicking an item card when a
+  character joined/left the faction while their character panel was open (use-after-free of the
+  CEO container behind the panel's CCO contexts; Discord 1560503636541308958). `ceoguard.rs` records
+  each panel character's CEO container, thunks the CcoCampaignActiveCeoManager vtable to re-point a
+  stale manager context, and `se.ui.fix_ceo_panel()` (auto) closes the open character_details within
+  250 ms of a rebuild. cfg `ceo_ui_refresh` (UI only, not in the sync tag). Reproduced 2x without
+  the panel close, 0 crashes in 2 runs with it; details in the sebugs worktree notes/ceo_panel_crash.md.
 
 ## 7. When the game updates
 
