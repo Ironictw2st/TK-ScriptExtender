@@ -291,6 +291,10 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   button's label (`button_txt`) unanswered. Real mouse clicks are reported as the button itself and
   already worked. `popup_of` now uses the table and walks the label up to its button. Verified in
   game 2026-10-15: real mouse on the ACCEPT label and on the REJECT background.
+  Same night, regression check of the 0.44.0-beta.2 bug with beta.2: building an ancillary trade
+  in the diplomacy screen (items both ways, CONFIRM, MAKE THIS WORK counter-offer) sends nothing
+  early and the SE never acts. Not tested: removing an item before CONFIRM, the final PROPOSE of a
+  countered deal.
 
 ## 7. When the game updates
 
