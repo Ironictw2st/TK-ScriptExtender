@@ -286,6 +286,11 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   and sends the engine's own op 7 / op 6 command (FUN_141b3f420) on a click that sent nothing.
   New cfg `followup_respond_hook` (sync tag), new native `se_followup_respond`, Lua
   `se.modify.followup_respond`; four new anchors.
+- 0.46.0-beta.2 (2026-10-15, pre-release): Lua only. `UIComponent` is a callable table in the
+  campaign state, so beta.1's listener could not see the popup and left a click reported on a
+  button's label (`button_txt`) unanswered. Real mouse clicks are reported as the button itself and
+  already worked. `popup_of` now uses the table and walks the label up to its button. Verified in
+  game 2026-10-15: real mouse on the ACCEPT label and on the REJECT background.
 
 ## 7. When the game updates
 

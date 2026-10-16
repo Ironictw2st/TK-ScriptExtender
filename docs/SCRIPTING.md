@@ -33,7 +33,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.43 | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings; multiplayer: one human's Delegate vote counts for every human (`prebattle_single_delegate`), one Continue clears the post-battle screen for every human (`postbattle_single_continue`) |
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
-| 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`) |
+| 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label |
 
 ---
 
@@ -1338,7 +1338,11 @@ update. As with propose, it acts only if the offer is still waiting unchanged an
 not answer the click itself. Ordinary AI offers are left to the engine. The listener never
 proposes from this popup, and the DLL never proposes a deal the player has to answer. Natives:
 `se_followup_respond`. Off with `followup_respond_hook=0` (part of the multiplayer version lock).
-Verified in game: ACCEPT signs the peace, REJECT brings the war, and the turn ends.
+Verified in game: ACCEPT signs the peace, REJECT brings the war, and the turn ends. A real mouse
+click on the label or the background is reported as the button itself. In 0.46.0-beta.1 a click
+reported on the label child (`button_txt`) was not answered, because the listener did not use the
+game's `UIComponent`, which is a callable table. Fixed in 0.46.0-beta.2 (verified: real mouse on the
+ACCEPT label and on the REJECT background).
 
 #### `se.modify.followup_respond(answer) -> ok, message`
 
