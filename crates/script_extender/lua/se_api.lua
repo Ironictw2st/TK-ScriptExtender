@@ -2579,7 +2579,7 @@ end
 -- cm.saved_values store as ONE string, so once it grows past the cap the save holds a cut string,
 -- loadstring fails on the next load and load_values_from_string throws every mod's saved values
 -- away. Here campaign_manager:save_named_value / load_named_value are wrapped: a string or table
--- that serialises above CHUNK bytes is written as numbered slots "<name>__se_<i>" plus a marker
+-- that serialises above THRESHOLD bytes is written as numbered slots "<name>__se_<i>" plus a marker
 -- "--se_chunks:<n>:<len>" in its own slot, and joined again on load. Old saves carry no marker and
 -- load as before. Without the DLL a chunked value loads as empty (the same wipe as before).
 -- Installed automatically whenever the campaign manager class appears in this state;
@@ -2588,7 +2588,10 @@ end
 se.saves = se.saves or {}
 local SV = se._saves or { installed = false, path = "not installed", chunked_saves = 0, chunked_loads = 0, last_name = "", last_len = 0, logged = {} }
 se._saves = SV
-local CHUNK = 60000
+local CHUNK = 60000 -- size of one numbered slot
+-- values up to this size are written in one slot, as without chunking (the cap: 65,476 bytes
+-- survived, 65,796 did not)
+local THRESHOLD = 65000
 local MARK = "--se_chunks:"
 
 local function chunking_on()
@@ -2606,7 +2609,7 @@ local function wrap_save(orig)
 				local ok, r = pcall(self.get_table_save_state, self, value)
 				s = ok and r or nil
 			end
-			if type(s) == "string" and #s > CHUNK then
+			if type(s) == "string" and #s > THRESHOLD then
 				local n = math.ceil(#s / CHUNK)
 				for i = 1, n do
 					orig(self, name .. "__se_" .. i, string.sub(s, (i - 1) * CHUNK + 1, i * CHUNK))
@@ -2625,37 +2628,54 @@ local function wrap_save(orig)
 	end
 end
 
+-- Join a chunked value from the marker found in its main slot. Only the numbered slots are read
+-- here: the main slot has already been read once (by the vanilla function), and a second read of a
+-- slot is never needed (0.45.1: the old version read every string / table slot itself before the
+-- vanilla read, a second read per value on every load).
+local function join_chunks(self, name, raw, default)
+	local n, len = string.match(raw, "^%-%-se_chunks:(%d+):(%d+)")
+	n, len = tonumber(n), tonumber(len)
+	local parts = {}
+	for i = 1, (n or 0) do
+		local okc, c = pcall(function() return self.context:load_string(name .. "__se_" .. i) end)
+		parts[i] = (okc and type(c) == "string") and c or ""
+	end
+	local s = table.concat(parts)
+	if not n or #s ~= len then
+		log("save chunking: " .. name .. " is chunked but incomplete (" .. #s .. " of " .. tostring(len) .. " bytes); using the default")
+		return default
+	end
+	SV.chunked_loads = SV.chunked_loads + 1
+	SV.last_name, SV.last_len = name, len
+	log("save chunking: " .. name .. " " .. len .. " bytes loaded from " .. n .. " chunks")
+	if type(default) == "string" then return s end
+	local f = loadstring(s)
+	if type(f) == "function" then
+		local okt, t = pcall(f)
+		if okt and type(t) == "table" then return t end
+	end
+	log("save chunking: " .. name .. " joined but did not convert into a table; using the default")
+	return default
+end
+
+local function is_marker(v)
+	return type(v) == "string" and string.sub(v, 1, #MARK) == MARK
+end
+
 local function wrap_load(orig)
 	return function(self, name, default, ...)
-		if type(name) == "string" and (type(default) == "string" or type(default) == "table") and self.context then
+		local r = orig(self, name, default, ...)
+		if type(name) ~= "string" or not self.context then return r end
+		if type(default) == "string" then
+			-- vanilla hands back the slot's text as it is: a marker means a chunked value
+			if is_marker(r) then return join_chunks(self, name, r, default) end
+		elseif type(default) == "table" and rawequal(r, default) then
+			-- vanilla fell back to the default: the slot may hold a marker (a Lua comment, so it
+			-- did not convert into a table). Only this case reads the slot a second time.
 			local okr, raw = pcall(function() return self.context:load_string(name) end)
-			if okr and type(raw) == "string" and string.sub(raw, 1, #MARK) == MARK then
-				local n, len = string.match(raw, "^%-%-se_chunks:(%d+):(%d+)")
-				n, len = tonumber(n), tonumber(len)
-				local parts = {}
-				for i = 1, (n or 0) do
-					local okc, c = pcall(function() return self.context:load_string(name .. "__se_" .. i) end)
-					parts[i] = (okc and type(c) == "string") and c or ""
-				end
-				local s = table.concat(parts)
-				if not n or #s ~= len then
-					log("save chunking: " .. name .. " is chunked but incomplete (" .. #s .. " of " .. tostring(len) .. " bytes); using the default")
-					return default
-				end
-				SV.chunked_loads = SV.chunked_loads + 1
-				SV.last_name, SV.last_len = name, len
-				log("save chunking: " .. name .. " " .. len .. " bytes loaded from " .. n .. " chunks")
-				if type(default) == "string" then return s end
-				local f = loadstring(s)
-				if type(f) == "function" then
-					local okt, t = pcall(f)
-					if okt and type(t) == "table" then return t end
-				end
-				log("save chunking: " .. name .. " joined but did not convert into a table; using the default")
-				return default
-			end
+			if okr and is_marker(raw) then return join_chunks(self, name, raw, default) end
 		end
-		return orig(self, name, default, ...)
+		return r
 	end
 end
 
