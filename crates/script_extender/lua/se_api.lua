@@ -2630,7 +2630,7 @@ se._saves = SV
 local CHUNK = 60000 -- size of one numbered slot
 -- values up to this size are written in one slot, as without chunking (the cap: 65,476 bytes
 -- survived, 65,796 did not)
-local THRESHOLD = 65000
+local THRESHOLD = 64000
 local MARK = "--se_chunks:"
 
 local function chunking_on()
