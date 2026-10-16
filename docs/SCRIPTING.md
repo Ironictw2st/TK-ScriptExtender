@@ -33,6 +33,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.43 | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings; multiplayer: one human's Delegate vote counts for every human (`prebattle_single_delegate`), one Continue clears the post-battle screen for every human (`postbattle_single_continue`) |
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
+| 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`) |
 
 ---
 
@@ -75,11 +76,12 @@ change at the same model tick. The API follows three rules so that it can be use
    or `os.time` to decide a change; use the model's own random functions.
 3. **Both machines must run the same script extender with the same simulation settings.** The
    DLL enforces this through the game's build string, which the multiplayer lobby compares:
-   it always ends up containing the DLL version and a fingerprint of the fourteen settings that can
+   it always ends up containing the DLL version and a fingerprint of the fifteen settings that can
    change the simulation — `autoresolve_hooks`, `ai_recruit_cache`, `recruit_perm_cache`,
    `horde_income`, `horde_income_category`, `ai_recruit_hook`, `followup_hooks`,
    `marriage_inlaws`, `marriage_blood_generations`, `save_chunking`, `duel_power_hook`,
-   `prebattle_single_delegate`, `postbattle_single_continue` and `naval_to_land`
+   `prebattle_single_delegate`, `postbattle_single_continue`, `naval_to_land` and
+   `followup_respond_hook`
    (`script_extender.cfg` text may use `{version}`
    and `{sync}`; text without both gets ` [se <version>.<sync>]` appended; without cfg text the game's
    own string is extended; `se.modify.build_number` cannot remove it). A player without the
@@ -1325,6 +1327,24 @@ the half-built deal at once, so it came back "deal rejected" before money could 
 in `_proposed_by_active_faction`; the ordinary negotiation uses `approach_*` nodes). It checks again
 right before sending. A click anywhere else is ignored.
 
+**The other side, from 0.46.0-beta.1:** when an AI faction takes the Emperor, its follow-up
+offer to you ("Issue Ultimatum": peace on behalf of the Han Empire, rejecting means war) can be
+just as dead. ACCEPT and REJECT receive the click, but no negotiation command is sent, and the turn
+cannot end. This happens mostly with large mod sets, where the vassalisation starts a long chain of
+follow-up deals. The same listener now also handles `button_accept` / `button_reject` in
+`diplomacy_popup_panel`. A click calls `se.modify.followup_respond("accept" | "reject")`, and the
+DLL sends the engine's own accept (op 7) or reject (op 6) command for that offer on the next UI
+update. As with propose, it acts only if the offer is still waiting unchanged and the engine did
+not answer the click itself. Ordinary AI offers are left to the engine. The listener never
+proposes from this popup, and the DLL never proposes a deal the player has to answer. Natives:
+`se_followup_respond`. Off with `followup_respond_hook=0` (part of the multiplayer version lock).
+Verified in game: ACCEPT signs the peace, REJECT brings the war, and the turn ends.
+
+#### `se.modify.followup_respond(answer) -> ok, message`
+
+`answer` = `"accept"` or `"reject"`. Queues the answer to the follow-up offer that is on screen
+(see above). Refused when no such offer is waiting or the engine has just handled the click.
+
 Before 0.44.0-beta.2 a mod had to switch it on itself:
 
 ```lua
@@ -1581,14 +1601,24 @@ Since 0.42.0-beta.2. Automatic, nothing to call. The engine keeps at most about 
 one saved string, and the campaign manager writes the whole `cm.saved_values` store as one string.
 Once a campaign's saved values grow past that, the save holds a cut string, and on the next load
 every mod's saved values reset at once. With the DLL, `cm:save_named_value` and
-`cm:load_named_value` split any string or table that serialises above 60,000 bytes into numbered
-savegame entries (`<name>__se_1`, `<name>__se_2`, ...) plus a marker in its own entry, and join
+`cm:load_named_value` split any string or table that serialises above 64,000 bytes into numbered
+savegame entries (60,000 bytes each) (`<name>__se_1`, `<name>__se_2`, ...) plus a marker in its own entry, and join
 them again on load. That covers `saved_values` and every mod's own named values. Values below the
 limit are saved exactly as before, and saves made without the DLL load as before.
 
 A save written with chunking must be loaded with the DLL: without it, a chunked value loads as
 empty, which is the same reset that would have happened anyway. `save_chunking=0` in
 `script_extender.cfg` turns it off.
+
+**Fixed in 0.46.0-beta.1:** from 0.42.0-beta.2 to 0.45.0, the load wrapper read each saved string
+itself before the campaign manager's own read. The engine hands each saved value out only once,
+so the campaign manager's read came back empty. That reset the mission managers
+(`mission_managers`) on every load, whatever the save size, and completed missions were issued
+again. Other values loaded through the same function were lost too: `saved_values`, unless 190E's
+save mirror restored it. From 0.46.0-beta.1, the campaign manager reads first and chunks are
+joined only when it hands back a chunk marker; no entry is read twice. Values up to 64,000 bytes
+(previously 60,000) stay in one entry. Verified in game: the same save loaded with 0.45.0 loses a
+completed mission, with 0.46.0-beta.1 it keeps it.
 
 ```lua
 local t = se.saves.info()   -- { installed, enabled, path, chunked_saves, chunked_loads, last_name, last_len }
@@ -1976,6 +2006,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `diag_crash` | `1` | crash reporter (§3.18): `0` off, `1` `se_crash.txt` on a fault, `2` also the activity trace `se_activity.txt` |
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
+| `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
 | `marriage_blood_generations` | `0` | with `marriage_inlaws=1`: blood relatives sharing an ancestor within this many generations may not marry (0..6; 0 = only the engine's close-kin rule) |
@@ -1984,11 +2015,11 @@ values optionally quoted; an unknown key is logged and ignored.
 | `postbattle_single_continue` | `1` | multiplayer post-battle: one human's Continue clears the post-battle screen for every human (an unmade captive choice falls back to the default); `0` = every human must click Continue |
 | `naval_to_land` | `1` (DLL 0.44.0+) | a battle between armies on water (river or sea), which 3K cannot fight (START disabled, forcing it crashes), is fought as a land battle on the nearest land; mixed coast battles become playable too; `0` = vanilla |
 
-**Fourteen of them are part of the multiplayer version lock** — `autoresolve_hooks`,
+**Fifteen of them are part of the multiplayer version lock** — `autoresolve_hooks`,
 `ai_recruit_cache`, `recruit_perm_cache`, `horde_income`, `horde_income_category`,
 `ai_recruit_hook`, `followup_hooks`, `marriage_inlaws`, `marriage_blood_generations`,
 `save_chunking`, `duel_power_hook`, `prebattle_single_delegate`,
-`postbattle_single_continue` and `naval_to_land`. The DLL
+`postbattle_single_continue`, `naval_to_land` and `followup_respond_hook`. The DLL
 hashes their *effective* values into the build string, so an absent key and an explicitly written
 default give the same tag, but two players with different values cannot join each other (§1).
 

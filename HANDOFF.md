@@ -275,6 +275,17 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   the vanilla DB). Any other negotiation clears it, and the check runs again before sending.
 - **0.45.0 stable (2026-10-11)** = the 0.44.0-beta.3 code. The beta.3 fix was released before an
   in-game check.
+- 0.46.0-beta.1 (2026-10-15, pre-release): two fixes, both verified in game on the 190E set.
+  (1) Completed missions issued again after a load (reported on Steam for 0.43 / 0.45): the
+  0.42.0-beta.2 save-chunking wrapper read every saved string before `load_named_value` did, and
+  `context:load_string` hands a value out only once, so `mission_managers` came back empty on every
+  load. The wrapper now lets the vanilla read go first and never reads an entry twice; one entry
+  holds up to 64,000 bytes. (2) The emperor holder's "Issue Ultimatum" to the player (recipient
+  side of the follow-up negotiation) could have dead ACCEPT / REJECT. `followup.rs` detours
+  CcoDiplomacyNegotiation CanPlayerAccept / Accept / Reject (FUN_142f48b30 / 142f43050 / 142f90790)
+  and sends the engine's own op 7 / op 6 command (FUN_141b3f420) on a click that sent nothing.
+  New cfg `followup_respond_hook` (sync tag), new native `se_followup_respond`, Lua
+  `se.modify.followup_respond`; four new anchors.
 
 ## 7. When the game updates
 
