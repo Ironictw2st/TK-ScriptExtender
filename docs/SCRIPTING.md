@@ -33,7 +33,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.43 | auto-resolve duels decided by the duelists' real stats (`se.modify.duel_power_formula`, §3.14): the unit-card stat block, hit points and abilities, with a refusal gap written into the duel roll's own settings; multiplayer: one human's Delegate vote counts for every human (`prebattle_single_delegate`), one Continue clears the post-battle screen for every human (`postbattle_single_continue`) |
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
-| 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label |
+| 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
 
 ---
 
@@ -1344,6 +1344,18 @@ reported on the label child (`button_txt`) was not answered, because the listene
 game's `UIComponent`, which is a callable table. Fixed in 0.46.0-beta.2 (verified: real mouse on the
 ACCEPT label and on the REJECT background).
 
+#### `se.ui.fix_ceo_panel() -> ok, message`
+
+Since 0.46.0-beta.3, on by default (turn it off with `ceo_ui_refresh=0`). When a character joins or
+leaves a faction while their character panel is open, the game rebuilds the character's equipment
+data, but the open panel keeps pointing at the old copy, and a right-click on an item card
+(equip / unequip) crashed the game. The DLL notices the rebuild, and this function's 250 ms poll
+then closes the open character panel through its own close button; reopening it shows the live
+data. The DLL also re-points the panel's equipment-manager context at the live data before each of
+its methods runs. UI only: nothing reaches the model, so the setting is not part of the multiplayer
+version lock. Natives: `se_ceo_rebuilt`, `se_ceo_refresh_info`, `se_ceo_refresh_selftest`
+(diagnostic).
+
 #### `se.modify.followup_respond(answer) -> ok, message`
 
 `answer` = `"accept"` or `"reject"`. Queues the answer to the follow-up offer that is on screen
@@ -2010,6 +2022,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `diag_crash` | `1` | crash reporter (§3.18): `0` off, `1` `se_crash.txt` on a fault, `2` also the activity trace `se_activity.txt` |
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
+| `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
