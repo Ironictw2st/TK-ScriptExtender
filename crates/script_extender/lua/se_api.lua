@@ -2848,11 +2848,19 @@ pcall(se.saves.install)
 local function auto_followup()
 	local function install(core)
 		se.core = se.core or core
-		local ok, msg = se.ui.fix_followup_button()
-		if ok then log("follow-up button fix enabled automatically") elseif msg then log("follow-up button fix not enabled: " .. str(msg)) end
+		local f = G("se_followup_propose")
+		if type(f) == "function" and f("installed") then
+			local ok, msg = se.ui.fix_followup_button()
+			if ok then log("follow-up button fix enabled automatically") elseif msg then log("follow-up button fix not enabled: " .. str(msg)) end
+		end
+		if type(se.ui.fix_ceo_panel) == "function" then
+			local ok, msg = se.ui.fix_ceo_panel()
+			log("character panel refresh: " .. str(ok) .. " " .. str(msg))
+		end
 	end
 	local f = G("se_followup_propose")
-	if type(f) ~= "function" or not f("installed") then return end
+	local c = G("se_ceo_rebuilt")
+	if (type(f) ~= "function" or not f("installed")) and type(c) ~= "function" then return end
 	local core = G("core")
 	if type(core) == "table" and type(core.add_listener) == "function" then return install(core) end
 	if type(ENV) ~= "table" or rawget(ENV, "__se_followup_watch") then return end
@@ -2875,6 +2883,47 @@ local function auto_followup()
 	rawset(ENV, "__se_followup_watch", true)
 	setmetatable(ENV, mt)
 end
+-- se.ui.fix_ceo_panel() -> ok, message   (DLL 0.46.0-beta.3+, on by default; off with
+--   ceo_ui_refresh=0). When a character's CEO container is rebuilt (they joined or left a faction)
+--   while their character panel is open, every item card in that panel points at freed CEO objects,
+--   and a right-click on one (equip / unequip) crashed the game. Every 250 ms this asks the DLL
+--   whether such a rebuild happened and, if so, closes the open character panel through its own
+--   close button; the next open builds it from the live data.
+function se.ui.fix_ceo_panel()
+	local okn, err = need("se_ceo_rebuilt")
+	if not okn then return false, err end
+	local info = str(G("se_ceo_refresh_info") and se_ceo_refresh_info() or "")
+	if not string.find(info, "installed=1") then return false, "not installed (ceo_ui_refresh=0 or install failed)" end
+	local core = se.core or G("core")
+	local rt = G("real_timer")
+	if type(core) ~= "table" or type(core.add_listener) ~= "function" then return false, "core (event manager) is not available" end
+	if type(rt) ~= "table" or type(rt.register_repeating) ~= "function" then return false, "real_timer is not available" end
+	local TIMER = "se_ceo_panel_poll"
+	pcall(function() core:remove_listener("se_ceo_panel_poll") end)
+	core:add_listener("se_ceo_panel_poll", "RealTimeTrigger",
+		function(context) return context.string == TIMER end,
+		function()
+			local n, cqis = se_ceo_rebuilt()
+			if not n or n == 0 then return end
+			local root = core.get_ui_root and core:get_ui_root()
+			local finder = G("find_uicomponent")
+			if not root or type(finder) ~= "function" then return end
+			local ok, panel = pcall(finder, root, "character_details")
+			if not ok or not panel then return end
+			local okv, vis = pcall(function() return panel:Visible() end)
+			if not okv or not vis then return end
+			local okb, button = pcall(finder, panel, "button_close")
+			if okb and button then
+				pcall(function() button:SimulateLClick() end)
+				log("character panel closed after a CEO rebuild (cqi " .. str(cqis) .. "); reopen it for live data")
+			end
+		end, true)
+	local ok = pcall(rt.register_repeating, TIMER, 250)
+	if not ok then ok = pcall(rt.register_repeating, rt, TIMER, 250) end
+	if not ok then return false, "could not start the real timer" end
+	return true, "polling every 250 ms"
+end
+
 pcall(auto_followup)
 
 log("se_api loaded (dll " .. se.version() .. ")")

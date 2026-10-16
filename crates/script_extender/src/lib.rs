@@ -44,6 +44,7 @@ mod marriage;
 mod prebattle;
 mod navalland;
 mod dilemma;
+mod ceoguard;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
@@ -131,6 +132,8 @@ fn bootstrap() {
     prebattle::install(&table);
     crash::boot("navalland");
     navalland::install(&table);
+    crash::boot("ceoguard");
+    ceoguard::install(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"
