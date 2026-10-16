@@ -2047,16 +2047,20 @@ local FOLLOWUP_BUTTONS = { button_accept = true, button_txt = true, button_rejec
 --   "followup" (the player proposes: MEDIATE PEACE), "respond" (an offer the player answers:
 --   the emperor holder's ultimatum), false = another panel, nil = cannot tell (no UIComponent in
 --   reach: hand it over as se.UIComponent; the natives have their own guards then).
---   button = "accept" / "reject" when button_accept / button_reject is the component or a parent.
+--   button = "accept" / "reject" when button_accept / button_reject is the component or a parent
+--   (a click on a button's label lands on its button_txt child).
+--   UIComponent is a callable table in the campaign state (0.46.0-beta.2: a table was taken for
+--   "no UIComponent" before, so a click on a label could not be answered); a component that cannot
+--   be converted or read means "cannot tell" (nil), never "another panel".
 local function popup_of(address)
 	local UIC = se.UIComponent or G("UIComponent")
-	if type(UIC) ~= "function" then return nil end
+	if type(UIC) ~= "function" and type(UIC) ~= "table" then return nil end
 	local okc, uic = pcall(UIC, address)
 	local button
 	for _ = 1, 16 do
-		if not okc or not uic then return false end
+		if not okc or not uic then return nil end
 		local oki, id = pcall(function() return uic:Id() end)
-		if not oki then return false end
+		if not oki or type(id) ~= "string" then return nil end
 		if button == nil and id == "button_accept" then button = "accept" end
 		if button == nil and id == "button_reject" then button = "reject" end
 		if id == FOLLOWUP_PANEL then return "followup", button end
