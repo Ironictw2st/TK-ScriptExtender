@@ -2040,19 +2040,27 @@ end
 se.ui = se.ui or {}
 
 local FOLLOWUP_PANEL = "diplomacy_followup_negotiation_popup_panel"
-local FOLLOWUP_BUTTONS = { button_accept = true, button_txt = true }
+local RESPOND_PANEL = "diplomacy_popup_panel"
+local FOLLOWUP_BUTTONS = { button_accept = true, button_txt = true, button_reject = true }
 
--- is the clicked component part of the follow-up negotiation popup? nil = cannot tell (no
--- UIComponent in reach: hand it over as se.UIComponent); the native has its own guards then
-local function in_followup_popup(address)
+-- Which popup holds the clicked component, and which of its buttons was hit:
+--   "followup" (the player proposes: MEDIATE PEACE), "respond" (an offer the player answers:
+--   the emperor holder's ultimatum), false = another panel, nil = cannot tell (no UIComponent in
+--   reach: hand it over as se.UIComponent; the natives have their own guards then).
+--   button = "accept" / "reject" when button_accept / button_reject is the component or a parent.
+local function popup_of(address)
 	local UIC = se.UIComponent or G("UIComponent")
 	if type(UIC) ~= "function" then return nil end
 	local okc, uic = pcall(UIC, address)
+	local button
 	for _ = 1, 16 do
 		if not okc or not uic then return false end
 		local oki, id = pcall(function() return uic:Id() end)
 		if not oki then return false end
-		if id == FOLLOWUP_PANEL then return true end
+		if button == nil and id == "button_accept" then button = "accept" end
+		if button == nil and id == "button_reject" then button = "reject" end
+		if id == FOLLOWUP_PANEL then return "followup", button end
+		if id == RESPOND_PANEL then return "respond", button end
 		local okp, parent = pcall(function() return uic:Parent() end)
 		if not okp or not parent then return false end
 		okc, uic = pcall(UIC, parent)
@@ -2071,10 +2079,28 @@ function se.modify.followup_propose()
 	return se_followup_propose()
 end
 
+-- se.modify.followup_respond(answer) -> ok, message   (DLL 0.45.1+; answer = "accept" | "reject")
+--   The other side of a follow-up: the AI's follow-up offer to the player (the emperor holder's
+--   "Issue Ultimatum": peace on behalf of the Han, or war). Sends the engine's own accept / reject
+--   command for the offer that is on screen, through the normal command queue. Refused when no
+--   such offer is waiting or the engine just handled the click itself.
+function se.modify.followup_respond(answer)
+	local okn, err = need("se_followup_respond")
+	if not okn then return false, err end
+	if answer ~= "accept" and answer ~= "reject" then return false, "answer must be \"accept\" or \"reject\"" end
+	return se_followup_respond(answer)
+end
+
+local function trace_mark(text)
+	if type(G("se_dip_trace_mark")) == "function" then se_dip_trace_mark(text) end
+end
+
 -- se.ui.fix_followup_button() -> ok, message
 --   On game build 1.7.2.0 the call-for-action button of that popup is lit but dead: a click never
 --   reaches its ProposeDeal command. This listens for the click and proposes through
---   se.modify.followup_propose(). Needs se.core = core. Call it once per campaign session (first
+--   se.modify.followup_propose(). Since DLL 0.45.1 it also repairs the other side: ACCEPT /
+--   REJECT of a follow-up offer the player answers (diplomacy_popup) go through
+--   se.modify.followup_respond(). Needs se.core = core. Call it once per campaign session (first
 --   tick); calling it again replaces the listener.
 function se.ui.fix_followup_button()
 	local okn, err = need("se_followup_propose")
@@ -2083,16 +2109,29 @@ function se.ui.fix_followup_button()
 	if not installed then return false, why end
 	local core = se.core or G("core")
 	if type(core) ~= "table" or type(core.add_listener) ~= "function" then return false, "core (event manager) is not available: set se.core = core first" end
+	local respond_on = type(G("se_followup_respond")) == "function" and se_followup_respond("installed") == true
 	pcall(function() core:remove_listener("se_followup_button") end)
 	core:add_listener("se_followup_button", "ComponentLClickUp",
 		function(context) return FOLLOWUP_BUTTONS[context.string] == true end,
 		function(context)
-			if in_followup_popup(context.component) == false then return end
+			local kind, button = popup_of(context.component)
+			if kind == false then return end
+			if button == nil then
+				if context.string == "button_accept" then button = "accept" elseif context.string == "button_reject" then button = "reject" end
+			end
+			-- an offer the player answers: the native refuses unless one is waiting on screen
+			if respond_on and kind ~= "followup" and button ~= nil then
+				local ok, msg = se_followup_respond(button)
+				trace_mark("lua click " .. str(context.string) .. " answer " .. button .. " -> " .. str(ok) .. " " .. str(msg))
+				log("follow-up offer button (" .. button .. "): " .. str(ok) .. " " .. str(msg))
+				if ok or kind == "respond" then return end
+			end
+			if kind == "respond" or button == "reject" then return end
 			local ok, msg = se.modify.followup_propose()
-			if type(G("se_dip_trace_mark")) == "function" then se_dip_trace_mark("lua click " .. str(context.string) .. " -> " .. str(ok) .. " " .. str(msg)) end
+			trace_mark("lua click " .. str(context.string) .. " -> " .. str(ok) .. " " .. str(msg))
 			log("follow-up popup button: " .. str(ok) .. " " .. str(msg))
 		end, true)
-	return true, "listening"
+	return true, respond_on and "listening (propose and answer)" or "listening (propose)"
 end
 
 ----------------------------------------------------------------------------------------------
