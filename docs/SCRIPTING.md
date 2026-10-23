@@ -1356,6 +1356,32 @@ its methods runs. UI only: nothing reaches the model, so the setting is not part
 version lock. Natives: `se_ceo_rebuilt`, `se_ceo_refresh_info`, `se_ceo_refresh_selftest`
 (diagnostic).
 
+#### `se.diag.engine_guards() -> table` / `se.diag.engine_guards_selftest() -> ok, message`
+
+Since 0.46.0-guards.1 (local test build), on by default (turn it off with `engine_crash_guards=0`).
+Four game crashes come from the engine reading a missing value without checking it first. Each
+guard makes that one spot behave the way the same function already behaves when the value is
+missing elsewhere:
+
+| Guard | Crash it prevents | With the guard |
+|---|---|---|
+| `inactive_string` | an attitude line for a diplomacy event whose "inactive" text group is empty (exe+0x2F67DF5) | the line gets no inactive text |
+| `ceo_owner` | "does this owner hold this item" asked about a missing owner, e.g. hovering an item card (exe+0x18B4060) | the answer is "no" |
+| `text_font` | text laid out with a font that is not loaded (exe+0x641657) | the text is not measured, as the rest of the routine already does for a missing font |
+| `building_browser` | a building level that does not resolve in the building browser list (exe+0xCE4A90) | that level is left out of the list |
+
+```lua
+local g = se.diag.engine_guards()
+if g then ModLog("ceo owner guard caught " .. tostring(g.ceo_owner_hits) .. " missing owners") end
+local ok, msg = se.diag.engine_guards_selftest()  -- calls the guarded functions on test objects
+```
+
+`se.diag.engine_guards()` returns `inactive_string`, `ceo_owner`, `text_font` and
+`building_browser` (true when installed) and `inactive_string_hits`, `ceo_owner_hits` and
+`building_browser_hits` (how often each one stepped in; `text_font` has no counter). The
+`ceo_owner` lookup is also used by the campaign model, so `engine_crash_guards` is part of the
+multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_selftest`.
+
 #### `se.modify.followup_respond(answer) -> ok, message`
 
 `answer` = `"accept"` or `"reject"`. Queues the answer to the follow-up offer that is on screen
@@ -2023,6 +2049,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 | `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
+| `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |

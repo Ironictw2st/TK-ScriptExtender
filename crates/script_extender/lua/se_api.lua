@@ -2924,6 +2924,32 @@ function se.ui.fix_ceo_panel()
 	return true, "polling every 250 ms"
 end
 
+-- se.diag.engine_guards() -> table   (DLL 0.46.0-guards.1+, on by default; off with
+--   engine_crash_guards=0). Which engine crash guards are installed and how often each one has
+--   caught its NULL: { inactive_string = true, inactive_string_hits = 0, ceo_owner = true,
+--   ceo_owner_hits = 0, text_font = true, building_browser = true, building_browser_hits = 0 }.
+--   text_font has no counter (it is an in-place code patch). Read-only.
+function se.diag.engine_guards()
+	local okn, err = need("se_engine_guards_info")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in string.gmatch(str(se_engine_guards_info()), "([%w_]+)=(%d+)") do
+		if string.sub(k, -5) == "_hits" then t[k] = tonumber(v) else t[k] = (v == "1") end
+	end
+	return t
+end
+
+-- se.diag.engine_guards_selftest() -> ok, message
+--   Calls the two detoured engine functions on objects built inside the DLL (never the game's):
+--   InactiveString on an event with no inactive factor group (must not crash or set a string) plus
+--   a control with a group (must set it), and the CEO-owner lookup on a NULL owner (must answer
+--   false); re-reads the text-font and building-browser code patches. Safe to run at any time.
+function se.diag.engine_guards_selftest()
+	local okn, err = need("se_engine_guards_selftest")
+	if not okn then return false, err end
+	return se_engine_guards_selftest()
+end
+
 pcall(auto_followup)
 
 log("se_api loaded (dll " .. se.version() .. ")")
