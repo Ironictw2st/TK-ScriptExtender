@@ -7,9 +7,9 @@ KINGDOMS **build 1.7.2.0**. Audience: mod authors who already know 3K campaign s
 Sources of truth for this document: `crates/script_extender/lua/se_api.lua` (signatures),
 the DLL sources under `crates/script_extender/src/` (defaults, refusals), `HANDOFF.md`
 (injection rules, version history), `notes/*.md` (behaviour, live verification). Current DLL
-version at the time of writing: **0.45.0** (2026-10-11): 0.43.0 plus the 0.44 pre-release line
-(battles on water fought as land battles, the real dilemma choice key, the MEDIATE PEACE repair on
-by default) and a fix that keeps that repair out of the ordinary diplomacy screen.
+version at the time of writing: **0.46.0** (2026-10-24): 0.45.0 plus the 0.46 pre-release line
+(saved script values survive a load again, the emperor ultimatum ACCEPT / REJECT repair, the
+character panel refresh after a CEO rebuild).
 
 ### Which DLL version a feature needs
 

@@ -1,8 +1,8 @@
 # Script extender DLL: handoff for the mod-manager integration
 
 Written 2026-09-17. Everything below was verified live on Total War: THREE KINGDOMS **1.7.2.0**
-(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.45.0** (2026-10-11, tag `v0.45.0`; the code of the untagged
-0.44.0-beta.3); previous stable 0.43.0; the next pre-release line is 0.46.0-beta.N
+(Steam build 25370317) unless marked otherwise. Current stable DLL: **0.46.0** (2026-10-24, tag `v0.46.0`; the code of 0.46.0-beta.3);
+previous stable 0.45.0; the next pre-release line is 0.47.0-beta.N
 (`script_extender.dll` + `injector.exe`; releases are the `v*` tags on GitHub). Source:
 `Z:\Claude\ScriptExtender` (Rust workspace). Deep RE notes: `notes/*.md`; day-to-day rules:
 `CLAUDE.md`; **scripting documentation for mod authors: `docs/SCRIPTING.md`**.
@@ -302,6 +302,13 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   stale manager context, and `se.ui.fix_ceo_panel()` (auto) closes the open character_details within
   250 ms of a rebuild. cfg `ceo_ui_refresh` (UI only, not in the sync tag). Reproduced 2x without
   the panel close, 0 crashes in 2 runs with it; details in the sebugs worktree notes/ceo_panel_crash.md.
+- **0.46.0 stable (2026-10-24)** = the 0.46.0-beta.3 code. Headline: saved script state survives a load
+  again. From 0.42.0-beta.2 to 0.45.0 every value loaded through `cm:load_named_value` with a string
+  or table default (above all `saved_values`, the store of every `cm:set_saved_value`) came back empty
+  after a load. Seen by players as: Cao Cao's schemes reset on reload while their effects stayed
+  (slot free, no cooldown), completed missions issued again, and other scripted state restarting
+  (faction council, emperor and storybook managers, progression movies, Nanman tech / skills /
+  fealty, mod flags). Fixed in 0.46.0-beta.1; state already lost in a save does not come back.
 
 ## 7. When the game updates
 
