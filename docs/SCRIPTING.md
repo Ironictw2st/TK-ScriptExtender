@@ -34,6 +34,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
 | 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
+| 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock |
 
 ---
 
@@ -1674,6 +1675,79 @@ local t = se.query.marriage_hook()   -- { installed, generations, verdicts, sear
 
 ---
 
+### 3.21 Audio: Wwise events and the jukebox
+
+Since: DLL 0.47.0-beta.1 (check with
+`se.audio.available()`). Works in the frontend and the campaign. Audio is local to the machine
+and changes nothing in the simulation, so it is allowed anywhere, multiplayer included, and is
+not part of the version lock. cfg `audio=0` turns the module off (natives then report
+"unavailable").
+
+The DLL posts Wwise events on its own game object (`0x190E5E00`), separate from every engine
+emitter. Any event whose bank is loaded can be played. `Play_Movie_*` soundtracks are always
+loaded (`global_movies__core.bnk`). Battle music events (`Music_B_*`) are only loaded in battle,
+and the vanilla dynamic battle music needs the battle state machine, so a jukebox should use its
+own events. A bank shipped in a mod pack under `audio\wwise\` whose name starts with `global`
+loads at startup. Posting by name or id skips `event_data.dat`, which is only the engine's own
+name registry. Verification: notes/audio_wwise.md.
+
+**Event ids are strings.** `lua_Number` is a 32-bit float in this game, so a 32-bit Wwise id
+like `0xd80b6c61` does not survive as a number. Pass the event *name* (hashed by the DLL exactly
+like Wwise's `GetIDFromString`: FNV-1 of the lower-cased name) or a `"0x"`-hex string. Playing ids
+are small sequential integers and are returned as numbers.
+
+#### `se.audio.available() -> ok, reason`
+`false, reason` when the DLL has no audio module, its anchors did not match, or `audio=0`.
+
+#### `se.audio.post(event [, opts]) -> playing_id | nil, message`
+`opts.on_end(info)` is called once when the track ends, with `info = { id, event = "0x..",
+reason }`. `reason` is `"end"` (it finished or was stopped) or `"transition"` (a loading screen
+stopped it; do not auto-advance). `opts.position = true` enables `se.audio.position`. An event
+that is not loaded returns `nil, "event 0x... is not loaded"`. `Game_Mode_*` events are refused:
+they set the engine's global mode state and silenced the menu music in testing.
+
+End notifications come from Wwise's audio thread. The DLL queues them and `se_api.lua` drains the
+queue every 250 ms with the engine's `real_timer` (`RealTimeTrigger`), which also runs in the
+frontend. The timer starts on the first `post` or `on_transition`. `se.audio.poll()` drains it
+immediately.
+
+#### `se.audio.stop(target [, fade_ms])`, `se.audio.pause(...)`, `se.audio.resume(...) -> ok, message`
+`target` is a playing id from `post` (only tracks posted through `se.audio`) or an event name /
+`"0x"` id (every instance of it on the jukebox object). `fade_ms` defaults to 0, max 60000.
+
+#### `se.audio.vanilla_music(on [, fade_ms]) -> ok, message`, `se.audio.vanilla_music_paused() -> boolean`
+`false` pauses the game's dynamic music (`Global_Music_Play` on the engine's global emitter) and
+keeps it paused. Wwise pauses stack, and the game's own `Global_Music_Resume` is a master resume
+that clears every level. So whenever the game's music controller resumes the music or starts a new
+`Global_Music_Play`, the DLL pauses it again, keeping exactly one pause level. A second
+`vanilla_music(false)` is a no-op.
+`true` resumes it, unless the game itself has the music paused, in which case the game's own
+resume follows. A loading screen releases the pause.
+
+#### `se.audio.set_state(group, value) -> ok, message`
+Wwise SetState by names or `"0x"` ids. The group `Game_Mode` is refused.
+
+#### `se.audio.position(playing_id) -> ms | nil, message`
+Playback position of a track posted with `position = true`. Only plain sounds have one; music
+containers return nil.
+
+#### `se.audio.active_count() -> number`, `se.audio.on_transition(fn)`
+`on_transition(fn)` calls `fn()` when a loading screen starts (frontend -> campaign, campaign <->
+battle). At that moment the DLL has already stopped every jukebox track (500 ms fade) and
+released the vanilla pause. A Lua state that survives the load can restart its music afterwards.
+
+```lua
+if se and se.audio and se.audio.available() then
+  se.audio.vanilla_music(false, 1000)
+  local id = se.audio.post("Play_Movie_3K_main_three_kingdoms", {
+    on_end = function(info)
+      if info.reason == "end" then se.audio.vanilla_music(true, 2000) end
+    end })
+end
+```
+
+---
+
 ## 4. Recipes
 
 Each of these is a complete script. Console scripts live in `<game root>\lua_scripts\` and are
@@ -2023,6 +2097,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ai_recruit_hook` | `1` | `0` skips the AI recruitment planner hook (no AI recruitment trace, no AI scope for the caches) |
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 | `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
+| `audio` | `1` (DLL 0.47.0-beta.1+) | `0` turns the audio module off: no Wwise detours, `se.audio.available()` is false (§3.21). Local, not in the version lock |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
@@ -2339,6 +2414,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.query.world_leaders()` | faction keys holding an emperor seat |
 | `se.region(key)` | checked cm:query_region |
 | `se.saves.info()` | save chunking state (saved values above 64 KiB) |
+| `se.audio.available/post/stop/pause/resume/vanilla_music/...` | Wwise audio for jukeboxes, local only (§3.21) |
 | `se.version()` | DLL version string |
 
 ### Values the module reads from you, and its own state

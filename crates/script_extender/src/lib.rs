@@ -10,6 +10,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod addrs;
+mod audio;
 mod freeze;
 mod hook;
 mod logging;
@@ -134,6 +135,8 @@ fn bootstrap() {
     navalland::install(&table);
     crash::boot("ceoguard");
     ceoguard::install(&table);
+    crash::boot("audio");
+    audio::install(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"

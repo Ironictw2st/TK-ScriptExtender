@@ -310,6 +310,13 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   (faction council, emperor and storybook managers, progression movies, Nanman tech / skills /
   fealty, mod flags). Fixed in 0.46.0-beta.1; state already lost in a save does not come back.
 
+- 0.47.0-beta.1 (2026-10-29, pre-release): Wwise audio for Lua jukeboxes (`audio.rs`, `se.audio`,
+  SCRIPTING.md §3.21), ported unchanged from the 13 Oct audio-test-2 build onto 0.46.0. Posts events on
+  its own game object, pauses the game's music and keeps it paused (detour on the music controller
+  FUN_140794900), and stops jukebox tracks at a loading screen (detour on Wwise SetState). Own 16-byte
+  anchors: a mismatch turns only audio off. cfg `audio` (default 1; local, not in the sync tag).
+  Consumer: the 190E Soundtrack panel.
+
 ## 7. When the game updates
 
 1. New `TimeDateStamp` / `SizeOfImage` -> update the constants in `src/addrs.rs`.

@@ -2926,4 +2926,166 @@ end
 
 pcall(auto_followup)
 
+-- ---------------------------------------------------------------------------------------------
+-- se.audio: Wwise events on the extender's own game object (DLL with se_audio_* natives; 190E "Soundtrack" jukebox)
+--
+--   se.audio.available() -> ok, reason
+--   se.audio.post(event [, {on_end = fn(info), position = bool}]) -> playing_id | nil, message
+--       event = Wwise event name ("Play_Movie_mainmenu_1") or "0x"-hex id string. Never pass a
+--       32-bit id as a number: lua_Number is a 32-bit float here and would corrupt it.
+--       on_end(info) gets { id, event = "0x..", reason = "end" | "transition" }; "transition" =
+--       the track was stopped because a loading screen started (do not auto-advance on it).
+--       Game_Mode_* events are refused.
+--   se.audio.stop(target [, fade_ms]) / pause / resume -> ok, message
+--       target = a playing id from post, or an event name / "0x" id (every instance on our object)
+--   se.audio.set_state(group, value) -> ok, message      names or "0x" ids; Game_Mode refused
+--   se.audio.position(playing_id) -> ms | nil, message   needs post(..., {position = true}); plain
+--                                                        sounds only (music containers have none)
+--   se.audio.vanilla_music(on [, fade_ms]) -> ok, message
+--       false = pause the game's own dynamic music and keep it paused (the game's resume / re-post
+--       is undone by the DLL) until vanilla_music(true) or the next loading screen
+--   se.audio.vanilla_music_paused() -> bool
+--   se.audio.active_count() -> number of jukebox tracks playing
+--   se.audio.on_transition(fn)                           fn() when a loading screen starts (all
+--                                                        jukebox tracks are stopped by the DLL)
+--   se.audio.poll()                                      drain end notifications now (a real-time
+--                                                        timer does it every 250 ms after the
+--                                                        first post)
+-- Audio is local to this machine and changes nothing in the simulation: safe in multiplayer.
+-- ---------------------------------------------------------------------------------------------
+se.audio = se.audio or {}
+local AU = { on_end = {}, on_transition = {}, timer = false }
+se.audio._state = AU
+local AU_TIMER = "se_audio_poll"
+
+local function au_info()
+	local f = G("se_audio_info")
+	if type(f) ~= "function" then return false, "native se_audio_info is not available (DLL without the audio module, or not injected)" end
+	return f()
+end
+
+function se.audio.available()
+	local ok, reason = au_info()
+	return ok == true, reason
+end
+
+function se.audio.vanilla_music_paused()
+	local ok, _, paused = au_info()
+	return ok == true and paused == true
+end
+
+function se.audio.active_count()
+	local ok, _, _, n = au_info()
+	if ok ~= true then return 0 end
+	return n or 0
+end
+
+function se.audio.poll()
+	local f = G("se_audio_poll")
+	if type(f) ~= "function" then return 0 end
+	local items = f()
+	if type(items) ~= "table" then return 0 end
+	for _, it in ipairs(items) do
+		if it.id == 0 then
+			for _, fn in ipairs(AU.on_transition) do
+				local ok, err = pcall(fn)
+				if not ok then log("audio on_transition error: " .. str(err)) end
+			end
+		else
+			local cb = AU.on_end[it.id]
+			AU.on_end[it.id] = nil
+			if cb then
+				local ok, err = pcall(cb, it)
+				if not ok then log("audio on_end error: " .. str(err)) end
+			end
+		end
+	end
+	return #items
+end
+
+-- The engine's real_timer drives RealTimeTrigger in the frontend and the campaign alike
+-- (cm:repeat_callback is campaign-only). Started on first use: core does not exist yet when this
+-- chunk runs at state creation.
+local function au_start_timer()
+	if AU.timer then return true end
+	local core, rt = G("core"), G("real_timer")
+	if type(core) ~= "table" or type(rt) ~= "table" or type(rt.register_repeating) ~= "function" then
+		return false
+	end
+	local ok_l = pcall(function()
+		core:add_listener("se_audio_poll_listener", "RealTimeTrigger",
+			function(context)
+				local okc, s = pcall(function() return context.string end)
+				return not okc or s == nil or s == AU_TIMER
+			end,
+			function() se.audio.poll() end, true)
+	end)
+	local ok_t = pcall(rt.register_repeating, AU_TIMER, 250)
+	if not ok_t then ok_t = pcall(rt.register_repeating, rt, AU_TIMER, 250) end
+	AU.timer = ok_l and ok_t
+	if not AU.timer then log("audio: could not start the poll timer (listener " .. str(ok_l) .. ", timer " .. str(ok_t) .. "); call se.audio.poll() yourself") end
+	return AU.timer
+end
+
+local function au_event(ev)
+	if type(ev) == "number" then
+		if ev >= 16777216 then return nil, "event ids above 2^24 must be passed as \"0x\" strings (lua numbers are 32-bit floats)" end
+		return tostring(math.floor(ev))
+	end
+	if type(ev) ~= "string" or ev == "" then return nil, "event name or \"0x\" id expected" end
+	return ev
+end
+
+function se.audio.post(ev, opts)
+	local okn, err = need("se_audio_post")
+	if not okn then return nil, err end
+	local e, emsg = au_event(ev)
+	if not e then return nil, emsg end
+	opts = opts or {}
+	local id, msg = se_audio_post(e, opts.position == true)
+	if not id then return nil, msg end
+	if type(opts.on_end) == "function" then AU.on_end[id] = opts.on_end end
+	au_start_timer()
+	return id, msg
+end
+
+local function au_action(target, action, fade_ms)
+	local okn, err = need("se_audio_action")
+	if not okn then return false, err end
+	if type(target) == "number" then
+		return se_audio_action(target, action, fade_ms or 0)
+	end
+	local e, emsg = au_event(target)
+	if not e then return false, emsg end
+	return se_audio_action(e, action, fade_ms or 0)
+end
+
+function se.audio.stop(target, fade_ms) return au_action(target, 0, fade_ms) end
+function se.audio.pause(target, fade_ms) return au_action(target, 1, fade_ms) end
+function se.audio.resume(target, fade_ms) return au_action(target, 2, fade_ms) end
+
+function se.audio.set_state(group, value)
+	local okn, err = need("se_audio_set_state")
+	if not okn then return false, err end
+	if type(group) ~= "string" or type(value) ~= "string" then return false, "group and value must be names or \"0x\" strings" end
+	return se_audio_set_state(group, value)
+end
+
+function se.audio.position(id)
+	local okn, err = need("se_audio_position")
+	if not okn then return nil, err end
+	return se_audio_position(num(id) or 0)
+end
+
+function se.audio.vanilla_music(on, fade_ms)
+	local okn, err = need("se_audio_vanilla")
+	if not okn then return false, err end
+	return se_audio_vanilla(on == true, fade_ms or 0)
+end
+
+function se.audio.on_transition(fn)
+	if type(fn) == "function" then AU.on_transition[#AU.on_transition + 1] = fn end
+	au_start_timer()
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")
