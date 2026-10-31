@@ -48,6 +48,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_pool_lock_set", se_pool_lock_set);
     crate::recruit::register(l);
     crate::audio::register(l);
+    crate::uidev::register(l);
     crate::units::register(l);
     crate::progression::register(l);
     crate::chars::register(l);

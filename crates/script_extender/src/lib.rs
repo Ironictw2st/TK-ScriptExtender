@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod addrs;
 mod audio;
+mod uidev;
 mod freeze;
 mod hook;
 mod logging;
@@ -137,6 +138,7 @@ fn bootstrap() {
     ceoguard::install(&table);
     crash::boot("audio");
     audio::install(&table);
+    uidev::install();
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"

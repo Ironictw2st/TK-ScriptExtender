@@ -3088,4 +3088,271 @@ function se.audio.on_transition(fn)
 	au_start_timer()
 end
 
+----------------------------------------------------------------------------------------------
+-- UI dev loader (DLL 0.47+): open a .twui.xml and its Lua from disk, rebuilt when either file
+-- is saved. For testing layouts without a pack. Refused in multiplayer.
+----------------------------------------------------------------------------------------------
+
+se.ui = se.ui or {}
+local DEV = { handles = {}, order = {}, timer = false }
+local DEV_TIMER = "se_ui_dev_watch"
+
+-- The layout's Lua runs in the environment of whoever called se.ui.open (console, mod script):
+-- core, cm, find_uicomponent ... live there, not in the raw globals this chunk sees.
+local function DG(name, env)
+	env = env or DEV.env
+	local v = type(env) == "table" and env[name] or nil
+	if v == nil then v = G(name) end
+	return v
+end
+local function dev_core(env) return se.core or DG("core", env) end
+
+local function dev_key(path) return string.lower((string.gsub(str(path), "\\", "/"))) end
+
+-- Multiplayer: the attached Lua could change the simulation on this machine only.
+local function dev_mp()
+	local cm, bm = DG("cm"), DG("bm")
+	if type(cm) == "table" then
+		local ok, mp = pcall(function() return cm:query_model():is_multiplayer() end)
+		if not ok or type(mp) ~= "boolean" then ok, mp = pcall(function() return cm:is_multiplayer() end) end
+		if not ok or type(mp) ~= "boolean" then return true end
+		return mp
+	end
+	if type(bm) == "table" then
+		local ok, mp = pcall(function() return bm:is_multiplayer() end)
+		return ok and mp == true
+	end
+	return false
+end
+
+local function dev_uic(address)
+	local UIC = se.UIComponent or DG("UIComponent")
+	if type(UIC) ~= "function" and type(UIC) ~= "table" then return nil end
+	local ok, u = pcall(UIC, address)
+	if ok then return u end
+end
+
+-- parent: nil (UI root), a UIComponent object or a component address
+local function dev_parent(parent)
+	if parent == nil then
+		local core = dev_core()
+		local ok, root = pcall(function() return core:get_ui_root() end)
+		if not ok or not root then return nil, "no UI root in this Lua state" end
+		return root
+	end
+	if type(parent) == "table" or type(parent) == "userdata" then
+		local ok, a = pcall(function() return parent:Address() end)
+		if ok and a then return a end
+	end
+	return parent
+end
+
+local function dev_close_parts(h)
+	if type(h.on_close) == "function" then
+		local ok, e = pcall(h.on_close, h)
+		if not ok then log("ui dev: on_close of " .. h.twui .. " failed: " .. str(e)) end
+	end
+	h.on_close = nil
+	local core = dev_core(h.env)
+	for _, name in ipairs(h.listeners) do
+		pcall(function() core:remove_listener(name) end)
+	end
+	h.listeners = {}
+	if h.component then
+		local u = dev_uic(h.component)
+		if u then pcall(function() u:Destroy() end) end
+	end
+	h.component = nil
+end
+
+-- Run one Lua file with the component; every core:add_listener it makes while it runs is
+-- recorded so the next reload can remove it. A returned function becomes on_close.
+local function dev_run_lua(h, path, uic)
+	local chunk, err = se_uidev_load_lua(path)
+	if not chunk then return false, err end
+	if type(h.env) == "table" then pcall(setfenv, chunk, h.env) end
+	local core = dev_core(h.env)
+	local orig = type(core) == "table" and core.add_listener or nil
+	-- core is an instance: the method usually lives in its class, so put back exactly what the
+	-- instance held before (nil = inherited again)
+	local own = orig and rawget(core, "add_listener")
+	if orig then
+		rawset(core, "add_listener", function(self, name, ...)
+			h.listeners[#h.listeners + 1] = name
+			return orig(self, name, ...)
+		end)
+	end
+	local ok, r = pcall(chunk, uic, h)
+	if orig then rawset(core, "add_listener", own or nil) end
+	if not ok then return false, str(r) end
+	if type(r) == "function" then h.on_close = r end
+	return true
+end
+
+local function dev_build(h)
+	local virtual, err = se_uidev_place(h.twui)
+	if not virtual then return false, err end
+	local parent, perr = dev_parent(h.parent)
+	if not parent then return false, perr end
+	-- the UI root (and a parent handed over as an object) is already a UIComponent
+	local pu = parent
+	local okm, m = pcall(function() return parent.CreateComponent end)
+	if not okm or type(m) ~= "function" then pu = dev_uic(parent) end
+	if not pu then return false, "UIComponent is not available in this Lua state" end
+	local ok, c = pcall(function() return pu:CreateComponent(h.name, virtual) end)
+	if not ok or not c then return false, "CreateComponent(" .. virtual .. ") failed: " .. str(c) end
+	h.component = c
+	local uic = dev_uic(c)
+	for _, p in ipairs(h.lua) do
+		local okl, lerr = dev_run_lua(h, p, uic)
+		if not okl then return false, p .. ": " .. str(lerr) end
+	end
+	return true
+end
+
+local function dev_stamps(h)
+	local t = { se_uidev_stamp(h.twui) or "missing" }
+	for _, p in ipairs(h.lua) do t[#t + 1] = se_uidev_stamp(p) or "missing" end
+	return table.concat(t, "|")
+end
+
+local function dev_reload(h)
+	dev_close_parts(h)
+	h.stamp = dev_stamps(h)
+	local ok, err = dev_build(h)
+	h.reloads = h.reloads + 1
+	if ok then
+		h.error = nil
+		log("ui dev: " .. h.twui .. " loaded (#" .. h.reloads .. ", " .. #h.listeners .. " listener(s))")
+	else
+		h.error = err
+		log("ui dev: " .. h.twui .. " FAILED: " .. str(err))
+		-- a half-built layout or half-run script must not stay behind
+		dev_close_parts(h)
+	end
+	return ok, err
+end
+
+local function dev_poll()
+	for _, key in ipairs(DEV.order) do
+		local h = DEV.handles[key]
+		if h and h.watch then
+			local s = dev_stamps(h)
+			if s ~= h.stamp then dev_reload(h) end
+		end
+	end
+end
+
+local function dev_start_timer()
+	if DEV.timer then return true end
+	local core, rt = dev_core(), DG("real_timer")
+	if type(core) == "table" and type(rt) == "table" and type(rt.register_repeating) == "function" then
+		local ok_l = pcall(function()
+			core:add_listener("se_ui_dev_watch_listener", "RealTimeTrigger",
+				function(context)
+					local okc, s = pcall(function() return context.string end)
+					return okc and s == DEV_TIMER
+				end,
+				function() dev_poll() end, true)
+		end)
+		local ok_t = pcall(rt.register_repeating, DEV_TIMER, 500)
+		if not ok_t then ok_t = pcall(rt.register_repeating, rt, DEV_TIMER, 500) end
+		DEV.timer = ok_l and ok_t
+	end
+	if not DEV.timer then
+		local get_tm = DG("get_tm")
+		if type(get_tm) == "function" then
+			DEV.timer = pcall(function() get_tm():repeat_callback(dev_poll, 500, DEV_TIMER) end)
+		end
+	end
+	if not DEV.timer then log("ui dev: no repeating timer in this Lua state; call se.ui.reload() after saving") end
+	return DEV.timer
+end
+
+-- se.ui.open(twui_path, opts) -> handle | nil, message
+--   opts.lua    = path or { paths }   Lua run after the layout is created, as chunk(component, handle)
+--                                      (default: <same folder>/<stem>.lua when it exists)
+--   opts.parent = UIComponent or address (default: UI root)
+--   opts.name   = component name (default: se_dev_<stem>)
+--   opts.watch  = false to turn off the rebuild on save
+--   opts.env    = environment for the Lua (default: the caller's, where core / cm live)
+-- Opening a path that is already open reloads it with the new options.
+function se.ui.open(twui, opts)
+	local okn, err = need("se_uidev_place", "se_uidev_stamp", "se_uidev_load_lua")
+	if not okn then return nil, err end
+	if type(twui) ~= "string" or not string.match(string.lower(twui), "%.twui%.xml$") then
+		return nil, "a .twui.xml path is expected"
+	end
+	if dev_mp() then return nil, "refused in multiplayer: the layout's Lua would run on this machine only" end
+	opts = opts or {}
+	local okf, caller = pcall(getfenv, 2)
+	local env = opts.env or (okf and type(caller) == "table" and caller) or nil
+	if env then DEV.env = env end
+	local lua = opts.lua
+	if type(lua) == "string" then lua = { lua } end
+	if lua == nil then
+		local sib = string.gsub(twui, "%.[tT][wW][uU][iI]%.[xX][mM][lL]$", ".lua")
+		lua = se_uidev_stamp(sib) and { sib } or {}
+	end
+	local stem = string.match(dev_key(twui), "([^/]+)%.twui%.xml$") or "layout"
+	local key = dev_key(twui)
+	local h = DEV.handles[key]
+	if h then dev_close_parts(h) else
+		h = { listeners = {}, reloads = 0 }
+		DEV.handles[key] = h
+		DEV.order[#DEV.order + 1] = key
+	end
+	h.twui, h.lua, h.parent, h.env = twui, lua, opts.parent, env or DEV.env
+	h.name = opts.name or ("se_dev_" .. stem)
+	h.watch = opts.watch ~= false
+	local ok, rerr = dev_reload(h)
+	if h.watch then dev_start_timer() end
+	if not ok then return nil, rerr end
+	return h
+end
+
+local function dev_find(x)
+	if type(x) == "table" and x.twui then return x end
+	if type(x) == "string" then return DEV.handles[dev_key(x)] end
+end
+
+-- se.ui.reload(handle | path) -> ok, message   (no argument: every open layout)
+function se.ui.reload(x)
+	if x == nil then
+		for _, key in ipairs(DEV.order) do if DEV.handles[key] then dev_reload(DEV.handles[key]) end end
+		return true
+	end
+	local h = dev_find(x)
+	if not h then return false, "not open: " .. str(x) end
+	return dev_reload(h)
+end
+
+-- se.ui.close(handle | path) -> ok   (no argument: every open layout)
+function se.ui.close(x)
+	local keys = {}
+	if x == nil then keys = DEV.order else
+		local h = dev_find(x)
+		if not h then return false, "not open: " .. str(x) end
+		keys = { dev_key(h.twui) }
+	end
+	for _, key in ipairs(keys) do
+		local h = DEV.handles[key]
+		if h then dev_close_parts(h); DEV.handles[key] = nil end
+	end
+	local order = {}
+	for _, key in ipairs(DEV.order) do if DEV.handles[key] then order[#order + 1] = key end end
+	DEV.order = order
+	return true
+end
+
+-- se.ui.list() -> { { twui=, lua={..}, component=, reloads=, error= }, ... }
+function se.ui.list()
+	local t = {}
+	for _, key in ipairs(DEV.order) do
+		local h = DEV.handles[key]
+		t[#t + 1] = { twui = h.twui, lua = h.lua, component = h.component, reloads = h.reloads, error = h.error, watch = h.watch }
+	end
+	return t
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")

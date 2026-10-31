@@ -34,7 +34,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
 | 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
-| 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock |
+| 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock; beta.2 (planned): UI dev loader, `.twui.xml` + Lua from disk with rebuild on save (`se.ui.open`, §3.22; cfg `ui_dev_loader`), refused in multiplayer |
 
 ---
 
@@ -1746,6 +1746,68 @@ if se and se.audio and se.audio.available() then
 end
 ```
 
+### 3.22 UI dev loader: layouts and their Lua straight from disk
+
+Since: DLL 0.47.0-beta.2 (planned; **not yet verified in game**, see notes/ui_dev_loader.md). For
+testing a `.twui.xml` and its Lua without building a pack or restarting the game. Refused in
+multiplayer, because the attached Lua would run on one machine only. **Off by default:** add
+`ui_dev_loader=1` to `script_extender.cfg` (next to the DLL, or one folder up) to turn it on.
+
+Your files stay wherever you keep them. When a layout is opened or reloaded, the DLL copies it to
+`data\ui\se_dev\<n>_<name>.twui.xml` and creates it from the in-game path
+`ui/se_dev/<n>_<name>`. The game then finds it as a loose file, because no pack holds that path.
+The copy is necessary because **the game caches every parsed layout by path for the whole
+session**, so each reload needs a new name. The engine is only ever given in-game paths
+(`ui/...`); passing a disk path to `CreateComponent` is untested.
+
+The DLL deletes old copies (the previous one at every reload, all of them when it loads). Lua
+files are not copied: they are read from your path at every (re)load.
+
+Images the layout references must be in a loaded pack or a loose file under `data\ui\...`. Images
+from your own folder are not copied.
+
+#### `se.ui.open(twui_path [, opts]) -> handle | nil, message`
+Creates the layout, then runs each Lua file as `chunk(component, handle)`, where `component` is
+the `UIComponent` of the new layout. `opts`:
+
+| field | default | meaning |
+|---|---|---|
+| `lua` | `<same folder>\<stem>.lua` if it exists | path or list of paths |
+| `parent` | UI root | `UIComponent` or component address |
+| `name` | `se_dev_<stem>` | name of the created component |
+| `watch` | `true` | rebuild when the layout or one of its Lua files is saved (checked every 500 ms) |
+| `env` | the caller's environment | environment the Lua runs in (where `core`, `cm`, `find_uicomponent` live) |
+
+Opening a path that is already open reloads it with the new options.
+
+**Reload rules.** Every `core:add_listener` a chunk makes *while it runs* is recorded. Before the
+next build those listeners are removed, so a click handler never runs twice. A function returned
+by the chunk becomes `on_close(handle)` and is called before the rebuild and on close. Use it for
+anything the chunk starts later (timers, listeners added from inside callbacks). If a build fails
+(missing file, Lua error), the error is logged, nothing half-built stays on screen, and the watcher
+keeps going, so saving a fix brings the layout back.
+
+#### `se.ui.reload([handle | path]) -> ok, message`, `se.ui.close([handle | path]) -> ok`
+Without an argument: every open layout.
+
+#### `se.ui.list() -> { { twui, lua, component, reloads, error, watch }, ... }`
+
+```lua
+-- console script: open a panel from disk and keep it in sync with the files
+se.core = core
+local h, err = se.ui.open("Z:\\MyPanels\\test_panel.twui.xml")
+if not h then ModLog("open failed: " .. tostring(err)) end
+```
+
+```lua
+-- Z:\MyPanels\test_panel.lua (runs with the new component; re-run on every save)
+local component, handle = ...
+core:add_listener("test_panel_click", "ComponentLClickUp",
+  function(context) return context.string == "round_small_button" end,
+  function() ModLog("clicked") end, true)
+return function() ModLog("test_panel closing") end
+```
+
 ---
 
 ## 4. Recipes
@@ -2415,6 +2477,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.region(key)` | checked cm:query_region |
 | `se.saves.info()` | save chunking state (saved values above 64 KiB) |
 | `se.audio.available/post/stop/pause/resume/vanilla_music/...` | Wwise audio for jukeboxes, local only (§3.21) |
+| `se.ui.open/reload/close/list` | layouts + their Lua from disk, rebuilt on save; not in multiplayer (§3.22) |
 | `se.version()` | DLL version string |
 
 ### Values the module reads from you, and its own state
