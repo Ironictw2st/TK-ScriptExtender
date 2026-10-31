@@ -34,7 +34,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.44 (pre-release) | beta.1: battles on water are fought as land battles (`naval_to_land`); beta.2: the real choice key of a dilemma answer (`se.dilemma.choice_key`), the MEDIATE PEACE repair is on by default |
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
 | 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
-| 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock; beta.2 (planned): UI dev loader, `.twui.xml` + Lua from disk with rebuild on save (`se.ui.open`, §3.22; cfg `ui_dev_loader`), refused in multiplayer |
+| 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock; beta.2: UI dev loader, `.twui.xml` + Lua from disk with rebuild on save (`se.ui.open`, §3.22; cfg `ui_dev_loader`), refused in multiplayer |
 
 ---
 
@@ -1748,7 +1748,7 @@ end
 
 ### 3.22 UI dev loader: layouts and their Lua straight from disk
 
-Since: DLL 0.47.0-beta.2 (planned; **not yet verified in game**, see notes/ui_dev_loader.md). For
+Since: DLL 0.47.0-beta.2 (verified in game 2026-10-31: open, rebuild on Lua and layout save, error recovery, close). For
 testing a `.twui.xml` and its Lua without building a pack or restarting the game. Refused in
 multiplayer, because the attached Lua would run on one machine only. **Off by default:** add
 `ui_dev_loader=1` to `script_extender.cfg` (next to the DLL, or one folder up) to turn it on.
@@ -2160,6 +2160,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 | `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
 | `audio` | `1` (DLL 0.47.0-beta.1+) | `0` turns the audio module off: no Wwise detours, `se.audio.available()` is false (§3.21). Local, not in the version lock |
+| `ui_dev_loader` | `0` (DLL 0.47.0-beta.2+) | `1` turns on the UI dev loader (§3.22): `se.ui.open` copies layouts into `data\ui\se_dev\`. Local, refused in multiplayer, not in the version lock |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |

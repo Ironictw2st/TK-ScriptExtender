@@ -317,6 +317,14 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   anchors: a mismatch turns only audio off. cfg `audio` (default 1; local, not in the sync tag).
   Consumer: the 190E Soundtrack panel.
 
+- 0.47.0-beta.2 (2026-10-31, pre-release): UI dev loader (`uidev.rs`, `se.ui.open/reload/close/list`,
+  SCRIPTING.md §3.22), Discord request "open TWUI files + connected LUA files from disk". A layout on
+  disk is copied to `data\ui\se_dev\<n>_<stem>.twui.xml` and created as `ui/se_dev/<n>_<stem>` (new
+  name per load: the engine caches parsed layouts by path for the session); its Lua is read from the
+  user's path at every load; rebuild on save (500 ms poll), listeners made by the chunk removed
+  before each rebuild. No engine memory read or written. Opt-in cfg `ui_dev_loader=1` (default off;
+  local, refused in multiplayer, not in the sync tag). Copies deleted at DLL load.
+
 ## 7. When the game updates
 
 1. New `TimeDateStamp` / `SizeOfImage` -> update the constants in `src/addrs.rs`.
