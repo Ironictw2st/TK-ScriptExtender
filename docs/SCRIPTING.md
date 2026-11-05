@@ -1384,8 +1384,8 @@ multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_se
 
 #### `se.diag.sepatches() -> table` / `se.diag.sepatches_selftest([n]) -> ok, message`
 
-Since 0.46.0-sepatches.1 (local test build), both on by default. The ideas come from two
-third-party packs (`z_ngc_cai_null_guard`, `z_ngc_battle_crash_fix`); the code is the SE's own
+Since 0.46.0-sepatches.1 (local test build), both on by default. **Credit: Sleeping Rowlet**, whose packs
+`z_ngc_cai_null_guard` and `z_ngc_battle_crash_fix` found both fixes; the SE re-implements them in its own code
 (see `notes/SEPATCHES_zngc.md`).
 
 | Patch | cfg | What it does |

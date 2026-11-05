@@ -1,6 +1,6 @@
 //! Two engine patches, re-implemented here from the ideas in two third-party mod packs
-//! (`z_ngc_cai_null_guard.pack`, `z_ngc_battle_crash_fix.pack`; author "z_ngc", licence and
-//! permission unknown, see notes/SEPATCHES_zngc.md). No code or binary of those packs is used:
+//! (`z_ngc_cai_null_guard.pack`, `z_ngc_battle_crash_fix.pack`) by **Sleeping Rowlet**, who is credited
+//! for both fixes (see notes/SEPATCHES_zngc.md). No code or binary of those packs is used:
 //! the addresses were re-derived and re-verified on exe 1.7.2.0 (TimeDateStamp 0x69CE4C84) and the
 //! replacement code below was written from the original function's own disassembly.
 //!
