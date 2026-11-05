@@ -1382,6 +1382,26 @@ local ok, msg = se.diag.engine_guards_selftest()  -- calls the guarded functions
 `ceo_owner` lookup is also used by the campaign model, so `engine_crash_guards` is part of the
 multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_selftest`.
 
+#### `se.diag.sepatches() -> table` / `se.diag.sepatches_selftest([n]) -> ok, message`
+
+Since 0.46.0-sepatches.1 (local test build), both on by default. The ideas come from two
+third-party packs (`z_ngc_cai_null_guard`, `z_ngc_battle_crash_fix`); the code is the SE's own
+(see `notes/SEPATCHES_zngc.md`).
+
+| Patch | cfg | What it does |
+|---|---|---|
+| CAI null guard | `cai_null_guard` | three AI call sites that ask "is this entry in state 1" about a looked-up object that can be missing now answer "yes, nothing to do" for a missing object instead of crashing at exe+0x1E570B0 (the pack describes it as an end-turn AI crash) |
+| Battle instance transform | `battle_xform_fast` | the routine that builds each battle instance record (a matrix, its inverse, colour bytes; exe+0x13778B0) runs as straight-line code, about 16x faster in a micro-benchmark. Every output byte is identical to the original for any finite input |
+
+```lua
+local p = se.diag.sepatches()      -- { cai_null_guard = true, cai_sites = 3, cai_hits = 0, battle_xform = true, ... }
+local ok, msg = se.diag.sepatches_selftest(100000)  -- original vs faster routine, byte for byte
+```
+
+`cai_null_guard` is part of the multiplayer version lock (it changes what the AI does where vanilla
+crashes); `battle_xform_fast` is not, because its output is identical. Natives:
+`se_sepatches_info`, `se_sepatches_selftest`.
+
 #### `se.modify.followup_respond(answer) -> ok, message`
 
 `answer` = `"accept"` or `"reject"`. Queues the answer to the follow-up offer that is on screen
@@ -2050,6 +2070,8 @@ values optionally quoted; an unknown key is logged and ignored.
 | `followup_hooks` | `1` | `0` skips the MEDIATE PEACE button repair hooks (`se.ui.fix_followup_button` then refuses) |
 | `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
 | `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
+| `cai_null_guard` | `1` (DLL 0.46.0-sepatches.1+) | null guard on three AI call sites (`se.diag.sepatches`); in the version lock; `0` = off |
+| `battle_xform_fast` | `1` (DLL 0.46.0-sepatches.1+) | faster, bit-identical battle instance-record routine (`se.diag.sepatches`); not in the version lock; `0` = off |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |

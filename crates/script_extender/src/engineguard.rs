@@ -100,8 +100,8 @@ pub static BROWSER_HITS: AtomicU64 = AtomicU64::new(0);
 static LOGGED_INACTIVE: AtomicU32 = AtomicU32::new(0);
 static LOGGED_CEO: AtomicU32 = AtomicU32::new(0);
 
-unsafe fn readable(p: usize, n: usize) -> bool { p >= 0x10000 && IsBadReadPtr(p as *const c_void, n) == 0 }
-unsafe fn bytes_at<const N: usize>(p: usize) -> Option<[u8; N]> {
+pub(crate) unsafe fn readable(p: usize, n: usize) -> bool { p >= 0x10000 && IsBadReadPtr(p as *const c_void, n) == 0 }
+pub(crate) unsafe fn bytes_at<const N: usize>(p: usize) -> Option<[u8; N]> {
     if readable(p, N) { Some(core::ptr::read_unaligned(p as *const [u8; N])) } else { None }
 }
 
@@ -175,7 +175,7 @@ fn browser_stub(resolve: usize, cont: usize, counter: usize) -> Vec<u8> {
 }
 
 /// One executable page within rel32 reach of `near` (free regions below the exe first, then above).
-unsafe fn alloc_near(near: usize) -> Option<usize> {
+pub(crate) unsafe fn alloc_near(near: usize) -> Option<usize> {
     const GRAN: usize = 0x10000;
     const REACH: usize = 0x7000_0000;
     let try_at = |a: usize| -> Option<usize> {
@@ -201,6 +201,18 @@ unsafe fn alloc_near(near: usize) -> Option<usize> {
 
 /// Write `new` over `addr` with the other threads frozen and out of the range.
 unsafe fn write_code(name: &'static str, addr: usize, new: &[u8]) -> Result<(), String> {
+    write_code_for(name, "engine_crash_guards", addr, new)
+}
+
+/// Make a freshly written stub page read+execute.
+pub(crate) unsafe fn make_executable(stub: usize, len: usize) {
+    let mut old = 0u32;
+    VirtualProtect(stub as *mut c_void, 0x1000, PAGE_EXECUTE_READ, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), stub as *const c_void, len);
+}
+
+/// `write_code` for another module's cfg key.
+pub(crate) unsafe fn write_code_for(name: &'static str, cfg_key: &'static str, addr: usize, new: &[u8]) -> Result<(), String> {
     let before: [u8; 16] = bytes_at(addr).unwrap_or([0; 16]);
     crate::freeze::with_threads_frozen(addr, new.len(), || {
         let mut old = 0u32;
@@ -214,8 +226,8 @@ unsafe fn write_code(name: &'static str, addr: usize, new: &[u8]) -> Result<(), 
         Ok(())
     })??;
     let after: [u8; 16] = bytes_at(addr).unwrap_or([0; 16]);
-    crate::status::record_patch(name, "engine_crash_guards", addr, before, after);
-    crate::crash::hook_installed(name, "engine_crash_guards", addr);
+    crate::status::record_patch(name, cfg_key, addr, before, after);
+    crate::crash::hook_installed(name, cfg_key, addr);
     Ok(())
 }
 

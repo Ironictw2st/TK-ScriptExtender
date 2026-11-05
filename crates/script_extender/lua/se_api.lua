@@ -2950,6 +2950,31 @@ function se.diag.engine_guards_selftest()
 	return se_engine_guards_selftest()
 end
 
+-- se.diag.sepatches() -> table   (DLL 0.46.0-sepatches.1+, on by default)
+--   Two engine patches (cfg cai_null_guard, battle_xform_fast; each off with =0):
+--   { cai_null_guard = true, cai_sites = 3, cai_hits = 0, battle_xform = true, xform_calls = 0,
+--   xform_fallbacks = 0 }. cai_hits counts how often one of the three AI call sites met a missing
+--   object; xform_calls counts battle instance-record builds through the faster routine. Read-only.
+function se.diag.sepatches()
+	local okn, err = need("se_sepatches_info")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in string.gmatch(str(se_sepatches_info()), "([%w_]+)=(%d+)") do
+		if k == "cai_null_guard" or k == "battle_xform" then t[k] = (v == "1") else t[k] = tonumber(v) end
+	end
+	return t
+end
+
+-- se.diag.sepatches_selftest([n]) -> ok, message
+--   Runs n (default 20000, max 2000000) random instance records through the engine's original
+--   function and the faster one, and compares every output byte; calls the CAI stub with a NULL
+--   and a live object. Uses private buffers only. Safe to run at any time (outside a battle).
+function se.diag.sepatches_selftest(n)
+	local okn, err = need("se_sepatches_selftest")
+	if not okn then return false, err end
+	return se_sepatches_selftest(n or 20000)
+end
+
 pcall(auto_followup)
 
 log("se_api loaded (dll " .. se.version() .. ")")
