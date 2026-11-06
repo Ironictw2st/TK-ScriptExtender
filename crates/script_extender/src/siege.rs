@@ -162,9 +162,19 @@ unsafe fn install_gate(base: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Opt-in (default off): the 0.46.0-siege.1 stub writes its threshold cell inside a page that
+/// make_executable turns PAGE_EXECUTE_READ -> access violation on the first call (5 Nov 2026).
+pub fn gate_enabled() -> bool {
+    crate::build::config_value("siege_odds_gate").as_deref() == Some("1")
+}
+
 pub fn install(t: &Table) {
-    if !crate::build::hook_enabled("siege_odds_gate") {
-        log!("siege odds gate off (siege_odds_gate=0 in script_extender.cfg): vanilla flat 50 % assault refusal");
+    match install_force_assault(t.base()) {
+        Ok(()) => log!("siege force assault anchors ok (cfg siege_force_assault={})", crate::build::hook_enabled("siege_force_assault") as u8),
+        Err(e) => log!("siege force assault unavailable: {e}"),
+    }
+    if !gate_enabled() {
+        log!("siege odds gate off (opt-in: siege_odds_gate=1; the stub is not fixed yet): vanilla flat 50 % assault refusal");
         return;
     }
     // SAFETY: bytes verified first; written with the other threads frozen (engineguard::write_code_for).
@@ -174,6 +184,137 @@ pub fn install(t: &Table) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Forced assault for AI besiegers (cfg siege_force_assault; notes/siege_assault_static.md Steps 7-11)
+// ------------------------------------------------------------------------------------------------
+// Script orders (attack_settlement) are refused on AI turns: the binding's turn-state check
+// FUN_1419da7a0 needs the turn manager phase [[ctx+0x3b68]+0x8c] == 1 ("orders open"); the AI turn
+// keeps it 0. se_siege_assault opens that phase for exactly one attack_settlement call of the
+// faction whose turn it is (AI only) and restores the saved value right after (proven in game on
+// 1.7.2.0, 5 Nov 2026: Dong Zhuo force 629 assaulted Chang'an). ctx = [[char+0x250]+0x78]
+// (FUN_141498690 on char+0x250, as the binding does). MP: the window touches only simulation state
+// and runs inside a model callback, but it has not been verified in lockstep: se_api refuses it in MP.
+
+const GATE_RVA: usize = 0x19da80c; // `mov rax,[rbx+0x3b68] ; cmp dword [rax+0x8c],1 ; jne +8` in FUN_1419da7a0
+const GATE_BYTES: [u8; 16] = [0x48, 0x8b, 0x83, 0x68, 0x3b, 0x00, 0x00, 0x83, 0xb8, 0x8c, 0x00, 0x00, 0x00, 0x01, 0x75, 0x08];
+const CTX_RVA: usize = 0x1498690; // `mov rax,[rcx] ; mov rax,[rax+0x78] ; ret`
+const CTX_BYTES: [u8; 8] = [0x48, 0x8b, 0x01, 0x48, 0x8b, 0x40, 0x78, 0xc3];
+/// MILITARY_FORCE vtable (slot-0 object address), cqi dword at +8, siege object chain [[force+0x5c0]]
+const FORCE_VT_RVA: usize = 0x3460298;
+
+static FA_READY: AtomicUsize = AtomicUsize::new(0); // exe base once the anchors matched
+static FA_CALLS: AtomicU64 = AtomicU64::new(0);
+static FA_OPENED: AtomicU64 = AtomicU64::new(0);
+static FA_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static FA_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn readable(p: usize, n: usize) -> bool { p >= 0x10000 && IsBadReadPtr(p as *const _, n) == 0 }
+unsafe fn rq(p: usize) -> usize { if readable(p, 8) { core::ptr::read_unaligned(p as *const usize) } else { 0 } }
+unsafe fn rd32(p: usize) -> u32 { if readable(p, 4) { core::ptr::read_unaligned(p as *const u32) } else { 0 } }
+
+fn install_force_assault(base: usize) -> Result<(), String> {
+    use crate::engineguard::bytes_at;
+    unsafe {
+        if bytes_at::<16>(base + GATE_RVA) != Some(GATE_BYTES) { return Err("turn-phase gate bytes differ".into()); }
+        if bytes_at::<8>(base + CTX_RVA) != Some(CTX_BYTES) { return Err("ctx accessor bytes differ".into()); }
+    }
+    FA_READY.store(base, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Engine MILITARY_FORCE behind a query/modify military force script object (validated by vtable + cqi).
+unsafe fn force_from_arg(l: *mut LuaState, idx: c_int, cqi: u32) -> Result<usize, String> {
+    let api = lua::api().ok_or("lua api missing")?;
+    let base = FA_READY.load(Ordering::Relaxed);
+    if base == 0 { return Err("force assault not available (anchors)".into()); }
+    let ty = (api.type_)(l, idx);
+    if ty != lua::LUA_TLIGHTUSERDATA && ty != lua::LUA_TUSERDATA { return Err(format!("arg {idx} is not a script object")); }
+    let p = (api.touserdata)(l, idx) as usize;
+    if p == 0 { return Err("null userdata".into()); }
+    let vt = base + FORCE_VT_RVA;
+    for c in [p, rq(p), rq(p + 0x18), rq(rq(p) + 0x18), rq(rq(p + 8) + 0x18), rq(rq(rq(p) + 8) + 0x18)] {
+        if c != 0 && rq(c) == vt && rd32(c + 8) == cqi { return Ok(c); }
+    }
+    Err(format!("military force {cqi} not found behind arg {idx}"))
+}
+
+/// se_siege_equipment(query_military_force, cqi) -> built, in_progress   (or nil, message)
+/// S = [[force+0x5c0]] (the force's siege object at its target): built-items vector count [S+0xd4],
+/// in-progress count [S+0xc4]. No siege object (not besieging) -> 0, 0.
+unsafe extern "C" fn se_siege_equipment(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    match force_from_arg(l, 1, cqi) {
+        Ok(f) => {
+            let s = rq(rq(f + 0x5c0));
+            let (built, prog) = if s != 0 { (rd32(s + 0xd4), rd32(s + 0xc4)) } else { (0, 0) };
+            (api.pushinteger)(l, built.min(64) as isize);
+            (api.pushinteger)(l, prog.min(64) as isize);
+            2
+        }
+        Err(e) => {
+            (api.pushnil)(l);
+            lua::push_str(l, &e);
+            2
+        }
+    }
+}
+
+unsafe fn fa_fail(l: *mut LuaState, m: &str) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    FA_REFUSED.fetch_add(1, Ordering::Relaxed);
+    (api.pushboolean)(l, 0);
+    lua::push_str(l, m);
+    2
+}
+
+/// se_siege_assault(query_character, cqi, modify_character, query_settlement) -> ok, message
+/// Calls modify_character:attack_settlement(settlement) with the turn phase opened for that one call.
+/// Refused unless it is the general's faction's turn, that faction is AI and the phase is 0.
+unsafe extern "C" fn se_siege_assault(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    FA_CALLS.fetch_add(1, Ordering::Relaxed);
+    if FA_READY.load(Ordering::Relaxed) == 0 || !crate::build::hook_enabled("siege_force_assault") {
+        return fa_fail(l, "siege_force_assault is off or its anchors did not match");
+    }
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let ch = match crate::pool::character_from_arg(l, 1, cqi) {
+        Ok(c) => c,
+        Err(e) => return fa_fail(l, &e),
+    };
+    let ctx = rq(rq(ch + 0x250) + 0x78);
+    let tm = rq(ctx + 0x3b68);
+    let rec = rq(tm + 0x48);
+    let fac = rq(rq(ch + 0x270));
+    if ctx == 0 || tm == 0 || rec == 0 || fac == 0 || !readable(tm + 0x8c, 4) || !readable(rec + 0xcd0, 1) {
+        return fa_fail(l, "turn state not readable");
+    }
+    if rd32(rec + 8) != rd32(fac + 8) { return fa_fail(l, "not this general's faction's turn"); }
+    if core::ptr::read_unaligned((rec + 0xcd0) as *const u8) != 0 { return fa_fail(l, "human faction"); }
+    let phase_p = (tm + 0x8c) as *mut u32;
+    let old = core::ptr::read_unaligned(phase_p);
+    if old != 0 { return fa_fail(l, &format!("turn phase is {old}, not 0 (AI turn)")); }
+    let top = (api.gettop)(l);
+    (api.getfield)(l, 3, c"attack_settlement".as_ptr());
+    (api.pushvalue)(l, 3);
+    (api.pushvalue)(l, 4);
+    core::ptr::write_unaligned(phase_p, 1);
+    FA_OPENED.fetch_add(1, Ordering::Relaxed);
+    let rc = (api.pcall)(l, 2, 1, 0);
+    core::ptr::write_unaligned(phase_p, old);
+    if rc != 0 {
+        let m = lua::to_str(l, -1);
+        (api.settop)(l, top);
+        return fa_fail(l, &format!("attack_settlement error: {m}"));
+    }
+    let ok = (api.toboolean)(l, -1) != 0;
+    (api.settop)(l, top);
+    if ok { FA_ACCEPTED.fetch_add(1, Ordering::Relaxed); } else { FA_REFUSED.fetch_add(1, Ordering::Relaxed); }
+    (api.pushboolean)(l, ok as c_int);
+    lua::push_str(l, if ok { "assault ordered" } else { "attack_settlement returned false" });
+    2
+}
+
 fn info() -> String {
     let mut s = format!(
         "siege_gate={};calls={};vanilla_refusals={};refusals={};turned_to_accept={};bad_frame={};last_odds_x100={}",
@@ -181,6 +322,9 @@ fn info() -> String {
         REFUSALS.load(Ordering::Relaxed), ACCEPTED_BY_GATE.load(Ordering::Relaxed), BAD_FRAME.load(Ordering::Relaxed),
         LAST_ODDS_X100.load(Ordering::Relaxed),
     );
+    s.push_str(&format!(";force_assault={};fa_calls={};fa_opened={};fa_accepted={};fa_refused={}",
+        (FA_READY.load(Ordering::Relaxed) != 0 && crate::build::hook_enabled("siege_force_assault")) as u8,
+        FA_CALLS.load(Ordering::Relaxed), FA_OPENED.load(Ordering::Relaxed), FA_ACCEPTED.load(Ordering::Relaxed), FA_REFUSED.load(Ordering::Relaxed)));
     for i in 0..=MAX_BANDS {
         let c = BAND_CALLS[i].load(Ordering::Relaxed);
         if c != 0 { s.push_str(&format!(";band{i}_calls={c};band{i}_turned={}", BAND_FLIPPED[i].load(Ordering::Relaxed))); }
@@ -196,6 +340,8 @@ unsafe extern "C" fn se_siege_info(l: *mut LuaState) -> c_int {
 
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_siege_info", se_siege_info);
+    lua::set_global_fn(l, "se_siege_assault", se_siege_assault);
+    lua::set_global_fn(l, "se_siege_equipment", se_siege_equipment);
 }
 
 #[cfg(test)]

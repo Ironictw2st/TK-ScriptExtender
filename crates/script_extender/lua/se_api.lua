@@ -2976,7 +2976,11 @@ function se.diag.siege()
 	if not okn then return nil, err end
 	local t = {}
 	for k, v in string.gmatch(str(se_siege_info()), "([%w_]+)=(%d+)") do
-		if k == "siege_gate" then t[k] = (v == "1") else t[k] = tonumber(v) end
+		if k == "siege_gate" or k == "force_assault" then t[k] = (v == "1") else t[k] = tonumber(v) end
+	end
+	if se.siege and se.siege.stats then
+		for k, v in pairs(se.siege.stats) do t["policy_" .. k] = v end
+		t.policy_listening = se.siege.listening == true
 	end
 	return t
 end
@@ -2991,6 +2995,203 @@ function se.diag.sepatches_selftest(n)
 	return se_sepatches_selftest(n or 20000)
 end
 
+----------------------------------------------------------------------------------------------
+-- AI siege assault (DLL 0.47.0-siege+, cfg siege_force_assault, on by default; single player only)
+----------------------------------------------------------------------------------------------
+-- The campaign AI keeps sitting outside settlements it could take. At every AI faction's turn
+-- start each of its besieging armies is checked:
+--   * siege age >= se.siege.min_turns (default 1; counted by this module, saved in the game save)
+--   * odds = army strength / defenders' strength (garrison + armies in the settlement) >= 1.5
+--   * wait chance from the odds (se.siege.bands): 25 % at 1.5-3x, 10 % at 3-6x, 2.5 % at 6x+;
+--     the roll is a hash of (turn, army cqi, region key): the same on every machine and reload
+--   * walled settlement: raw odds >= 6 (se.siege.walled_min_odds; strength() ignores walls) and
+--     assault only with finished equipment (built >= 1, nothing in progress);
+--     otherwise a battering ram is queued (force_immediate_construct_siege_item) and it waits
+--   * a stance that blocks the attack is changed to DEFAULT first
+-- The order goes through se_siege_assault (the turn phase opened for that one attack_settlement
+-- call). Multiplayer: not enabled (the phase window is not verified in lockstep).
+-- se.diag.siege() carries the counters (fa_* from the DLL, policy_* from here).
+
+se.siege = se.siege or {}
+local SG = se.siege
+SG.min_turns = SG.min_turns or 1
+SG.min_odds = SG.min_odds or 1.5
+SG.walled_min_odds = SG.walled_min_odds or 6
+SG.bands = SG.bands or { { 1.5, 25 }, { 3, 10 }, { 6, 2.5 } }
+SG.stats = SG.stats or { turns = 0, besiegers = 0, young = 0, low_odds = 0, waited = 0, built = 0, need_equipment = 0, stance = 0, ordered = 0, refused = 0, errors = 0 }
+SG.last = SG.last or {}
+
+local STANCE_OK = { MILITARY_FORCE_ACTIVE_STANCE_TYPE_DEFAULT = true, MILITARY_FORCE_ACTIVE_STANCE_TYPE_LAND_RAID = true, MILITARY_FORCE_ACTIVE_STANCE_TYPE_SEA_RAID = true }
+
+-- deterministic roll in [0, 100) from (turn, army cqi, region key); integer math stays below 2^24
+-- because lua_Number is a 32-bit float in this build
+local roll
+roll = function(turn, cqi, key)
+	local h = 7919
+	local s = tostring(turn) .. ":" .. tostring(cqi) .. ":" .. tostring(key)
+	for i = 1, #s do
+		h = (h * 31 + string.byte(s, i)) % 65521
+	end
+	h = (h * 241 + 17) % 65521
+	return (h % 10000) / 100
+end
+SG.roll = roll
+
+local function wait_chance(odds)
+	local w = nil
+	for _, b in ipairs(SG.bands) do
+		if odds >= b[1] then w = b[2] end
+	end
+	return w
+end
+SG.wait_chance = wait_chance
+
+local function defenders(region)
+	local owner = region:owning_faction()
+	local total = 0
+	local rname = region:name()
+	local ml = owner:military_force_list()
+	for i = 0, ml:num_items() - 1 do
+		local f = ml:item_at(i)
+		local ok, inside = pcall(function()
+			if f:has_garrison_residence() and f:garrison_residence():region():name() == rname then return true end
+			return f:has_general() and f:general_character():is_in_settlement() and f:general_character():region():name() == rname
+		end)
+		if ok and inside then total = total + f:strength() end
+	end
+	return total
+end
+
+local function age_of(cm, cqi, key, turn)
+	local k = "se_siege_age_" .. tostring(cqi)
+	local v = cm:get_saved_value(k)
+	local vk, vt = nil, nil
+	if type(v) == "string" then
+		local a, b = string.match(v, "^(.*)|(%d+)$")
+		vk, vt = a, tonumber(b)
+	end
+	if vk ~= key or not vt then
+		cm:set_saved_value(k, key .. "|" .. tostring(turn))
+		return 0
+	end
+	return turn - vt
+end
+
+local function consider(cm, faction, mf, turn)
+	local st = SG.stats
+	if not mf:has_general() or mf:is_armed_citizenry() then return end
+	local g = mf:general_character()
+	if not g:is_besieging() then return end
+	st.besiegers = st.besiegers + 1
+	local cqi = mf:command_queue_index()
+	local region = g:region()
+	local key = region:name()
+	local rec = { turn = turn, faction = faction:name(), force = cqi, region = key }
+	table.insert(SG.last, rec)
+	local age = age_of(cm, cqi, key, turn)
+	rec.age = age
+	if age < SG.min_turns then st.young = st.young + 1 rec.result = "young" return end
+	local s = region:settlement()
+	local walled = false
+	pcall(function() walled = s:has_walls() end)
+	rec.walled = walled
+	local def = defenders(region)
+	local odds = (def > 0) and (mf:strength() / def) or 1000
+	rec.odds = math.floor(odds * 100) / 100
+	-- raw strength() ignores the walls (the engine's fortification multipliers): a walled target
+	-- needs SG.walled_min_odds raw odds (Fang Yue lost Chang'an at 3.8x with full equipment)
+	local w = (odds >= (walled and SG.walled_min_odds or SG.min_odds)) and wait_chance(odds) or nil
+	if not w then st.low_odds = st.low_odds + 1 rec.result = "low odds" return end
+	if walled then
+		local built, prog = G("se_siege_equipment")(mf, cqi)
+		rec.built, rec.in_progress = built, prog
+		if type(built) ~= "number" then st.errors = st.errors + 1 rec.result = "equipment: " .. str(prog) return end
+		if built < 1 or prog > 0 then
+			if prog == 0 then
+				pcall(function() cm:modify_military_force(mf):force_immediate_construct_siege_item("3k_main_blk_battering_ram", true) end)
+				st.built = st.built + 1
+				local b2, p2 = G("se_siege_equipment")(mf, cqi)
+				rec.after_build = str(b2) .. "/" .. str(p2)
+			end
+			st.need_equipment = st.need_equipment + 1
+			rec.result = "building equipment"
+			return
+		end
+	end
+	local r = roll(turn, cqi, key)
+	rec.roll, rec.wait = r, w
+	if r < w then st.waited = st.waited + 1 rec.result = "waits (roll)" return end
+	local stance = tostring(mf:active_stance())
+	if not STANCE_OK[stance] then
+		pcall(function() cm:modify_military_force(mf):change_stance("MILITARY_FORCE_ACTIVE_STANCE_TYPE_DEFAULT") end)
+		st.stance = st.stance + 1
+		rec.stance = stance
+	end
+	local ok, msg = G("se_siege_assault")(g, g:command_queue_index(), cm:modify_character(g), s)
+	rec.result = (ok and "ASSAULT " or "refused: ") .. str(msg)
+	if ok then st.ordered = st.ordered + 1 else st.refused = st.refused + 1 end
+	log(string.format("siege: %s force %d at %s age %d odds %.2f walled %s roll %.2f wait %s -> %s", faction:name(), cqi, key, age, odds, str(walled), r, str(w), rec.result))
+end
+
+function SG.on_turn_start(faction)
+	local cm = cm_()
+	if not cm then return end
+	SG.stats.turns = SG.stats.turns + 1
+	while #SG.last > 60 do table.remove(SG.last, 1) end
+	local turn = cm:query_model():turn_number()
+	local ml = faction:military_force_list()
+	local forces = {}
+	for i = 0, ml:num_items() - 1 do table.insert(forces, ml:item_at(i)) end
+	for _, mf in ipairs(forces) do
+		local okc, err = pcall(consider, cm, faction, mf, turn)
+		if not okc then SG.stats.errors = SG.stats.errors + 1 log("siege: error " .. str(err)) end
+	end
+end
+
+function SG.enable(core)
+	core = core or se.core or G("core")
+	if type(core) ~= "table" then return false, "core not available" end
+	if type(G("se_siege_assault")) ~= "function" then return false, "DLL without se_siege_assault" end
+	local info = str(G("se_siege_info")())
+	if not string.match(info, "force_assault=1") then return false, "siege_force_assault off in script_extender.cfg (or anchors)" end
+	if SG.listening then return true, "already listening" end
+	SG.listening = true
+	core:add_listener("se_siege_force_assault", "FactionTurnStart", function(context)
+		local ok, r = pcall(function()
+			local f = context:faction()
+			if f:is_human() or f:is_dead() then return false end
+			local okm, mp = pcall(function() return cm_():query_model():is_multiplayer() end)
+			return okm and mp == false
+		end)
+		return ok and r
+	end, function(context)
+		local okp, err = pcall(SG.on_turn_start, context:faction())
+		if not okp then SG.stats.errors = SG.stats.errors + 1 log("siege: turn error " .. str(err)) end
+	end, true)
+	return true, "listening"
+end
+
+-- turn the siege assault on as soon as a campaign event manager is known in this state: the
+-- chunk's globals rarely hold `core`, but every campaign mod script that uses se sets se.core
+local function auto_siege()
+	local function go(core)
+		local ok, msg = SG.enable(core)
+		SG.enable_result = str(ok) .. " " .. str(msg)
+		log("siege force assault: " .. SG.enable_result)
+	end
+	local core = se.core or G("core")
+	if type(core) == "table" and type(core.add_listener) == "function" then return go(core) end
+	if getmetatable(se) ~= nil then return end
+	setmetatable(se, { __newindex = function(t, k, v)
+		rawset(t, k, v)
+		if k == "core" and type(v) == "table" then
+			setmetatable(t, nil)
+			pcall(go, v)
+		end
+	end })
+end
+
 pcall(auto_followup)
+pcall(auto_siege)
 
 log("se_api loaded (dll " .. se.version() .. ")")
