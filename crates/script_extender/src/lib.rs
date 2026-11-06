@@ -47,6 +47,9 @@ mod prebattle;
 mod navalland;
 mod dilemma;
 mod ceoguard;
+mod engineguard;
+mod sepatches;
+mod siege;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
@@ -139,6 +142,12 @@ fn bootstrap() {
     crash::boot("audio");
     audio::install(&table);
     uidev::install();
+    crash::boot("engineguard");
+    engineguard::install(&table);
+    crash::boot("sepatches");
+    sepatches::install(&table);
+    crash::boot("siege");
+    siege::install(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"

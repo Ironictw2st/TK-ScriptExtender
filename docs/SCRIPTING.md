@@ -1357,6 +1357,52 @@ its methods runs. UI only: nothing reaches the model, so the setting is not part
 version lock. Natives: `se_ceo_rebuilt`, `se_ceo_refresh_info`, `se_ceo_refresh_selftest`
 (diagnostic).
 
+#### `se.diag.engine_guards() -> table` / `se.diag.engine_guards_selftest() -> ok, message`
+
+Since 0.46.0-guards.1 (local test build), on by default (turn it off with `engine_crash_guards=0`).
+Four game crashes come from the engine reading a missing value without checking it first. Each
+guard makes that one spot behave the way the same function already behaves when the value is
+missing elsewhere:
+
+| Guard | Crash it prevents | With the guard |
+|---|---|---|
+| `inactive_string` | an attitude line for a diplomacy event whose "inactive" text group is empty (exe+0x2F67DF5) | the line gets no inactive text |
+| `ceo_owner` | "does this owner hold this item" asked about a missing owner, e.g. hovering an item card (exe+0x18B4060) | the answer is "no" |
+| `text_font` | text laid out with a font that is not loaded (exe+0x641657) | the text is not measured, as the rest of the routine already does for a missing font |
+| `building_browser` | a building level that does not resolve in the building browser list (exe+0xCE4A90) | that level is left out of the list |
+
+```lua
+local g = se.diag.engine_guards()
+if g then ModLog("ceo owner guard caught " .. tostring(g.ceo_owner_hits) .. " missing owners") end
+local ok, msg = se.diag.engine_guards_selftest()  -- calls the guarded functions on test objects
+```
+
+`se.diag.engine_guards()` returns `inactive_string`, `ceo_owner`, `text_font` and
+`building_browser` (true when installed) and `inactive_string_hits`, `ceo_owner_hits` and
+`building_browser_hits` (how often each one stepped in; `text_font` has no counter). The
+`ceo_owner` lookup is also used by the campaign model, so `engine_crash_guards` is part of the
+multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_selftest`.
+
+#### `se.diag.sepatches() -> table` / `se.diag.sepatches_selftest([n]) -> ok, message`
+
+Since 0.46.0-sepatches.1 (local test build), both on by default. **Credit: Sleeping Rowlet**, whose packs
+`z_ngc_cai_null_guard` and `z_ngc_battle_crash_fix` found both fixes; the SE re-implements them in its own code
+(see `notes/SEPATCHES_zngc.md`).
+
+| Patch | cfg | What it does |
+|---|---|---|
+| CAI null guard | `cai_null_guard` | three AI call sites that ask "is this entry in state 1" about a looked-up object that can be missing now answer "yes, nothing to do" for a missing object instead of crashing at exe+0x1E570B0 (the pack describes it as an end-turn AI crash) |
+| Battle instance transform | `battle_xform_fast` | the routine that builds each battle instance record (a matrix, its inverse, colour bytes; exe+0x13778B0) runs as straight-line code, about 16x faster in a micro-benchmark. Every output byte is identical to the original for any finite input |
+
+```lua
+local p = se.diag.sepatches()      -- { cai_null_guard = true, cai_sites = 3, cai_hits = 0, battle_xform = true, ... }
+local ok, msg = se.diag.sepatches_selftest(100000)  -- original vs faster routine, byte for byte
+```
+
+`cai_null_guard` is part of the multiplayer version lock (it changes what the AI does where vanilla
+crashes); `battle_xform_fast` is not, because its output is identical. Natives:
+`se_sepatches_info`, `se_sepatches_selftest`.
+
 #### `se.modify.followup_respond(answer) -> ok, message`
 
 `answer` = `"accept"` or `"reject"`. Queues the answer to the follow-up offer that is on screen
@@ -2161,7 +2207,13 @@ values optionally quoted; an unknown key is logged and ignored.
 | `ceo_ui_refresh` | `1` (DLL 0.46.0-beta.3+) | closes an open character panel whose character's equipment data was rebuilt (joined / left a faction), so a right-click on a stale item card cannot crash; UI only, not in the version lock; `0` = off |
 | `audio` | `1` (DLL 0.47.0-beta.1+) | `0` turns the audio module off: no Wwise detours, `se.audio.available()` is false (§3.21). Local, not in the version lock |
 | `ui_dev_loader` | `0` (DLL 0.47.0-beta.2+) | `1` turns on the UI dev loader (§3.22): `se.ui.open` copies layouts into `data\ui\se_dev\`. Local, refused in multiplayer, not in the version lock |
+| `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
+| `cai_null_guard` | `1` (DLL 0.46.0-sepatches.1+) | null guard on three AI call sites (`se.diag.sepatches`); in the version lock; `0` = off |
+| `battle_xform_fast` | `1` (DLL 0.46.0-sepatches.1+) | faster, bit-identical battle instance-record routine (`se.diag.sepatches`); not in the version lock; `0` = off |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |
+| `siege_force_assault` | `1` (DLL 0.46.0-siege.2+) | AI besiegers assault when the odds are good (§4e); single player only; in the version lock; `0` = vanilla |
+| `siege_odds_gate` | `0` (DLL 0.46.0-siege.1+; opt-in since siege.5) | experimental: replaces the AI's flat 50 % "wait" roll with an odds-scaled one; **known crash, leave it off**; in the version lock |
+| `siege_odds_bands` | `1.5:25,3:10,6:2.5` | bands for `siege_odds_gate` (odds:refuse-%); in the version lock |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
 | `marriage_blood_generations` | `0` | with `marriage_inlaws=1`: blood relatives sharing an ancestor within this many generations may not marry (0..6; 0 = only the engine's close-kin rule) |
@@ -2286,6 +2338,31 @@ Console script with all of this at the top: `se_ai_recruit_rules.lua`. Test: `to
 
 ---
 
+
+## 4e. AI siege assault (DLL 0.46.0-siege.2+, single player)
+
+Vanilla AI armies often sit outside a settlement for many turns although they could take it.
+With the script extender loaded (cfg `siege_force_assault`, on by default) every AI faction's
+besieging armies are checked at that faction's turn start:
+
+| Rule | Value |
+|---|---|
+| siege age | at least `se.siege.min_turns` turns (default 1; counted by se, kept in the save) |
+| odds | army `strength()` / strength of the defenders inside the settlement |
+| unwalled target | odds >= `se.siege.min_odds` (1.5) |
+| walled target | odds >= `se.siege.walled_min_odds` (6; `strength()` ignores the walls) **and** finished siege equipment (at least one item built, none in progress); without equipment a battering ram is queued instead |
+| wait chance | `se.siege.bands` = `{ {1.5, 25}, {3, 10}, {6, 2.5} }` (odds, % chance to wait one more turn) |
+| roll | deterministic: hash of (turn, army cqi, region key), the same on reload |
+| stance | a stance that blocks attacks is set to DEFAULT first |
+
+The assault is a normal `attack_settlement`; the DLL only opens the turn phase that the engine
+requires for script orders (closed during AI turns) for that one call (`se_siege_assault`).
+Human factions are never touched; multiplayer campaigns are skipped for now. Players without
+the script extender play vanilla. Numbers can be changed from a campaign script
+(`se.siege.walled_min_odds = 8`). Counters: `se.diag.siege()` (`fa_*` DLL calls,
+`policy_*` decisions), the last 60 decisions in `se.siege.last`.
+
+---
 ## 5. Troubleshooting
 
 ### The API is not there at all
