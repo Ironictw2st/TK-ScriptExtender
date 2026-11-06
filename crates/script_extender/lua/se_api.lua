@@ -2965,6 +2965,22 @@ function se.diag.sepatches()
 	return t
 end
 
+-- se.diag.siege() -> table   (DLL 0.46.0-siege.1+)
+--   Counters of the AI assault gate (cfg siege_odds_gate, siege_odds_bands; off with siege_odds_gate=0):
+--   { siege_gate = true, calls, vanilla_refusals, refusals, turned_to_accept, bad_frame, last_odds_x100,
+--   band1_calls, band1_turned, ... }. calls = rolls the gate compared, vanilla_refusals = rolls the
+--   flat 50 % would have refused, refusals = refused with the odds-scaled threshold, turned_to_accept
+--   = refused in vanilla but accepted now. bandN = odds band N (band0 = below the first band).
+function se.diag.siege()
+	local okn, err = need("se_siege_info")
+	if not okn then return nil, err end
+	local t = {}
+	for k, v in string.gmatch(str(se_siege_info()), "([%w_]+)=(%d+)") do
+		if k == "siege_gate" then t[k] = (v == "1") else t[k] = tonumber(v) end
+	end
+	return t
+end
+
 -- se.diag.sepatches_selftest([n]) -> ok, message
 --   Runs n (default 20000, max 2000000) random instance records through the engine's original
 --   function and the faster one, and compares every output byte; calls the CAI stub with a NULL

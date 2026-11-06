@@ -72,6 +72,7 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::ceoguard::register(l);
     crate::engineguard::register(l);
     crate::sepatches::register(l);
+    crate::siege::register(l);
 }
 
 /// Pool availability lock on the CHARACTER: `+0x75c` status byte (10 = available, 5 = locked,

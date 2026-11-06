@@ -187,10 +187,13 @@ pub fn sync_tag() -> String {
     feed(&income_category.to_string());
     // save_chunking decides whether a large saved value survives a reload, so peers that differ
     // in it diverge after the first save / load
-    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue", "naval_to_land", "followup_respond_hook", "engine_crash_guards", "cai_null_guard"] {
+    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue", "naval_to_land", "followup_respond_hook", "engine_crash_guards", "cai_null_guard", "siege_odds_gate"] {
         feed(key);
         feed(if hook_enabled(key) { "1" } else { "0" });
     }
+    // the odds bands change which assaults the AI accepts
+    feed("siege_odds_bands");
+    feed(&crate::siege::bands_text());
     feed("marriage_blood_generations");
     feed(&crate::marriage::generations().to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
@@ -204,7 +207,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
     "diag_diplomacy", "diag_crash", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue",
     "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "engine_crash_guards",
-    "cai_null_guard", "battle_xform_fast",
+    "cai_null_guard", "battle_xform_fast", "siege_odds_gate", "siege_odds_bands",
 ];
 
 /// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns
