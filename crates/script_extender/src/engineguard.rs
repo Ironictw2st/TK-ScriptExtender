@@ -288,6 +288,92 @@ unsafe fn install_browser(base: usize) -> Result<(), String> {
     Ok(())
 }
 
+
+// ---- weak_ptr.lock() used without a null check (battle effect/audio handle updater) ----------
+// Crash reports exe+0x26a3e68 and exe+0x26a47ea (Windows "Application Error" events, no dump):
+// the code locks a weak_ptr stored at object+0x20/+0x28, and on an expired handle keeps the
+// null it got and does `mov rax,[reg]; call [rax+N]`. Skipping the call is what the engine's own
+// checked paths do for an expired handle. Sibling sites in the same function share the pattern
+// and are guarded too. Notes: notes/battlecrash_1105.md.
+struct WeakSite {
+    name: &'static str,
+    rva: usize,
+    bytes: &'static [u8],
+    /// `test reg,reg` for the register that holds the locked pointer
+    test: [u8; 3],
+}
+const WEAK_SITES: [WeakSite; 4] = [
+    // FUN_1426a3e20: mov rax,[r8]; mov rcx,r8; call [rax+0x30]   (crash 0x26a3e68)
+    WeakSite { name: "guard_weak_3e68", rva: 0x26a3e68, bytes: &[0x49, 0x8b, 0x00, 0x49, 0x8b, 0xc8, 0xff, 0x50, 0x30], test: [0x4d, 0x85, 0xc0] },
+    // FUN_1426a3ee0 cold part: call [rax+0x78]
+    WeakSite { name: "guard_weak_4778", rva: 0x26a4778, bytes: &[0x49, 0x8b, 0x00, 0x48, 0x8d, 0x55, 0x80, 0x49, 0x8b, 0xc8, 0xff, 0x50, 0x78], test: [0x4d, 0x85, 0xc0] },
+    // call [rax+0xc0]   (crash 0x26a47ea, the most frequent)
+    WeakSite { name: "guard_weak_47ea", rva: 0x26a47ea, bytes: &[0x49, 0x8b, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x30, 0x49, 0x8b, 0xc8, 0xff, 0x90, 0xc0, 0x00, 0x00, 0x00], test: [0x4d, 0x85, 0xc0] },
+    // r12 variant: mov rax,[r12]; mov rcx,r12; call [rax+0x28]
+    WeakSite { name: "guard_weak_485a", rva: 0x26a485a, bytes: &[0x49, 0x8b, 0x04, 0x24, 0x49, 0x8b, 0xcc, 0xff, 0x50, 0x28], test: [0x4d, 0x85, 0xe4] },
+];
+/// incremented by the stubs themselves
+pub static WEAK_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// ```text
+///   test reg,reg ; jz null
+///   <the original instructions>      ; rip-independent by construction
+///   jmp [rip+0] ; dq cont
+/// null:
+///   push rax ; mov rax,counter ; lock inc qword [rax] ; pop rax
+///   jmp [rip+0] ; dq cont
+/// ```
+/// Only the flags differ from the original; what the skipped call would have returned (rax, rcx,
+/// rdx) is dead at the continuation.
+fn weak_stub(test: [u8; 3], orig: &[u8], cont: usize, counter: usize) -> Vec<u8> {
+    let mut s = Vec::with_capacity(64 + orig.len());
+    s.extend_from_slice(&test);
+    s.extend_from_slice(&[0x74, 0x00]);
+    let jz = s.len() - 1;
+    s.extend_from_slice(orig);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    let null = s.len();
+    s[jz] = (null - (jz + 1)) as u8;
+    s.push(0x50);
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(counter as u64).to_le_bytes());
+    s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s
+}
+
+unsafe fn install_weak_site(base: usize, w: &WeakSite) -> Result<(), String> {
+    let site = base + w.rva;
+    if !readable(site, w.bytes.len()) { return Err(format!("{site:#x} unreadable")); }
+    let cur = core::slice::from_raw_parts(site as *const u8, w.bytes.len());
+    if cur != w.bytes { return Err(format!("bytes at {site:#x} differ")); }
+    let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let code = weak_stub(w.test, w.bytes, site + w.bytes.len(), &WEAK_HITS as *const AtomicU64 as usize);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
+    let mut old = 0u32;
+    VirtualProtect(stub as *mut c_void, 0x1000, PAGE_EXECUTE_READ, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), stub as *const c_void, code.len());
+    let disp = stub as i64 - (site as i64 + 5);
+    if disp < i32::MIN as i64 || disp > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = vec![0x90u8; w.bytes.len()];
+    patch[0] = 0xe9;
+    patch[1..5].copy_from_slice(&(disp as i32).to_le_bytes());
+    write_code(w.name, site, &patch)
+}
+
+unsafe fn install_weak(base: usize) -> Result<(), String> {
+    let mut n = 0;
+    for w in WEAK_SITES.iter() {
+        match install_weak_site(base, w) {
+            Ok(()) => n += 1,
+            Err(e) => log!("engine guard {} not installed: {e}", w.name),
+        }
+    }
+    if n == 0 { Err("no weak_ptr site matched".into()) } else { Ok(()) }
+}
+
 pub fn install(t: &Table) {
     if !crate::build::hook_enabled("engine_crash_guards") {
         log!("engine crash guards off (engine_crash_guards=0 in script_extender.cfg)");
@@ -297,11 +383,12 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 4] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 5] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
             ("building_browser", install_browser),
+            ("weak_lock", install_weak),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -321,11 +408,11 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
-        (BROWSER_STUB.load(Ordering::Relaxed) != 0) as u8, BROWSER_HITS.load(Ordering::Relaxed),
+        (BROWSER_STUB.load(Ordering::Relaxed) != 0) as u8, BROWSER_HITS.load(Ordering::Relaxed), WEAK_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -419,6 +506,18 @@ mod tests {
         assert_eq!(FONT_SITE_BEFORE[..4], FONT_SITE_AFTER[..4]);
         // the loop bottom's jc goes back to 0x650 = site + 11
         assert_eq!((FONT_LOOP_BOTTOM_RVA + 5) as isize + (FONT_LOOP_BOTTOM[4] as i8) as isize, (site + 11) as isize);
+    }
+
+    #[test]
+    fn weak_stub_layout() {
+        for w in WEAK_SITES.iter() {
+            let s = weak_stub(w.test, w.bytes, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
+            // jz lands on the null path, right after the original bytes + jmp [rip+0] + target
+            let jz = 5 + s[4] as usize;
+            assert_eq!(jz, 5 + w.bytes.len() + 14);
+            assert_eq!(s[jz], 0x50);
+            assert_eq!(&s[5..5 + w.bytes.len()], w.bytes);
+        }
     }
 
     #[test]
