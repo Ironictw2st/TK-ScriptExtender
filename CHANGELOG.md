@@ -2,13 +2,20 @@
 
 ## Unreleased (local branch fix/ui-uaf-phase-guards, not tagged)
 
-- **Two more engine crash guards** in `engine_crash_guards`:
+- **Three more engine crash guards** in `engine_crash_guards`:
   - `clear_selection`: clicking a court seat whose court-screen selection list was already freed (exe+0x55b7e0, mod-manager report
     "Clicked on court tab"; same site as a "loading into a save" report). The detour on ClearSelection (exe+0x55b770) skips a list
     that has no vtable in the exe, an impossible count or an unreadable array.
   - `phase_record`: a battle unit's ability-phase walk reading a phase record that is no longer mapped (exe+0x2326aa4, sandbox battle,
     general starting to rout). The stub clears that list entry's record and continues on the engine's own NULL path.
-  - `se.diag.engine_guards()` gains `clear_selection`, `clear_selection_hits`, `phase_record`, `phase_record_hits`.
+  - `payload_walk`: the event UI's payload list (CcoCampaignPayloadInfo, FUN_1419f2370) walking a freed payload container
+    (exe+0x19f23c2 / 0x19f23cd: "closing start of turn notifications" reports, and the 190E Emishi turn 1->2 hang/crash). The
+    detour skips the walk when the container, its count (at most 0x400), its array or any payload (readable, vtable in the exe)
+    is implausible, so the message shows no payload list instead of crashing. **It cannot stop a hang** when the freed
+    container still holds a plausible count and plausible entries, and it is not the Emishi fix: that is the data fix to
+    EVD C099's CREATE_AUTOMATIC_DIPLOMACY_DEAL payloads (190E, in progress).
+  - `se.diag.engine_guards()` gains `clear_selection`, `clear_selection_hits`, `phase_record`, `phase_record_hits`,
+    `payload_walk`, `payload_walk_hits`.
   - Unit tests: decision tests, stub layout, and an execution test that runs the phase stub on both paths. NOT run in game.
 
 ## 0.47.0-beta.3 (pre-release; content of 0.47.0-beta.2 plus the following)

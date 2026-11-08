@@ -1372,6 +1372,7 @@ missing elsewhere:
 | `building_browser` | a building level that does not resolve in the building browser list (exe+0xCE4A90) | that level is left out of the list |
 | `clear_selection` (branch fix/ui-uaf-phase-guards) | clicking a court seat after the court screen's selection list was freed (exe+0x55B7E0, "Clicked on court tab"; also seen on loading a save) | the click clears nothing; the list must have a vtable in the exe, sane counts (at most 0x4000) and readable arrays |
 | `phase_record` (branch fix/ui-uaf-phase-guards) | a battle unit's active ability phase whose record is no longer mapped (exe+0x2326AA4, seen as a general starts to rout) | the phase is treated as gone: the list entry's record slot is cleared and the walk takes the engine's own "no record" path |
+| `payload_walk` (branch fix/ui-uaf-phase-guards) | an event's payload list built from a payload container that was already freed (exe+0x19F23C2, closing start-of-turn notifications) | the message shows no payload list. It cannot stop a hang if the freed container still looks plausible |
 
 ```lua
 local g = se.diag.engine_guards()
@@ -1382,7 +1383,8 @@ local ok, msg = se.diag.engine_guards_selftest()  -- calls the guarded functions
 `se.diag.engine_guards()` returns `inactive_string`, `ceo_owner`, `text_font` and
 `building_browser` (true when installed) and `inactive_string_hits`, `ceo_owner_hits` and
 `building_browser_hits` (how often each one stepped in; `text_font` has no counter). The local branch
-fix/ui-uaf-phase-guards adds `clear_selection`, `clear_selection_hits`, `phase_record` and `phase_record_hits`. The
+fix/ui-uaf-phase-guards adds `clear_selection`, `clear_selection_hits`, `phase_record`, `phase_record_hits`, `payload_walk` and
+`payload_walk_hits`. The
 `ceo_owner` lookup is also used by the campaign model, so `engine_crash_guards` is part of the
 multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_selftest`.
 

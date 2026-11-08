@@ -546,6 +546,74 @@ unsafe fn install_phase(base: usize) -> Result<(), String> {
     Ok(())
 }
 
+// ---- stale payload container behind CcoCampaignPayloadInfo (start-of-turn notifications) ------
+// Crash exe+0x19f23c2 (Mr.NanaLaptop threads 1566711255 / 1567618285 "closing start of turn
+// notifications" at 0x19f23c2/0x19f23cd, and the 190E Emishi T1->T2 hang/crash, 8 Nov). The event
+// UI builds a CcoCampaignPayloadInfo (0x142f7b020 -> 0x142f2da50 -> 0x1419f2320) and
+// FUN_1419f2370(container, ctx, out) walks the payload container (+4 count, +8 array of payload
+// objects; vtable +0x38 / +0x18 per payload). The container was freed: count 0x35395f72, array
+// garbage. The detour skips the walk when the container or any payload in it is not plausible,
+// leaving `out` as the caller passed it (0x1419f2320 zero-fills it first = an empty payload
+// list; the other caller, the tail-jump at 0x1419989ff, refreshes an existing list, which then
+// keeps its previous contents).
+// LIMITS: it turns the crash into a skipped payload list; it cannot stop a hang where the freed
+// container still holds a plausible count and plausible-looking entries. The Emishi root cause is
+// data (EVD C099's CREATE_AUTOMATIC_DIPLOMACY_DEAL payloads; wafinish), not this guard.
+type PayloadWalk = unsafe extern "C" fn(P, P, P);
+const PAYLOAD_WALK_RVA: usize = 0x19f2370;
+/// mov rax,rsp; mov [rax+18h],r8; mov [rax+10h],rdx; push r15; sub rsp,80h
+const PAYLOAD_WALK_ANCHOR: [u8; 16] = [0x48, 0x8b, 0xc4, 0x4c, 0x89, 0x40, 0x18, 0x48, 0x89, 0x50, 0x10, 0x41, 0x57, 0x48, 0x81, 0xec];
+/// An event carries a handful of payloads; vanilla's largest incident has well under 64.
+const PAYLOAD_COUNT_CAP: u32 = 0x400;
+static PAYLOAD_WALK: OnceLock<GenericDetour<PayloadWalk>> = OnceLock::new();
+pub static PAYLOAD_HITS: AtomicU64 = AtomicU64::new(0);
+static LOGGED_PAYLOAD: AtomicU32 = AtomicU32::new(0);
+
+/// Container readable, count within the cap, array readable, and every payload readable with a
+/// vtable inside the exe image (the walk calls vtable +0x18 and +0x38 and reads payload+8).
+unsafe fn payload_container_ok(c: usize, image: (usize, usize)) -> bool {
+    if !readable(c, 0x10) { return false; }
+    let n = core::ptr::read_unaligned((c + 4) as *const u32);
+    if n > PAYLOAD_COUNT_CAP { return false; }
+    if n == 0 { return true; }
+    let arr = core::ptr::read_unaligned((c + 8) as *const usize);
+    if !readable(arr, n as usize * 8) { return false; }
+    (0..n as usize).all(|i| {
+        let e = core::ptr::read_unaligned((arr + i * 8) as *const usize);
+        readable(e, 0x10) && {
+            let vt = core::ptr::read_unaligned(e as *const usize);
+            vt >= image.0 && vt < image.1
+        }
+    })
+}
+
+unsafe extern "C" fn payload_walk_detour(c: P, ctx: P, out: P) {
+    let Some(h) = PAYLOAD_WALK.get() else { return };
+    let image = IMAGE.get().copied().unwrap_or((0, usize::MAX));
+    if !payload_container_ok(c as usize, image) {
+        let n = PAYLOAD_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if crate::chatty(&LOGGED_PAYLOAD, 5) {
+            log!("engine guard: payload info on a stale payload container ({:#x}, #{n}); list left empty", c as usize);
+        }
+        return;
+    }
+    h.call(c, ctx, out)
+}
+
+unsafe fn install_payload_walk(base: usize) -> Result<(), String> {
+    let target = base + PAYLOAD_WALK_RVA;
+    if bytes_at::<16>(target) != Some(PAYLOAD_WALK_ANCHOR) { return Err(format!("bytes at {target:#x} differ")); }
+    if IMAGE.get().is_none() {
+        let image = image_range(base).ok_or("PE header unreadable")?;
+        let _ = IMAGE.set(image);
+    }
+    let f: PayloadWalk = core::mem::transmute(target);
+    let d = GenericDetour::new(f, payload_walk_detour).map_err(|e| e.to_string())?;
+    let _ = PAYLOAD_WALK.set(d);
+    let d = PAYLOAD_WALK.get().ok_or("detour not stored")?;
+    crate::freeze::enable_detour("guard_payload_walk", "engine_crash_guards", target, d)
+}
+
 pub fn install(t: &Table) {
     if !crate::build::hook_enabled("engine_crash_guards") {
         log!("engine crash guards off (engine_crash_guards=0 in script_extender.cfg)");
@@ -555,7 +623,7 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 7] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 8] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
@@ -563,6 +631,7 @@ pub fn install(t: &Table) {
             ("weak_lock", install_weak),
             ("clear_selection", install_clear_selection),
             ("phase_record", install_phase),
+            ("payload_walk", install_payload_walk),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -582,13 +651,14 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
         (BROWSER_STUB.load(Ordering::Relaxed) != 0) as u8, BROWSER_HITS.load(Ordering::Relaxed), WEAK_HITS.load(Ordering::Relaxed),
         CLEAR_SEL.get().is_some_and(|d| d.is_enabled()) as u8, CLEAR_SEL_HITS.load(Ordering::Relaxed),
         (PHASE_STUB.load(Ordering::Relaxed) != 0) as u8, PHASE_HITS.load(Ordering::Relaxed),
+        PAYLOAD_WALK.get().is_some_and(|d| d.is_enabled()) as u8, PAYLOAD_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -658,6 +728,40 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
     };
     ok &= browser;
     lines.push(format!("building_browser: call redirected={browser}"));
+    // stale inputs only: the guards reject them before any engine code runs
+    if CLEAR_SEL.get().is_some_and(|d| d.is_enabled()) {
+        let mut stale = [0u8; 0x118];
+        stale[0..8].copy_from_slice(&0x2_0000_1000usize.to_le_bytes()); // vtable outside the exe
+        stale[0x10c..0x110].copy_from_slice(&0x7ff7u32.to_le_bytes());
+        stale[0x110..0x118].copy_from_slice(&0x4e1d_29c3_fca5_21a7usize.to_le_bytes());
+        let f: ClearSelection = core::mem::transmute(base + CLEAR_SELECTION_RVA);
+        let h0 = CLEAR_SEL_HITS.load(Ordering::Relaxed);
+        f(stale.as_mut_ptr() as P, 0);
+        let pass = CLEAR_SEL_HITS.load(Ordering::Relaxed) == h0 + 1;
+        ok &= pass;
+        lines.push(format!("clear_selection: stale list skipped={pass}"));
+    } else {
+        ok = false;
+        lines.push("clear_selection: not installed".into());
+    }
+    let phase = PHASE_STUB.load(Ordering::Relaxed) != 0 && bytes_at::<1>(base + PHASE_SITE_RVA) == Some([0xe9]);
+    ok &= phase;
+    lines.push(format!("phase_record: jump in place={phase}"));
+    if PAYLOAD_WALK.get().is_some_and(|d| d.is_enabled()) {
+        let mut stale = [0u8; 0x10];
+        stale[4..8].copy_from_slice(&0x3539_5f72u32.to_le_bytes());
+        stale[8..16].copy_from_slice(&0x0226_0376_0226_0300usize.to_le_bytes());
+        let mut out = [0usize; 8];
+        let f: PayloadWalk = core::mem::transmute(base + PAYLOAD_WALK_RVA);
+        let h0 = PAYLOAD_HITS.load(Ordering::Relaxed);
+        f(stale.as_mut_ptr() as P, core::ptr::null_mut(), out.as_mut_ptr() as P);
+        let pass = PAYLOAD_HITS.load(Ordering::Relaxed) == h0 + 1 && out.iter().all(|&v| v == 0);
+        ok &= pass;
+        lines.push(format!("payload_walk: stale container skipped={pass}"));
+    } else {
+        ok = false;
+        lines.push("payload_walk: not installed".into());
+    }
     let msg = lines.join("; ");
     log!("se_engine_guards_selftest: ok={ok}: {msg}");
     (api.pushboolean)(l, ok as c_int);
@@ -881,6 +985,50 @@ mod tests {
             assert_eq!(run(0x4e1d_29c3_fca5_21a7, node.as_mut_ptr() as usize), 2);
             assert_eq!(node[9], 0, "node phase slot cleared");
             assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn payload_anchor_is_prologue() {
+        // mov rax,rsp ... push r15; sub rsp,imm32 (no rip-relative operand for the trampoline)
+        assert_eq!(PAYLOAD_WALK_ANCHOR[..3], [0x48, 0x8b, 0xc4]);
+        assert_eq!(PAYLOAD_WALK_ANCHOR[11..13], [0x41, 0x57]);
+    }
+
+    #[test]
+    fn payload_container_decision() {
+        unsafe {
+            let image = (0x1_4000_0000usize, 0x1_4483_6000usize);
+            // two payload objects with an in-image vtable
+            let p1 = [0x1_434a_0000usize, 7];
+            let p2 = [0x1_434a_0100usize, 8];
+            let mut arr = [p1.as_ptr() as usize, p2.as_ptr() as usize];
+            let mk = |count: u32, arr: usize| -> [u8; 0x10] {
+                let mut c = [0u8; 0x10];
+                c[4..8].copy_from_slice(&count.to_le_bytes());
+                c[8..16].copy_from_slice(&arr.to_le_bytes());
+                c
+            };
+            let empty = mk(0, 0);
+            assert!(payload_container_ok(empty.as_ptr() as usize, image));
+            let good = mk(2, arr.as_ptr() as usize);
+            assert!(payload_container_ok(good.as_ptr() as usize, image));
+            // the Emishi dump: count 0x35395f72, garbage array
+            let dump = mk(0x3539_5f72, 0x0226_0376_0226_0300);
+            assert!(!payload_container_ok(dump.as_ptr() as usize, image));
+            // plausible count, unreadable array
+            let bad_arr = mk(2, 0x0226_0376_0226_0300);
+            assert!(!payload_container_ok(bad_arr.as_ptr() as usize, image));
+            // one entry unreadable
+            arr[1] = 0x10;
+            assert!(!payload_container_ok(good.as_ptr() as usize, image));
+            // one entry readable but its vtable outside the image (freed + reused block)
+            let junk = [0x2_0000_1000usize, 0];
+            arr[1] = junk.as_ptr() as usize;
+            assert!(!payload_container_ok(good.as_ptr() as usize, image));
+            arr[1] = p2.as_ptr() as usize;
+            assert!(payload_container_ok(good.as_ptr() as usize, image));
+            assert!(!payload_container_ok(0, image));
         }
     }
 
