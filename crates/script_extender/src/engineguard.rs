@@ -374,6 +374,178 @@ unsafe fn install_weak(base: usize) -> Result<(), String> {
     if n == 0 { Err("no weak_ptr site matched".into()) } else { Ok(()) }
 }
 
+// ---- stale court-screen selection list (UI use-after-free) -------------------------------------
+// Crash exe+0x55b7e0 (thread 1568832033214697514, "Clicked on court tab"; same site as cluster 14
+// "loading into a save"). A court seat's CourtScreenStagedSlot click callback (thunk 0x142f0e9b0,
+// context CcoCampaignCourtScreenStagedSlot) calls FUN_14055b770 = ClearSelection(this, notify) on
+// the court screen's selection list after that object was freed: the selected-count at +0x10c
+// read 0x7ff7 and the array at +0x110 was a non-canonical pointer. Layout of the list (from
+// FUN_140593ec0 / FUN_1405b6230): vtable at +0, all items +0xfc count / +0x100 array, selected
+// items +0x10c count / +0x110 array. The detour skips the call (nothing selected = nothing to
+// clear, the function's own empty path) when the object is not a plausible live list.
+// Notes: 190Expanded Beta/Output/Batch1107/CourtCrash/README.md.
+type ClearSelection = unsafe extern "C" fn(P, u8);
+const CLEAR_SELECTION_RVA: usize = 0x55b770;
+const CLEAR_SELECTION_ANCHOR: [u8; 16] = [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57];
+/// Larger than any UI list the engine builds; the crash read 0x7ff7.
+const SELECTION_COUNT_CAP: u32 = 0x4000;
+static CLEAR_SEL: OnceLock<GenericDetour<ClearSelection>> = OnceLock::new();
+static IMAGE: OnceLock<(usize, usize)> = OnceLock::new();
+pub static CLEAR_SEL_HITS: AtomicU64 = AtomicU64::new(0);
+static LOGGED_CLEAR_SEL: AtomicU32 = AtomicU32::new(0);
+
+/// [base, base + SizeOfImage) of the exe, from its own PE header.
+unsafe fn image_range(base: usize) -> Option<(usize, usize)> {
+    let lfanew = core::ptr::read_unaligned((base + 0x3c) as *const u32) as usize;
+    if !readable(base + lfanew, 0x58) { return None; }
+    let size = core::ptr::read_unaligned((base + lfanew + 0x50) as *const u32) as usize;
+    Some((base, base + size))
+}
+
+/// One (count, array) pair of the list: count within the cap and, when non-zero, the whole
+/// array readable.
+unsafe fn list_pair_ok(this: usize, count_off: usize, array_off: usize) -> bool {
+    let n = core::ptr::read_unaligned((this + count_off) as *const u32);
+    if n > SELECTION_COUNT_CAP { return false; }
+    if n == 0 { return true; }
+    let arr = core::ptr::read_unaligned((this + array_off) as *const usize);
+    readable(arr, n as usize * 8)
+}
+
+/// True when `this` looks like a live selection list: readable through +0x118, vtable inside the
+/// exe image, and both (count, array) pairs sane. A freed and reused block fails at least one.
+unsafe fn selection_list_ok(this: usize, image: (usize, usize)) -> bool {
+    if !readable(this, 0x118) { return false; }
+    let vt = core::ptr::read_unaligned(this as *const usize);
+    if vt < image.0 || vt >= image.1 { return false; }
+    list_pair_ok(this, 0xfc, 0x100) && list_pair_ok(this, 0x10c, 0x110)
+}
+
+unsafe extern "C" fn clear_selection_detour(this: P, notify: u8) {
+    let Some(h) = CLEAR_SEL.get() else { return };
+    let image = IMAGE.get().copied().unwrap_or((0, usize::MAX));
+    if !selection_list_ok(this as usize, image) {
+        let n = CLEAR_SEL_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if crate::chatty(&LOGGED_CLEAR_SEL, 5) {
+            log!("engine guard: ClearSelection on a stale UI selection list (this {:#x}, #{n}); skipped", this as usize);
+        }
+        return;
+    }
+    h.call(this, notify)
+}
+
+unsafe fn install_clear_selection(base: usize) -> Result<(), String> {
+    let target = base + CLEAR_SELECTION_RVA;
+    if bytes_at::<16>(target) != Some(CLEAR_SELECTION_ANCHOR) { return Err(format!("bytes at {target:#x} differ")); }
+    let image = image_range(base).ok_or("PE header unreadable")?;
+    let _ = IMAGE.set(image);
+    let f: ClearSelection = core::mem::transmute(target);
+    let d = GenericDetour::new(f, clear_selection_detour).map_err(|e| e.to_string())?;
+    let _ = CLEAR_SEL.set(d);
+    let d = CLEAR_SEL.get().ok_or("detour not stored")?;
+    crate::freeze::enable_detour("guard_clear_selection", "engine_crash_guards", target, d)
+}
+
+// ---- dangling ability-phase record in the battle unit phase walk -----------------------------
+// Crash exe+0x2326aa4 (thread 1568838476181545013, sandbox battle, general starting to rout; no
+// dump, Windows event only). FUN_142326940 walks a battle unit's list of active ability phases
+// (log "Unit %u: Phase: %s FINISHED"); for each node rbx it loads the phase record
+// rsi = [rbx+0x48], tests it for NULL (je 0x2326b1b) and then reads [rsi+0x78], [rsi+0x94],
+// [rsi+0x98]. A non-null but unmapped record faults on the first read. The stub replaces the 26
+// bytes at 0x2326aa4 (no rip-relative operand; no branch lands inside, checked against the whole
+// .text). When the record is unreadable it clears the node's slot [rbx+0x48] (so every later read
+// of node[9] in this function takes its own NULL path instead of passing the dangling pointer to
+// vtable +0xa0/+0xb0) and continues at 0x2326b1b, the engine's own "no phase record" path.
+const PHASE_SITE_RVA: usize = 0x2326aa4;
+/// add r14d,[rsi+78h]; mov [rsp+6Ch],r14d; addss xmm7,[rsi+94h]; addss xmm8,[rsi+98h]
+const PHASE_SITE_BYTES: [u8; 26] = [
+    0x44, 0x03, 0x76, 0x78, 0x44, 0x89, 0x74, 0x24, 0x6c, 0xf3, 0x0f, 0x58, 0xbe, 0x94, 0x00, 0x00, 0x00,
+    0xf3, 0x44, 0x0f, 0x58, 0x86, 0x98, 0x00, 0x00, 0x00,
+];
+/// test rsi,rsi; je 0x2326b1b (the 2 instructions before the site; pins the NULL path)
+const PHASE_PRE_RVA: usize = 0x2326a9f;
+const PHASE_PRE_BYTES: [u8; 5] = [0x48, 0x85, 0xf6, 0x74, 0x77];
+const PHASE_NULL_PATH_RVA: usize = 0x2326b1b;
+static PHASE_STUB: AtomicUsize = AtomicUsize::new(0);
+pub static PHASE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Called from the stub with rcx = the phase record; true when the 0xa0 bytes it reads are mapped.
+unsafe extern "C" fn phase_record_ok(p: usize) -> bool { readable(p, 0xa0) }
+
+/// ```text
+///   push rax rcx rdx r8 r9 r10 r11       ; volatile GPRs (rsp 16-aligned in the body -> 8 mod 16)
+///   sub rsp,0x68 ; movdqu [rsp+8+16*i],xmm_i (i=0..5)   ; -> 16-aligned again
+///   sub rsp,0x20 ; mov rcx,rsi ; mov rax,check ; call rax
+///   test al,al                           ; flags survive: lea/movdqu/pop do not touch them
+///   lea rsp,[rsp+0x20] ; movdqu xmm_i,[rsp+8+16*i] ; lea rsp,[rsp+0x68] ; pop r11..rax
+///   jz bad
+///   <the original 26 bytes> ; jmp [rip+0] ; dq cont
+/// bad:
+///   mov qword [rbx+0x48],0               ; node's phase slot -> NULL
+///   push rax ; mov rax,counter ; lock inc qword [rax] ; pop rax
+///   jmp [rip+0] ; dq null_path
+/// ```
+fn phase_stub(orig: &[u8], check: usize, cont: usize, null_path: usize, counter: usize) -> Vec<u8> {
+    let mut s = Vec::with_capacity(160 + orig.len());
+    s.extend_from_slice(&[0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53]);
+    s.extend_from_slice(&[0x48, 0x83, 0xec, 0x68]);
+    for i in 0..6u8 {
+        // movdqu [rsp+disp8],xmm_i : f3 0f 7f /r (modrm 01 reg 100, sib 24)
+        s.extend_from_slice(&[0xf3, 0x0f, 0x7f, 0x44 | (i << 3), 0x24, 8 + 16 * i]);
+    }
+    s.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
+    s.extend_from_slice(&[0x48, 0x89, 0xf1]); // mov rcx,rsi
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(check as u64).to_le_bytes());
+    s.extend_from_slice(&[0xff, 0xd0]); // call rax
+    s.extend_from_slice(&[0x84, 0xc0]); // test al,al
+    s.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x20]); // lea rsp,[rsp+0x20]
+    for i in 0..6u8 {
+        s.extend_from_slice(&[0xf3, 0x0f, 0x6f, 0x44 | (i << 3), 0x24, 8 + 16 * i]);
+    }
+    s.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x68]); // lea rsp,[rsp+0x68]
+    s.extend_from_slice(&[0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59, 0x58]);
+    s.extend_from_slice(&[0x74, 0x00]);
+    let jz = s.len() - 1;
+    s.extend_from_slice(orig);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    let bad = s.len();
+    s[jz] = (bad - (jz + 1)) as u8;
+    s.extend_from_slice(&[0x48, 0xc7, 0x43, 0x48, 0, 0, 0, 0]); // mov qword [rbx+0x48],0
+    s.push(0x50);
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(counter as u64).to_le_bytes());
+    s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(null_path as u64).to_le_bytes());
+    s
+}
+
+unsafe fn install_phase(base: usize) -> Result<(), String> {
+    let site = base + PHASE_SITE_RVA;
+    if bytes_at::<5>(base + PHASE_PRE_RVA) != Some(PHASE_PRE_BYTES) { return Err("NULL-test bytes differ".into()); }
+    if bytes_at::<26>(site) != Some(PHASE_SITE_BYTES) { return Err(format!("bytes at {site:#x} differ")); }
+    let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let code = phase_stub(
+        &PHASE_SITE_BYTES,
+        phase_record_ok as *const () as usize,
+        site + PHASE_SITE_BYTES.len(),
+        base + PHASE_NULL_PATH_RVA,
+        &PHASE_HITS as *const AtomicU64 as usize,
+    );
+    core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
+    make_executable(stub, code.len());
+    let disp = stub as i64 - (site as i64 + 5);
+    if disp < i32::MIN as i64 || disp > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = vec![0x90u8; PHASE_SITE_BYTES.len()];
+    patch[0] = 0xe9;
+    patch[1..5].copy_from_slice(&(disp as i32).to_le_bytes());
+    write_code("guard_phase_record", site, &patch)?;
+    PHASE_STUB.store(stub, Ordering::Relaxed);
+    Ok(())
+}
+
 pub fn install(t: &Table) {
     if !crate::build::hook_enabled("engine_crash_guards") {
         log!("engine crash guards off (engine_crash_guards=0 in script_extender.cfg)");
@@ -383,12 +555,14 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 5] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 7] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
             ("building_browser", install_browser),
             ("weak_lock", install_weak),
+            ("clear_selection", install_clear_selection),
+            ("phase_record", install_phase),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -408,11 +582,13 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
         (BROWSER_STUB.load(Ordering::Relaxed) != 0) as u8, BROWSER_HITS.load(Ordering::Relaxed), WEAK_HITS.load(Ordering::Relaxed),
+        CLEAR_SEL.get().is_some_and(|d| d.is_enabled()) as u8, CLEAR_SEL_HITS.load(Ordering::Relaxed),
+        (PHASE_STUB.load(Ordering::Relaxed) != 0) as u8, PHASE_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -560,6 +736,161 @@ mod tests {
             assert!(!inactive_would_fault(cco_of(&ev).as_ptr() as usize));
             // no event at all
             assert!(!inactive_would_fault([0usize; 4].as_ptr() as usize));
+        }
+    }
+
+    #[test]
+    fn clear_selection_anchor_is_prologue() {
+        // mov [rsp+8],rbx; mov [rsp+10h],rbp; mov [rsp+18h],rsi; push rdi (the dump's bytes)
+        assert_eq!(CLEAR_SELECTION_ANCHOR[..5], [0x48, 0x89, 0x5c, 0x24, 0x08]);
+        assert_eq!(CLEAR_SELECTION_ANCHOR[15], 0x57);
+    }
+
+    #[test]
+    fn selection_list_decision() {
+        unsafe {
+            let items = [0x1111usize, 0x2222, 0x3333];
+            let mut obj = [0u8; 0x118];
+            let image = (0x1_4000_0000usize, 0x1_4483_6000usize);
+            let set_u32 = |o: &mut [u8; 0x118], off: usize, v: u32| o[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            let set_ptr = |o: &mut [u8; 0x118], off: usize, v: usize| o[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            set_ptr(&mut obj, 0, 0x1_4382_0000);
+            // live, empty list
+            assert!(selection_list_ok(obj.as_ptr() as usize, image));
+            // live list, 3 items, 1 selected
+            set_u32(&mut obj, 0xfc, 3);
+            set_ptr(&mut obj, 0x100, items.as_ptr() as usize);
+            set_u32(&mut obj, 0x10c, 1);
+            set_ptr(&mut obj, 0x110, items.as_ptr() as usize);
+            assert!(selection_list_ok(obj.as_ptr() as usize, image));
+            // the crash: count 0x7ff7, non-canonical array
+            set_u32(&mut obj, 0x10c, 0x7ff7);
+            set_ptr(&mut obj, 0x110, 0x4e1d_29c3_fca5_21a7);
+            assert!(!selection_list_ok(obj.as_ptr() as usize, image));
+            // sane count, unreadable array
+            set_u32(&mut obj, 0x10c, 2);
+            assert!(!selection_list_ok(obj.as_ptr() as usize, image));
+            set_ptr(&mut obj, 0x110, items.as_ptr() as usize);
+            assert!(selection_list_ok(obj.as_ptr() as usize, image));
+            // vtable outside the exe image (block reused by something else)
+            set_ptr(&mut obj, 0, 0x2_0000_1000);
+            assert!(!selection_list_ok(obj.as_ptr() as usize, image));
+            // null / tiny this
+            assert!(!selection_list_ok(0, image));
+            assert!(!selection_list_ok(0x10, image));
+        }
+    }
+
+    #[test]
+    fn phase_site_pins() {
+        // je at 0x2326aa2 (2 bytes, rel8 0x77) lands on the NULL path
+        assert_eq!(PHASE_PRE_RVA + 5 + PHASE_PRE_BYTES[4] as usize, PHASE_NULL_PATH_RVA);
+        // the site follows the je directly
+        assert_eq!(PHASE_PRE_RVA + 5, PHASE_SITE_RVA);
+        // continuation = test r13b,r13b at 0x2326abe
+        assert_eq!(PHASE_SITE_RVA + PHASE_SITE_BYTES.len(), 0x2326abe);
+        // the 26 bytes read rsi only (modrm rm=110 with disp) and carry no rip-relative operand
+        assert_eq!(PHASE_SITE_BYTES[2] & 0xc7, 0x46);
+        assert_eq!(PHASE_SITE_BYTES[12] & 0xc7, 0x86);
+        assert_eq!(PHASE_SITE_BYTES[21] & 0xc7, 0x86);
+    }
+
+    #[test]
+    fn phase_stub_layout() {
+        let (check, cont, null_path, counter) = (0x1111_2222_3333_4444u64, 0x5555_6666_7777_8888u64, 0x9999_aaaa_bbbb_ccccu64, 0xdddd_eeee_ffff_0001u64);
+        let s = phase_stub(&PHASE_SITE_BYTES, check as usize, cont as usize, null_path as usize, counter as usize);
+        // 7 pushes + sub 0x68 keep rsp 16-aligned at the call (body rsp is 16-aligned)
+        assert_eq!((7 * 8 + 0x68 + 0x20) % 16, 0);
+        let pushes = &s[..11];
+        let pops_at = s.windows(11).position(|w| w == [0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59, 0x58]).unwrap();
+        assert_eq!(pushes, &[0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53]);
+        // the check is called with rcx = rsi and its bool tested before any flag-writing op
+        let call = s.windows(2).position(|w| w == [0xff, 0xd0]).unwrap();
+        assert_eq!(&s[call - 13..call - 10], &[0x48, 0x89, 0xf1]);
+        assert_eq!(&s[call - 8..call], &check.to_le_bytes());
+        assert_eq!(&s[call + 2..call + 4], &[0x84, 0xc0]);
+        // between the test and the jz: only lea / movdqu / pop (no add/sub/cmp)
+        let between = &s[call + 4..pops_at + 11];
+        assert!(!between.windows(3).any(|w| w == [0x48, 0x83, 0xc4] || w == [0x48, 0x83, 0xec]));
+        let jz = pops_at + 11;
+        assert_eq!(s[jz], 0x74);
+        // ok path: the original bytes, then jmp [rip+0] cont
+        let orig_at = jz + 2;
+        assert_eq!(&s[orig_at..orig_at + 26], &PHASE_SITE_BYTES);
+        assert_eq!(&s[orig_at + 26..orig_at + 32], &[0xff, 0x25, 0, 0, 0, 0]);
+        assert_eq!(&s[orig_at + 32..orig_at + 40], &cont.to_le_bytes());
+        // bad path: jz lands on mov qword [rbx+0x48],0, then counter, then jmp to the NULL path
+        let bad = jz + 2 + s[jz + 1] as usize;
+        assert_eq!(bad, orig_at + 40);
+        assert_eq!(&s[bad..bad + 8], &[0x48, 0xc7, 0x43, 0x48, 0, 0, 0, 0]);
+        assert_eq!(&s[bad + 11..bad + 19], &counter.to_le_bytes());
+        assert_eq!(&s[s.len() - 8..], &null_path.to_le_bytes());
+        // xmm0-5 saved and restored at the same slots
+        for i in 0..6u8 {
+            let st = [0xf3, 0x0f, 0x7f, 0x44 | (i << 3), 0x24, 8 + 16 * i];
+            let ld = [0xf3, 0x0f, 0x6f, 0x44 | (i << 3), 0x24, 8 + 16 * i];
+            assert!(s.windows(6).any(|w| w == st) && s.windows(6).any(|w| w == ld));
+        }
+    }
+
+    /// Runs the real stub: harness sets rsi = record, rbx = node, keeps rsp 16-aligned like the
+    /// engine body, saves the callee-saved registers the original bytes write (r14, xmm7, xmm8),
+    /// and jumps in; the continuation and the NULL path land on two exits returning 1 and 2.
+    #[test]
+    fn phase_stub_executes() {
+        unsafe {
+            let page = VirtualAlloc(core::ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(page != 0);
+            let exit = |n: u8| -> Vec<u8> {
+                let mut e = vec![0xf3, 0x0f, 0x6f, 0xbc, 0x24, 0x80, 0, 0, 0]; // movdqu xmm7,[rsp+0x80]
+                e.extend_from_slice(&[0xf3, 0x44, 0x0f, 0x6f, 0x84, 0x24, 0x90, 0, 0, 0]); // movdqu xmm8,[rsp+0x90]
+                e.extend_from_slice(&[0x48, 0x81, 0xc4, 0xa0, 0, 0, 0]); // add rsp,0xa0
+                e.extend_from_slice(&[0x41, 0x5e, 0x5e, 0x5b]); // pop r14; pop rsi; pop rbx
+                e.extend_from_slice(&[0xb8, n, 0, 0, 0, 0xc3]); // mov eax,n; ret
+                e
+            };
+            let (ok_exit, bad_exit) = (exit(1), exit(2));
+            let ok_at = page + 0x200;
+            let bad_at = ok_at + ok_exit.len();
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let stub = phase_stub(&PHASE_SITE_BYTES, phase_record_ok as *const () as usize, ok_at, bad_at, &COUNTER as *const AtomicU64 as usize);
+            let stub_at = page + 0x400;
+            let mut h = vec![0x53, 0x56, 0x41, 0x56]; // push rbx; push rsi; push r14
+            h.extend_from_slice(&[0x48, 0x81, 0xec, 0xa0, 0, 0, 0]); // sub rsp,0xa0
+            h.extend_from_slice(&[0xf3, 0x0f, 0x7f, 0xbc, 0x24, 0x80, 0, 0, 0]); // movdqu [rsp+0x80],xmm7
+            h.extend_from_slice(&[0xf3, 0x44, 0x0f, 0x7f, 0x84, 0x24, 0x90, 0, 0, 0]); // movdqu [rsp+0x90],xmm8
+            h.extend_from_slice(&[0x48, 0x89, 0xce, 0x48, 0x89, 0xd3]); // mov rsi,rcx; mov rbx,rdx
+            h.extend_from_slice(&[0x48, 0xb8]);
+            h.extend_from_slice(&(stub_at as u64).to_le_bytes());
+            h.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+            core::ptr::copy_nonoverlapping(h.as_ptr(), page as *mut u8, h.len());
+            core::ptr::copy_nonoverlapping(ok_exit.as_ptr(), ok_at as *mut u8, ok_exit.len());
+            core::ptr::copy_nonoverlapping(bad_exit.as_ptr(), bad_at as *mut u8, bad_exit.len());
+            core::ptr::copy_nonoverlapping(stub.as_ptr(), stub_at as *mut u8, stub.len());
+            FlushInstructionCache(GetCurrentProcess(), page as *const c_void, 0x1000);
+            let run: unsafe extern "C" fn(usize, usize) -> u32 = core::mem::transmute(page);
+
+            let record = [7u8; 0xa0];
+            let mut node = [0usize; 10];
+            node[9] = record.as_ptr() as usize;
+            assert_eq!(run(record.as_ptr() as usize, node.as_mut_ptr() as usize), 1);
+            assert_eq!(node[9], record.as_ptr() as usize);
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+
+            node[9] = 0x4e1d_29c3_fca5_21a7;
+            assert_eq!(run(0x4e1d_29c3_fca5_21a7, node.as_mut_ptr() as usize), 2);
+            assert_eq!(node[9], 0, "node phase slot cleared");
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn phase_record_check() {
+        let rec = [0u8; 0xa0];
+        unsafe {
+            assert!(phase_record_ok(rec.as_ptr() as usize));
+            assert!(!phase_record_ok(0));
+            assert!(!phase_record_ok(0x4e1d_29c3_fca5_21a7));
         }
     }
 
