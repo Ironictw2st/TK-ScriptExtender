@@ -27,6 +27,7 @@ mod potential;
 mod xp;
 mod build;
 mod buildings;
+mod skills;
 mod alliances;
 mod autoresolve;
 mod income;
@@ -110,6 +111,7 @@ fn bootstrap() {
     xp::init(&table);
     build::init(&table);
     buildings::init(&table);
+    skills::init(&table);
     alliances::init(&table);
     bundles::init(&table);
     diplomacy::init(&table);

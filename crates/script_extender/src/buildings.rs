@@ -78,6 +78,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_slot_destroy", se_slot_destroy);
     lua::set_global_fn(l, "se_slot_construct", se_slot_construct);
     lua::set_global_fn(l, "se_slot_pay_to_complete", se_slot_pay_to_complete);
+    lua::set_global_fn(l, "se_slot_options", se_slot_options);
 }
 
 extern "system" {
@@ -116,7 +117,7 @@ unsafe fn ca_string(sp: usize) -> String {
     String::from_utf8_lossy(core::slice::from_raw_parts(ptr as *const u8, len)).into_owned()
 }
 
-unsafe fn record_key(rec: usize) -> String {
+pub(crate) unsafe fn record_key(rec: usize) -> String {
     if rec == 0 || !readable(rec, 0x20) {
         return String::new();
     }
@@ -262,6 +263,57 @@ unsafe extern "C" fn se_slot_candidates(l: *mut LuaState) -> c_int {
         Ok(s) => { lua::push_str(l, &s); 1 }
         Err(e) => { log!("se_slot_candidates: {e}"); lua::push_str(l, ""); lua::push_str(l, &e); 2 }
     }
+}
+
+unsafe fn tbl_int(l: *mut LuaState, name: &[u8], v: isize) {
+    let Some(api) = lua::api() else { return };
+    (api.pushinteger)(l, v);
+    (api.setfield)(l, -2, name.as_ptr() as *const c_char);
+}
+
+/// se_slot_options(q_slot, all_chains) -> { constructing = {key, turns, elapsed} | nil,
+///   options = { {key, cost, turns, reasons, upgrade}, ... } } | nil, msg
+/// Read-only and silent (no per-entry log lines): the candidate list with only_valid = 0, so
+/// blocked options come back with their reason bits (0x10000 = province construction limit
+/// reached, 0x2000 / 0x4000 = cannot afford). Construction in progress = manager+0x10
+/// (+0x8 elapsed, +0xc turns, +0x30 building_levels record).
+unsafe extern "C" fn se_slot_options(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let r = (|| -> Result<Slot, String> {
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        slot_from_arg(e, l, 1)
+    })();
+    let s = match r {
+        Ok(s) => s,
+        Err(err) => { log!("se_slot_options: {err}"); (api.pushnil)(l); lua::push_str(l, &err); return 2; }
+    };
+    let e = ENGINE.get().unwrap();
+    let all_chains = (api.toboolean)(l, 2) != 0;
+    (api.createtable)(l, 0, 3);
+    let item = rq(s.manager + 0x10);
+    if item != 0 && readable(item, 0x38) {
+        (api.createtable)(l, 0, 3);
+        lua::set_field_str(l, "key", &record_key(rq(item + 0x30)));
+        tbl_int(l, b"turns\0", rd(item + 0xc) as isize);
+        tbl_int(l, b"elapsed\0", rd(item + 8) as isize);
+        (api.setfield)(l, -2, b"constructing\0".as_ptr() as *const c_char);
+    }
+    lua::set_field_str(l, "building", &if s.building != 0 { record_key(rq(s.building + OFF_BUILDING_RECORD)) } else { String::new() });
+    with_candidates(e, &s, false, all_chains, |entries| {
+        (api.createtable)(l, entries.len() as c_int, 0);
+        for (i, (entry, _, key)) in entries.iter().enumerate() {
+            (api.createtable)(l, 0, 5);
+            lua::set_field_str(l, "key", key);
+            tbl_int(l, b"cost\0", rd(*entry + 0x10) as isize);
+            tbl_int(l, b"turns\0", rd(*entry + 0x14) as isize);
+            tbl_int(l, b"reasons\0", rd(*entry + 0x18) as isize);
+            (api.pushboolean)(l, (core::ptr::read_unaligned((*entry + 0x1c) as *const u8) != 0) as c_int);
+            (api.setfield)(l, -2, b"upgrade\0".as_ptr() as *const c_char);
+            (api.rawseti)(l, -2, (i + 1) as c_int);
+        }
+    });
+    (api.setfield)(l, -2, b"options\0".as_ptr() as *const c_char);
+    1
 }
 
 unsafe fn bool_result(l: *mut LuaState, r: Result<String, String>, who: &str) -> c_int {

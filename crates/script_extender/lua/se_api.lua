@@ -845,6 +845,18 @@ function se.query.skill_points(cqi)
 	return t.skill_points
 end
 
+-- se.query.skill_tree(cqi) -> { points, rows, nodes = { {row, col, level, max, can_add, locked,
+--   node, skill}, ... } } | nil, message. Read-only. row/col address the node in the engine's
+--   tree; level = points in the node (0 = not taken); can_add = the engine's own check (level
+--   below max, not locked, unlock requirements met), independent of the unspent points.
+function se.query.skill_tree(cqi)
+	local okn, err = need("se_skill_nodes")
+	if not okn then return nil, err end
+	local q, e1 = se.character(cqi)
+	if not q then return nil, e1 end
+	return se_skill_nodes(q, num(cqi))
+end
+
 -- se.modify.skill_points(cqi, n) : set the unspent skill-point counter (0..100)
 function se.modify.skill_points(cqi, n)
 	local okn, err = need("se_skill_points_set")
@@ -992,6 +1004,21 @@ function se.query.building_candidates(region_key, slot_index, opts)
 	local out = {}
 	for k in str(s):gmatch("[^,]+") do out[#out + 1] = k end
 	return out
+end
+
+-- se.query.building_options(region_key, slot_index, opts) -> { building, constructing =
+--   {key, turns, elapsed} | nil, options = { {key, cost, turns, reasons, upgrade}, ... } }
+--   Read-only. Every option the slot offers, blocked ones included with their reason bits:
+--   reasons == 0 = the UI would allow it now; 0x10000 = province construction limit reached;
+--   0x2000 / 0x4000 = cannot afford. opts.all_chains = true: every chain the slot can hold
+--   (default: upgrades / conversions of the current building; an empty slot lists everything).
+function se.query.building_options(region_key, slot_index, opts)
+	opts = opts or {}
+	local okn, err = need("se_slot_options")
+	if not okn then return nil, err end
+	local e, e2 = slot_of(region_key, slot_index)
+	if not e then return nil, e2 end
+	return se_slot_options(e.slot, opts.all_chains == true)
 end
 
 local function slot_action(tag, native, region_key, slot_index, f)
