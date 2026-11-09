@@ -198,7 +198,8 @@ static CEO_FIT: Mutex<Option<HashMap<String, [f32; 3]>>> = Mutex::new(None);
 //   CEO_RANGED = equipment that makes / helps the wearer shoot (mounted fire, ammunition), from effect data;
 //   CHAR_RANGED[details] = the wearer's ranged affinity 0..1 (his own skill tree + traits; 0.5 = unknown);
 //   CEO_OWNER[key] = details of the character a named signature item belongs to (Huang Zhong's bow).
-// Exponent adds RANGED_K x (2a - 1) for ranged items and +OWNER_K / -OWNER_K for the owner / anyone else.
+// Exponent adds RANGED_K x (2a - 1) for ranged items and +OWNER_K for the owner; anyone else values the owner's
+// signature item at the minimum (aicamp.14).
 static CEO_RANGED: Mutex<Option<HashMap<String, f32>>> = Mutex::new(None);
 static CHAR_RANGED: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
 static CEO_OWNER: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
@@ -296,7 +297,13 @@ unsafe extern "C" fn ceo_value_detour(ceo: *mut c_void) -> u32 {
         e += RANGED_K * rw * (2.0 * a.clamp(0.0, 1.0) - 1.0);
     }
     if let Some(o) = CEO_OWNER.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
-        e += if o == d { OWNER_K } else { -OWNER_K };
+        if o != d {
+            // aicamp.14 [live 9 Nov]: s^-3 was not enough: a unique's rarity value still beat a common accessory, so
+            // Liu Cong took Huang Zhong's bow instead of Liu Biao. Someone else's signature item = lowest value.
+            CEO_CHANGED.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        }
+        e += OWNER_K;
     }
     let factor = if e == 0.0 { 1.0 } else { s.powf(e.clamp(-3.0, 3.0)) };
     let nv = (base * factor).round().max(1.0);
