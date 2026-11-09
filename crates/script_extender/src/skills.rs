@@ -22,17 +22,100 @@ use std::sync::OnceLock;
 
 struct Engine {
     can_add: unsafe extern "C" fn(*mut c_void) -> u8,
+    // FUN_141a38e90(details, node): what CCQ_ADD_CAMPAIGN_SKILL_POINT runs (pending point + recompute + event)
+    add: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    // FUN_141a54020(tree, details): CCQ_COMMIT_CAMPAIGN_SKILL_CHOICES step 1 (apply pending, clear)
+    commit: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    // FUN_141422050(force legacy object): commit step 2, only when the character has one
+    commit_legacy: unsafe extern "C" fn(*mut c_void),
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 
 pub fn init(t: &Table) {
-    let e = unsafe { Engine { can_add: core::mem::transmute(t.get("skill_node_can_add")) } };
+    let e = unsafe {
+        Engine {
+            can_add: core::mem::transmute(t.get("skill_node_can_add")),
+            add: core::mem::transmute(t.get("skill_add_point")),
+            commit: core::mem::transmute(t.get("skill_commit")),
+            commit_legacy: core::mem::transmute(t.get("skill_commit_legacy")),
+        }
+    };
     let _ = ENGINE.set(e);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_skill_nodes", se_skill_nodes);
+    lua::set_global_fn(l, "se_skill_add", se_skill_add);
+}
+
+/// Force legacy object of a DETAILS, as both CCQ executors reach it:
+/// details+0xbd0 -> * -> +0x1b0 -> * (0 when the character has none).
+unsafe fn legacy_of(d: usize) -> usize {
+    let p = rq(d + 0xbd0);
+    if p == 0 { return 0; }
+    let a = rq(p);
+    if a == 0 { return 0; }
+    let b = rq(a + 0x1b0);
+    if b == 0 { return 0; }
+    rq(b)
+}
+
+/// se_skill_add(q, cqi, row, col) -> ok, msg
+/// Spends one unspent point on the node at (row, col) of the character tree and commits it,
+/// i.e. CCQ_ADD_CAMPAIGN_SKILL_POINT (FUN_141b45e40, legacy flag 0) followed by
+/// CCQ_COMMIT_CAMPAIGN_SKILL_CHOICES (FUN_141b48310), run directly instead of queued so every
+/// machine of a multiplayer game executes it once inside the same model callback.
+/// Refused when there is no unspent point or the engine's own check says the node can't take one.
+unsafe extern "C" fn se_skill_add(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let row = (api.tointeger)(l, 3);
+    let col = (api.tointeger)(l, 4);
+    let r = (|| -> Result<String, String> {
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        let (d, t) = tree_of(l, cqi)?;
+        if row < 0 || col < 0 { return Err(format!("bad node ({row}, {col})")); }
+        let list = nodes(t)?;
+        let n = list.iter().find(|n| n.row as isize == row && n.col as isize == col)
+            .ok_or_else(|| format!("no node at ({row}, {col})"))?;
+        let points = rd(t + 0x28);
+        if points == 0 { return Err("no unspent skill points".into()); }
+        if rd(t + 0x5c) != 0 { return Err(format!("{} uncommitted choices pending; refusing to commit someone else's choices", rd(t + 0x5c))); }
+        if !can_add(n.addr) { return Err(format!("node ({row}, {col}) '{}' cannot take a point", record_key(rq(rq(n.addr) + 0x78)))); }
+        let before = rb(n.addr + 0x10);
+        (e.add)(d as *mut c_void, n.addr as *mut c_void);
+        let after = rb(n.addr + 0x10);
+        let left = rd(t + 0x28);
+        if after != before.wrapping_add(1) || left + 1 != points {
+            // nothing was queued (or something unexpected was): still commit what is pending so
+            // the tree is never left with half-applied choices, and report it.
+            (e.commit)(t as *mut c_void, d as *mut c_void);
+            return Err(format!("add did not take: level {before} -> {after}, points {points} -> {left}"));
+        }
+        (e.commit)(t as *mut c_void, d as *mut c_void);
+        let leg = legacy_of(d);
+        if leg != 0 { (e.commit_legacy)(leg as *mut c_void); }
+        // notification exactly as FUN_141b48310: model = **(details+0x68); x = *(*(model+0x250)+0x78);
+        // (x+0x1310)->vtable[2](x+0x1310, &details)
+        let m = rq(rq(d + 0x68));
+        let x = if m != 0 { rq(rq(m + 0x250) + 0x78) } else { 0 };
+        if x != 0 && readable(x + 0x1310, 8) {
+            let obj = x + 0x1310;
+            let f = rq(rq(obj) + 0x10);
+            if f != 0 {
+                let notify: unsafe extern "C" fn(*mut c_void, *mut usize) = core::mem::transmute(f);
+                let mut dd = d;
+                notify(obj as *mut c_void, &mut dd);
+            }
+        }
+        Ok(format!("cqi {cqi}: '{}' level {before} -> {after}, points {points} -> {left}{}",
+            record_key(rq(rq(n.addr) + 0x78)), if leg != 0 { " (legacy committed)" } else { "" }))
+    })();
+    match r {
+        Ok(m) => { log!("se_skill_add: {m}"); (api.pushboolean)(l, 1); lua::push_str(l, &m); 2 }
+        Err(m) => { log!("se_skill_add: cqi {cqi}: {m}"); (api.pushboolean)(l, 0); lua::push_str(l, &m); 2 }
+    }
 }
 
 extern "system" {

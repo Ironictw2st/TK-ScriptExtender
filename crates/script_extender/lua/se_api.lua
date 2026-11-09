@@ -857,6 +857,19 @@ function se.query.skill_tree(cqi)
 	return se_skill_nodes(q, num(cqi))
 end
 
+-- se.modify.skill_add(cqi, row, col) : spend one unspent skill point on the node at (row, col)
+--   of se.query.skill_tree(cqi) and commit it, the same engine routines as the character
+--   screen's select + confirm. Refused without an unspent point or when node.can_add is false.
+function se.modify.skill_add(cqi, row, col)
+	local okn, err = need("se_skill_add")
+	if not okn then return false, err end
+	return on_model("skill_add(" .. str(cqi) .. ", " .. str(row) .. ", " .. str(col) .. ")", function()
+		local q, e1 = se.character(cqi)
+		if not q then return false, e1 end
+		return se_skill_add(q, num(cqi), num(row), num(col))
+	end)
+end
+
 -- se.modify.skill_points(cqi, n) : set the unspent skill-point counter (0..100)
 function se.modify.skill_points(cqi, n)
 	local okn, err = need("se_skill_points_set")
