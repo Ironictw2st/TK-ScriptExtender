@@ -46,7 +46,9 @@ static ROLE: Mutex<Option<HashMap<usize, u8>>> = Mutex::new(None);
 thread_local! {
     static CUR_DETAILS: Cell<usize> = const { Cell::new(0) };
     static CUR_CANDS: Cell<usize> = const { Cell::new(0) };
+    static IN_CHOOSER: Cell<bool> = const { Cell::new(false) };
 }
+static CHOOSER_CALLS: AtomicU64 = AtomicU64::new(0);
 
 extern "system" {
     fn IsBadReadPtr(lp: *const c_void, ucb: usize) -> i32;
@@ -68,19 +70,25 @@ fn strength() -> f32 {
 unsafe extern "C" fn chooser_detour(ch: *mut c_void, a: *mut c_void, policy: *mut c_void, chain: *mut c_void, w: f32) {
     let Some(h) = CHOOSER.get() else { return };
     let _g = crate::crash::enter("ai_skill_chooser");
-    let d = rq(rq(ch as usize + 0x260));
-    let prev = CUR_DETAILS.with(|c| c.replace(d));
+    // The first argument is the CAI's character wrapper (from the CAI character list), NOT the model
+    // character: **(arg+0x260) is not DETAILS (aicamp.7 live: picks = 0). DETAILS is taken from the tree
+    // the candidate builder is called with inside this chooser (tree = DETAILS + 0x98).
+    let _ = ch;
+    let prev = IN_CHOOSER.with(|c| c.replace(true));
+    let prev_d = CUR_DETAILS.with(|c| c.replace(0));
     let prev_c = CUR_CANDS.with(|c| c.replace(0));
+    CHOOSER_CALLS.fetch_add(1, Ordering::Relaxed);
     h.call(ch, a, policy, chain, w);
-    CUR_DETAILS.with(|c| c.set(prev));
+    IN_CHOOSER.with(|c| c.set(prev));
+    CUR_DETAILS.with(|c| c.set(prev_d));
     CUR_CANDS.with(|c| c.set(prev_c));
 }
 
 unsafe extern "C" fn cands_detour(tree: *mut c_void, out: *mut c_void) -> *mut c_void {
     let Some(h) = CANDS.get() else { return core::ptr::null_mut() };
     let r = h.call(tree, out);
-    let d = CUR_DETAILS.with(|c| c.get());
-    if d != 0 && tree as usize == d + 0x98 {
+    if IN_CHOOSER.with(|c| c.get()) {
+        CUR_DETAILS.with(|c| c.set((tree as usize).wrapping_sub(0x98)));
         CUR_CANDS.with(|c| c.set(out as usize));
     }
     r
@@ -518,7 +526,7 @@ unsafe extern "C" fn se_nudge_skill_strength(l: *mut LuaState) -> c_int {
 unsafe extern "C" fn se_nudge_skill_stats(l: *mut LuaState) -> c_int {
     let fits = FIT.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
     let roles = ROLE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    lua::push_str(l, &format!("installed={};strength={};picks={};nudged={};fits={fits};roles={roles}",
-        INSTALLED.load(Ordering::SeqCst) as u8, strength(), PICKS.load(Ordering::Relaxed), NUDGED.load(Ordering::Relaxed)));
+    lua::push_str(l, &format!("installed={};strength={};chooser={};picks={};nudged={};fits={fits};roles={roles}",
+        INSTALLED.load(Ordering::SeqCst) as u8, strength(), CHOOSER_CALLS.load(Ordering::Relaxed), PICKS.load(Ordering::Relaxed), NUDGED.load(Ordering::Relaxed)));
     1
 }

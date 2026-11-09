@@ -3362,8 +3362,19 @@ function se.ai_nudge.push_ceo_fits()
 	if type(f) ~= "function" then return 0, "se_nudge_ceo_fit missing" end
 	f("")
 	local parts, total = {}, 0
+	-- only real equipment is nudged; titles, traits, careers etc. keep their vanilla value (aicamp.10 live:
+	-- titles scored as military moved from ministers to generals). Keys like 3k_main_ancillary_weapon_*,
+	-- *_ancillary_armour_*, *_mount_*, *_accessory_*, *_follower_* (and the "ancilliary" misspelling).
+	local function is_equipment(k)
+		if key_has(k, "title") then return false end
+		if not (key_has(k, "ancillary") or key_has(k, "ancilliary")) then return false end
+		for _, w in ipairs({ "weapon", "armour", "armor", "mount", "accessory", "follower" }) do
+			if key_has(k, w) then return true end
+		end
+		return false
+	end
 	for key, fx in pairs(se.ai_effects.ceo or {}) do
-		local g = se.ai_effects_fit(fx, "general")
+		local g = is_equipment(key) and se.ai_effects_fit(fx, "general")
 		if g then
 			parts[#parts + 1] = string.format("%s=%.3f,%.3f,%.3f", key, g, se.ai_effects_fit(fx, "governor"), se.ai_effects_fit(fx, "minister"))
 			if #parts >= 200 then total = total + f(table.concat(parts, ";")) parts = {} end
