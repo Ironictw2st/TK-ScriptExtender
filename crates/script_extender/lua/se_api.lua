@@ -3098,8 +3098,15 @@ function se.ai_ceos.disable()
 end
 
 ----------------------------------------------------------------------------------------------
--- AI court appointments (DLL 0.48 feat/ai-campaign): fill AI court posts by the faction's needs
+-- AI court appointments (DLL 0.48 feat/ai-campaign): NUDGE the CAI's own choice, never assign
 ----------------------------------------------------------------------------------------------
+-- Owner (8 Nov): "I don't want to script these assign posts, just nudge the AI's attention".
+-- So this module never calls assign_to_post. It ranks each AI faction's candidates and publishes a
+-- per-character bias (se.ai_court.bias[faction][cqi] = multiplier >= 1); the CAI keeps making every
+-- appointment under its own rules (cai_personality_character_role_priorities: post priority,
+-- reassignment_allowed, assigned_character_bias). The bias reaches the engine through a DLL hook on
+-- the CAI's candidate-for-post scoring (to be located; notes/AI_CAMPAIGN.md); until then it is
+-- computed and logged only.
 -- Owner's design (8 Nov): the faction's CAI personality decides what it looks for (income-based ->
 -- characters whose minister effects boost income, military-based -> military bonuses); for income it
 -- checks which income type it has most of (peasantry / industry / commerce, from its buildings' GDP)
@@ -3108,15 +3115,16 @@ end
 --   candidate value = sum over his minister-scope effects (traits/items via ceo_management():all_ceos(),
 --     skills taken) of minister weight x factor; factor: the faction's main income type 2, "all" 1.5,
 --     other income types 1, each economic factor x (1.5 - lean); military x (0.5 + lean); untyped 1.
--- Defaults: only EMPTY posts are filled (replace = false), governor posts and faction leader / heir
--- are left to the engine, generals commanding a force are not moved, at most max_changes per faction
--- per cycle, every `every_turns` turns (staggered by faction key). Deterministic.
+--   bias = 1 + max_bias x value / best value of the faction (only for candidates with value > 0).
+-- plan() still reports which free character the faction "should" consider for each open post, as a
+-- read-only wish list for measurement. Deterministic, every `every_turns` turns (staggered by key).
 se.ai_court = se.ai_court or {}
 se.ai_court.config = se.ai_court.config or {
-	every_turns = 5, max_changes = 2, replace = false, replace_gain = 1.5,
+	every_turns = 5, max_changes = 2, max_bias = 1.0,
 	skip_generals = true, skip_posts = { "governor", "faction_leader", "faction_heir" },
 	log_orders = true,
 }
+se.ai_court.bias = se.ai_court.bias or {}
 
 local function key_hash(s)
 	local h = 0
@@ -3249,35 +3257,27 @@ function se.ai_court.plan(faction_key)
 			local best = cands[ci]
 			ci = ci + 1
 			orders[#orders + 1] = { cqi = best.cqi, post = post.key, value = best.value }
-		elseif okh and c.replace then
-			local okp, holders = pcall(function() return post.p:post_holders() end)
-			if okp and holders and holders:num_items() > 0 then
-				local h = holders:item_at(0)
-				local hv = se.ai_court.value(h, focus)
-				local best = cands[ci]
-				if best.value >= hv * (c.replace_gain or 1.5) and best.value > hv then
-					ci = ci + 1
-					orders[#orders + 1] = { cqi = best.cqi, post = post.key, value = best.value, old_cqi = h:cqi(), old_value = hv }
-				end
-			end
 		end
 	end
-	return orders, focus
+	return orders, focus, cands
 end
 
-function se.ai_court.execute(orders, focus)
-	local cm = cm_()
-	local done, failed = 0, 0
-	for _, o in ipairs(orders or {}) do
-		local ok, err = pcall(function() cm:modify_character(o.cqi):assign_to_post(o.post) end)
-		if ok then done = done + 1 else failed = failed + 1 end
-		if se.ai_court.config.log_orders then
-			log(string.format("ai_court: char %s -> %s (value %.1f%s; lean %.2f, main income %s) -> %s", str(o.cqi), o.post, o.value,
-				o.old_cqi and string.format(", replaces %s %.1f", str(o.old_cqi), o.old_value) or "", focus and focus.lean or -1,
-				str(focus and focus.sector), ok and "ok" or ("error " .. str(err))))
+-- se.ai_court.publish(faction_key, orders, focus, cands): store the per-character bias for the CAI
+-- hook (se.ai_court.bias[faction][cqi]) and log the wish list. Never appoints anyone.
+function se.ai_court.publish(faction_key, orders, focus, cands)
+	local best = cands and cands[1] and cands[1].value or 0
+	local b = {}
+	if best > 0 then
+		for _, c in ipairs(cands) do b[c.cqi] = 1 + (se.ai_court.config.max_bias or 1) * c.value / best end
+	end
+	se.ai_court.bias[str(faction_key)] = b
+	if se.ai_court.config.log_orders then
+		for _, o in ipairs(orders or {}) do
+			log(string.format("ai_court %s: would favour char %s for %s (value %.1f, bias x%.2f; lean %.2f, main income %s)", str(faction_key), str(o.cqi), o.post,
+				o.value, b[o.cqi] or 1, focus and focus.lean or -1, str(focus and focus.sector)))
 		end
 	end
-	return done, failed
+	return b
 end
 
 function se.ai_court.enable()
@@ -3293,9 +3293,9 @@ function se.ai_court.enable()
 		return okt and (turn + key_hash(str(context:faction():name()))) % every == 0
 	end, function(context)
 		local key = context:faction():name()
-		local okp, orders, focus = pcall(se.ai_court.plan, key)
+		local okp, orders, focus, cands = pcall(se.ai_court.plan, key)
 		if not okp then log("ai_court " .. str(key) .. ": plan error " .. str(orders)) return end
-		if #orders > 0 then se.ai_court.execute(orders, focus) end
+		se.ai_court.publish(key, orders, focus, cands)
 	end, true)
 	return true, "listening"
 end
