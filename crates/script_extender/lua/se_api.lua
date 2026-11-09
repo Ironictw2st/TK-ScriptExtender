@@ -3381,8 +3381,129 @@ function se.ai_nudge.push_ceo_fits()
 		end
 	end
 	if #parts > 0 then total = total + f(table.concat(parts, ";")) end
+	-- aicamp.13: ranged equipment (mounted fire / ammunition for the wearer) + named signature items
+	local r = G("se_nudge_ceo_ranged")
+	se.ai_nudge.signature = {}
+	if type(r) == "function" then
+		r("")
+		local rp = {}
+		for key, fx in pairs(se.ai_effects.ceo or {}) do
+			if is_equipment(key) then
+				local w = se.ai_nudge.ranged_weight(fx)
+				if w > 0 then
+					rp[#rp + 1] = string.format("%s=%.3f", key, w)
+					if #rp >= 200 then r(table.concat(rp, ";")) rp = {} end
+				end
+				se.ai_nudge.signature[#se.ai_nudge.signature + 1] = key
+			end
+		end
+		if #rp > 0 then r(table.concat(rp, ";")) end
+	end
 	se.ai_nudge.pushed_ceo_fits = true
 	return total
+end
+
+-- a character-scoped effect that makes or helps the character himself shoot (not army-wide archer buffs,
+-- not missile DEFENCE)
+function se.ai_nudge.is_ranged_effect(e)
+	e = str(e)
+	if not (key_has(e, "@character_to_character_own") or key_has(e, "@character_to_military_force_retinue_own")) then return false end
+	if key_has(e, "defence") or key_has(e, "block") or key_has(e, "resist") then return false end
+	return key_has(e, "mounted_fire") or key_has(e, "ammunition") or key_has(e, "missile") or key_has(e, "ranged")
+		or key_has(e, "reload") or key_has(e, "accuracy")
+end
+
+-- 0..1: how much of an item is about shooting (any ranged effect on a 2-effect bow = 1)
+function se.ai_nudge.ranged_weight(fx)
+	local n, k = 0, 0
+	for _, e in ipairs(fx or {}) do
+		n = n + 1
+		if se.ai_nudge.is_ranged_effect(e) then k = k + 1 end
+	end
+	if n == 0 or k == 0 then return 0 end
+	return math.min(1, 2 * k / n)
+end
+
+-- 0..1 ranged affinity of a character from HIS OWN tree + traits (equipment excluded, so a bow he already
+-- wears does not justify itself): 0 = no ranged skill anywhere, 0.5 = ranged skills in his tree (not bought),
+-- 0.75 = one bought or a ranged trait, 1 = more. -1 = unknown (tree unreadable).
+function se.ai_nudge.ranged_affinity(ch, cqi)
+	local S, C = se.ai_effects.skill or {}, se.ai_effects.ceo or {}
+	local t = se.query.skill_tree and se.query.skill_tree(cqi)
+	if type(t) ~= "table" or type(t.nodes) ~= "table" then return -1 end
+	local in_tree, bought = false, 0
+	for _, n in ipairs(t.nodes) do
+		local sk = S[str(n.skill)]
+		local ranged = false
+		if type(sk) == "table" then
+			for _, lv in pairs(sk) do
+				for _, e in ipairs(lv) do if se.ai_nudge.is_ranged_effect(e) then ranged = true break end end
+				if ranged then break end
+			end
+		end
+		if ranged then
+			in_tree = true
+			bought = bought + (n.level or 0)
+		end
+	end
+	pcall(function()
+		local all = ch:ceo_management():all_ceos()
+		for i = 0, all:num_items() - 1 do
+			local k = str(all:item_at(i):ceo_data_key())
+			if not key_has(k, "ancillary") and not key_has(k, "ancilliary") then
+				for _, e in ipairs(C[k] or {}) do
+					if se.ai_nudge.is_ranged_effect(e) then bought = bought + 1 break end
+				end
+			end
+		end
+	end)
+	if bought >= 2 then return 1 end
+	if bought == 1 then return 0.75 end
+	return in_tree and 0.5 or 0
+end
+
+-- named signature items of a character: equipment keys carrying his template name
+-- (3k_main_template_historical_huang_zhong_hero_metal -> huang_zhong -> 3k_main_ancillary_weapon_bow_huang_zhong[_faction])
+function se.ai_nudge.signature_of(ch)
+	local okt, tk = pcall(function() return ch:generation_template_key() end)
+	local token = okt and str(tk):match("template_historical_(.-)_hero")
+	if not token or #token < 4 or not token:match("^[%w_]+$") then return "" end
+	local out = {}
+	for _, key in ipairs(se.ai_nudge.signature or {}) do
+		local k = str(key)
+		if k:match("_" .. token .. "$") or k:match("_" .. token .. "_faction$") or k:match("_" .. token .. "_unique$") then
+			out[#out + 1] = k
+		end
+	end
+	return table.concat(out, ";")
+end
+
+-- per-character item fit of every character of an AI faction -> DLL (once per round the owners are reset)
+function se.ai_nudge.publish_ceo_chars(f)
+	local set, clear = G("se_nudge_ceo_char"), G("se_nudge_ceo_owner_clear")
+	if type(set) ~= "function" then return 0 end
+	local okt, turn = pcall(function() return (se.cm or G("cm")):model():turn_number() end)
+	if okt and turn ~= se.ai_nudge.owner_turn and type(clear) == "function" then
+		clear()
+		se.ai_nudge.owner_turn = turn
+	end
+	local n = 0
+	pcall(function()
+		local list = f:character_list()
+		for i = 0, list:num_items() - 1 do
+			local ch = list:item_at(i)
+			local ok, cqi = pcall(function() return ch:cqi() end)
+			if ok then
+				local q = se.character(cqi)
+				if q then
+					local oka, a = pcall(se.ai_nudge.ranged_affinity, ch, cqi)
+					local oks, own = pcall(se.ai_nudge.signature_of, ch)
+					if set(q, cqi, oka and a or -1, oks and own or "") then n = n + 1 end
+				end
+			end
+		end
+	end)
+	return n
 end
 
 local function nudge_active()
@@ -3441,6 +3562,7 @@ function se.ai_nudge.apply(values)
 			end, function(context)
 				local f = context:faction()
 				se.ai_nudge.publish_roles(f)
+				if (tonumber(se.ai_nudge.values.ceos) or 1) > 1 then pcall(se.ai_nudge.publish_ceo_chars, f) end
 				if (tonumber(se.ai_nudge.values.court) or 1) > 1 then pcall(se.ai_nudge.publish_court, f) end
 			end, true)
 		end

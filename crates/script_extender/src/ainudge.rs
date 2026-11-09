@@ -194,6 +194,17 @@ static CEO_VALUE: OnceLock<GenericDetour<CeoValue>> = OnceLock::new();
 static CEO_INSTALLED: AtomicBool = AtomicBool::new(false);
 static CEO_STRENGTH: AtomicU32 = AtomicU32::new(0x3f800000);
 static CEO_FIT: Mutex<Option<HashMap<String, [f32; 3]>>> = Mutex::new(None);
+// aicamp.13 per-character fit (owner: "Liu Biao should not take Huang Zhong's bow"):
+//   CEO_RANGED = equipment that makes / helps the wearer shoot (mounted fire, ammunition), from effect data;
+//   CHAR_RANGED[details] = the wearer's ranged affinity 0..1 (his own skill tree + traits; 0.5 = unknown);
+//   CEO_OWNER[key] = details of the character a named signature item belongs to (Huang Zhong's bow).
+// Exponent adds RANGED_K x (2a - 1) for ranged items and +OWNER_K / -OWNER_K for the owner / anyone else.
+static CEO_RANGED: Mutex<Option<HashMap<String, f32>>> = Mutex::new(None);
+static CHAR_RANGED: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
+static CEO_OWNER: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+const RANGED_K: f32 = 1.5;
+const OWNER_K: f32 = 1.5;
+static CEO_CHARS: AtomicU64 = AtomicU64::new(0);
 static CEO_CALLS: AtomicU64 = AtomicU64::new(0);
 static CEO_CHANGED: AtomicU64 = AtomicU64::new(0);
 
@@ -267,19 +278,27 @@ unsafe extern "C" fn ceo_value_detour(ceo: *mut c_void) -> u32 {
     let role = ROLE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied()));
     let key = crate::buildings::ca_string(rq(ceo as usize + 0x20));
     let fit = CEO_FIT.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied()));
-    let factor = match (role, fit) {
+    let mut e = match (role, fit) {
         (Some(r), Some(w)) if r < 3 => {
             let r = r as usize;
             let other = (0..3).filter(|&i| i != r).map(|i| w[i]).fold(0.0f32, f32::max);
-            s.powf((w[r] - other).clamp(-1.0, 1.0))
+            (w[r] - other).clamp(-1.0, 1.0)
         }
         (r, f) => {
             if CEO_MISS_LOGGED.fetch_add(1, Ordering::Relaxed) < 10 {
                 log!("ai_equip diag: no fit for details={d:#x} role={r:?} key='{key}' fit_known={}", f.is_some());
             }
-            1.0
+            0.0
         }
     };
+    if let Some(rw) = CEO_RANGED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
+        let a = CHAR_RANGED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied())).unwrap_or(0.5);
+        e += RANGED_K * rw * (2.0 * a.clamp(0.0, 1.0) - 1.0);
+    }
+    if let Some(o) = CEO_OWNER.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
+        e += if o == d { OWNER_K } else { -OWNER_K };
+    }
+    let factor = if e == 0.0 { 1.0 } else { s.powf(e.clamp(-3.0, 3.0)) };
     let nv = (base * factor).round().max(1.0);
     if factor != 1.0 {
         CEO_CHANGED.fetch_add(1, Ordering::Relaxed);
@@ -325,6 +344,67 @@ unsafe extern "C" fn se_nudge_ceo_fit(l: *mut LuaState) -> c_int {
     1
 }
 
+/// se_nudge_ceo_ranged(chunk) "key=w;key=w" ranged weight 0..1 of equipment ("" clears)
+unsafe extern "C" fn se_nudge_ceo_ranged(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let s = lua::to_str(l, 1);
+    let mut g = CEO_RANGED.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if s.is_empty() {
+        m.clear();
+    }
+    let mut n = 0;
+    for item in s.split(';') {
+        let Some((k, v)) = item.split_once('=') else { continue };
+        if let Ok(w) = v.trim().parse::<f32>() {
+            if !k.trim().is_empty() && w.is_finite() {
+                m.insert(k.trim().to_string(), w.clamp(0.0, 1.0));
+                n += 1;
+            }
+        }
+    }
+    (api.pushinteger)(l, n as isize);
+    1
+}
+
+/// se_nudge_ceo_char(q, cqi, ranged_affinity, "owned_key;owned_key") -> bool. Affinity < 0 forgets it.
+unsafe extern "C" fn se_nudge_ceo_char(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let a = (api.tonumber)(l, 3) as f32;
+    let owned = lua::to_str(l, 4);
+    let ok = match crate::skills::tree_of(l, cqi) {
+        Ok((d, _)) => {
+            {
+                let mut g = CHAR_RANGED.lock().unwrap_or_else(|p| p.into_inner());
+                let m = g.get_or_insert_with(HashMap::new);
+                if m.len() > 20000 { m.clear(); }
+                if a.is_finite() && a >= 0.0 { m.insert(d, a.min(1.0)); } else { m.remove(&d); }
+            }
+            if !owned.is_empty() {
+                let mut g = CEO_OWNER.lock().unwrap_or_else(|p| p.into_inner());
+                let m = g.get_or_insert_with(HashMap::new);
+                for k in owned.split(';').map(str::trim).filter(|k| !k.is_empty()) {
+                    m.insert(k.to_string(), d);
+                }
+            }
+            CEO_CHARS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(_) => false,
+    };
+    (api.pushboolean)(l, ok as c_int);
+    1
+}
+
+/// se_nudge_ceo_owner_clear(): forget all signature-item owners (Lua calls it once per round).
+unsafe extern "C" fn se_nudge_ceo_owner_clear(_l: *mut LuaState) -> c_int {
+    if let Ok(mut g) = CEO_OWNER.lock() {
+        if let Some(m) = g.as_mut() { m.clear(); }
+    }
+    0
+}
+
 unsafe extern "C" fn se_nudge_ceo_strength(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let x = (api.tonumber)(l, 1);
@@ -336,9 +416,11 @@ unsafe extern "C" fn se_nudge_ceo_strength(l: *mut LuaState) -> c_int {
 
 unsafe extern "C" fn se_nudge_ceo_stats(l: *mut LuaState) -> c_int {
     let fits = CEO_FIT.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    lua::push_str(l, &format!("installed={};strength={};values={};changed={};fits={fits};misses={};preset_calls={}", CEO_INSTALLED.load(Ordering::SeqCst) as u8,
+    let ranged = CEO_RANGED.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
+    let owners = CEO_OWNER.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
+    lua::push_str(l, &format!("installed={};strength={};values={};changed={};fits={fits};ranged={ranged};owners={owners};chars={};misses={};preset_calls={}", CEO_INSTALLED.load(Ordering::SeqCst) as u8,
         f32::from_bits(CEO_STRENGTH.load(Ordering::Relaxed)), CEO_CALLS.load(Ordering::Relaxed), CEO_CHANGED.load(Ordering::Relaxed),
-        CEO_MISS_LOGGED.load(Ordering::Relaxed), PRESET_CALLS.load(Ordering::Relaxed)));
+        CEO_CHARS.load(Ordering::Relaxed), CEO_MISS_LOGGED.load(Ordering::Relaxed), PRESET_CALLS.load(Ordering::Relaxed)));
     1
 }
 
@@ -465,6 +547,9 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_nudge_court_stats", se_nudge_court_stats);
     lua::set_global_fn(l, "se_nudge_ceo_fit", se_nudge_ceo_fit);
     lua::set_global_fn(l, "se_nudge_ceo_strength", se_nudge_ceo_strength);
+    lua::set_global_fn(l, "se_nudge_ceo_ranged", se_nudge_ceo_ranged);
+    lua::set_global_fn(l, "se_nudge_ceo_char", se_nudge_ceo_char);
+    lua::set_global_fn(l, "se_nudge_ceo_owner_clear", se_nudge_ceo_owner_clear);
     lua::set_global_fn(l, "se_nudge_ceo_stats", se_nudge_ceo_stats);
     lua::set_global_fn(l, "se_nudge_skill_fit", se_nudge_skill_fit);
     lua::set_global_fn(l, "se_nudge_skill_role", se_nudge_skill_role);
