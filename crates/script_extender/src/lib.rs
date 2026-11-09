@@ -23,6 +23,7 @@ mod units;
 mod progression;
 mod chars;
 mod cai;
+mod dbrec;
 mod potential;
 mod xp;
 mod build;
@@ -108,6 +109,7 @@ fn bootstrap() {
     units::init(&table);
     progression::init(&table);
     cai::init(&table);
+    dbrec::init(&table);
     potential::init(&table);
     xp::init(&table);
     build::init(&table);

@@ -53,6 +53,7 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::progression::register(l);
     crate::chars::register(l);
     crate::cai::register(l);
+    crate::dbrec::register(l);
     crate::potential::register(l);
     crate::xp::register(l);
     crate::build::register(l);
