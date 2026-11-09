@@ -196,7 +196,7 @@ pub fn sync_tag() -> String {
     // the odds bands change which assaults the AI accepts
     feed("siege_odds_bands");
     feed(&crate::siege::bands_text());
-    // campaign-AI policies (feat/ai-campaign): default OFF, "1" enables them for AI factions
+    // campaign-AI nudges (feat/ai-campaign): default ON (installed, inert until MCT), "0" keeps them out
     for key in AI_POLICY_KEYS {
         feed(key);
         feed(if ai_policy_enabled(key) { "1" } else { "0" });
@@ -218,10 +218,10 @@ pub const KNOWN_KEYS: &[&str] = &[
     "ai_skills", "ai_ceos", "ai_court", "ai_build",
 ];
 
-/// Campaign-AI policy switches (default off). In the sync tag: they change the simulation.
+/// Campaign-AI nudge switches: install the detours unless the key is "0" (default on; the nudges stay inert at strength 1.0 until the MCT values reach them). In the sync tag.
 pub const AI_POLICY_KEYS: [&str; 4] = ["ai_skills", "ai_ceos", "ai_court", "ai_build"];
 pub fn ai_policy_enabled(key: &str) -> bool {
-    AI_POLICY_KEYS.contains(&key) && config_value(key).as_deref() == Some("1")
+    AI_POLICY_KEYS.contains(&key) && config_value(key).as_deref() != Some("0")
 }
 
 /// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns

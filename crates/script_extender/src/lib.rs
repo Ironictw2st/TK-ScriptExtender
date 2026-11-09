@@ -28,6 +28,7 @@ mod xp;
 mod build;
 mod buildings;
 mod skills;
+mod ainudge;
 mod alliances;
 mod autoresolve;
 mod income;
@@ -150,6 +151,7 @@ fn bootstrap() {
     sepatches::install(&table);
     crash::boot("siege");
     siege::install(&table);
+    ainudge::install(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"

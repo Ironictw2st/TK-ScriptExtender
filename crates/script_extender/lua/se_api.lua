@@ -3305,6 +3305,82 @@ function se.ai_court.disable()
 	return true
 end
 
+----------------------------------------------------------------------------------------------
+-- AI nudges (DLL 0.48 feat/ai-campaign): the shipped behaviour, MCT-controlled
+----------------------------------------------------------------------------------------------
+-- Owner (9 Nov): "all of these should be nudges and tweaks to the AI, just controllable by MCT".
+-- se.ai_nudge.apply(values) is what the MCT consumer calls (in multiplayer with the HOST's values,
+-- delivered to every machine through one UI-triggered script event, see se.ai_nudge.mp_*).
+--   values.skills = strength (1 = off .. 4; default 1.5): the CAI's own skill scores are multiplied by
+--     1 + (strength - 1) x fit(skill, role) before its weighted pick (DLL ainudge.rs).
+-- Needs se.ai_effects (generated data). Roles are re-published at every AI FactionTurnStart.
+se.ai_nudge = se.ai_nudge or { values = {}, pushed_fits = false }
+local ROLE_ID = { general = 0, governor = 1, minister = 2 }
+
+-- fit of every skill (union of its levels' effects) for the three roles -> DLL
+function se.ai_nudge.push_skill_fits()
+	local f = G("se_nudge_skill_fit")
+	if type(f) ~= "function" then return 0, "se_nudge_skill_fit missing" end
+	f("")
+	local parts, total = {}, 0
+	for key, levels in pairs(se.ai_effects.skill or {}) do
+		local fx = {}
+		for _, list in pairs(levels) do for _, e in ipairs(list) do fx[#fx + 1] = e end end
+		local g, gov, min = se.ai_effects_fit(fx, "general"), se.ai_effects_fit(fx, "governor"), se.ai_effects_fit(fx, "minister")
+		if g then
+			parts[#parts + 1] = string.format("%s=%.3f,%.3f,%.3f", key, g, gov, min)
+			if #parts >= 200 then total = total + f(table.concat(parts, ";")) parts = {} end
+		end
+	end
+	if #parts > 0 then total = total + f(table.concat(parts, ";")) end
+	se.ai_nudge.pushed_fits = true
+	return total
+end
+
+-- publish the role of every character of an AI faction (general / governor / minister)
+function se.ai_nudge.publish_roles(f)
+	local r = G("se_nudge_skill_role")
+	if type(r) ~= "function" then return 0 end
+	local n = 0
+	pcall(function()
+		local list = f:character_list()
+		for i = 0, list:num_items() - 1 do
+			local ch = list:item_at(i)
+			local ok, cqi = pcall(function() return ch:cqi() end)
+			if ok then
+				local q = se.character(cqi)
+				if q and r(q, cqi, ROLE_ID[se.ai_skills.role_of(ch)] or 0) then n = n + 1 end
+			end
+		end
+	end)
+	return n
+end
+
+function se.ai_nudge.apply(values)
+	values = values or {}
+	se.ai_nudge.values = values
+	local s = tonumber(values.skills) or 1
+	local set = G("se_nudge_skill_strength")
+	if type(set) == "function" then set(s) end
+	if s > 1 and not se.ai_nudge.pushed_fits then se.ai_nudge.push_skill_fits() end
+	if s > 1 and not se.ai_nudge.listening then
+		local core = se.core or G("core")
+		if type(core) == "table" then
+			se.ai_nudge.listening = true
+			core:add_listener("se_ai_nudge_roles", "FactionTurnStart", function(context)
+				return (tonumber(se.ai_nudge.values.skills) or 1) > 1 and ai_faction(context:faction())
+			end, function(context) se.ai_nudge.publish_roles(context:faction()) end, true)
+		end
+	end
+	log(string.format("ai_nudge: skills x%.2f", s))
+	return true
+end
+
+function se.ai_nudge.stats()
+	local f = G("se_nudge_skill_stats")
+	return type(f) == "function" and f() or "not available"
+end
+
 -- se.ai_skills.trace(on): read-only log of every skill point an AI character spends (vanilla or
 -- ours): "[se] ai_skill_pick|faction|cqi|subtype|role|skill_key". Summarise with
 -- tools\aicamp\ai_campaign_summary.py (role fit by ai_hint tags).
@@ -3570,16 +3646,8 @@ local function auto_followup()
 			local ok, msg = se.ui.fix_ceo_panel()
 			log("character panel refresh: " .. str(ok) .. " " .. str(msg))
 		end
-		-- campaign-AI policies: ai_skills=1 / ai_ceos=1 in script_extender.cfg (default off; in the sync tag)
-		local cfg = G("se_ai_cfg")
-		if type(cfg) == "function" then
-			for _, p in ipairs({ { "ai_skills", se.ai_skills }, { "ai_ceos", se.ai_ceos }, { "ai_court", se.ai_court } }) do
-				if cfg(p[1]) and type(p[2]) == "table" then
-					local ok, msg = p[2].enable()
-					log(p[1] .. " policy enabled from cfg: " .. str(ok) .. " " .. str(msg))
-				end
-			end
-		end
+		-- campaign-AI nudges are switched and tuned from MCT (se.ai_nudge.apply, host values in MP);
+		-- the direct policies (se.ai_skills.enable / se.ai_ceos.enable) are tools, never auto-enabled.
 	end
 	local f = G("se_followup_propose")
 	local c = G("se_ceo_rebuilt")
