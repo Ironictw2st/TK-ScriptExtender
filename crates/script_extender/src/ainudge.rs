@@ -168,7 +168,146 @@ pub fn install(t: &Table) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Equipment (notes/AI_CAMPAIGN.md "Equipment nudge"):
+//   CAI_BDI_CHARACTER_ANCILLARY_MANAGER update FUN_141b1a3e0 calls, per character in priority order,
+//   FUN_141ae6560(DETAILS+0xd10 = character CEO management, faction CEO manager, category, ctx): per
+//   category it sorts the slots by their item's value and the candidates by value, and equips a
+//   candidate where its value is higher. value = FUN_1418bc5e0(ceo) = ceos.priority of the CEO record
+//   (ceo+0x20 -> +0x40 record, +0x18). Nudge: inside FUN_141ae6560, value *= s^d with
+//   d = w[role] - max(other roles) (-1..1) from the CEO's role weights: items that suit the
+//   character rise, misfits (battle gear on an unarmed leader) fall. Strength 1 = off.
+// ---------------------------------------------------------------------------------------------
+
+type Equip = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, *mut c_void);
+type CeoValue = unsafe extern "C" fn(*mut c_void) -> u32;
+static EQUIP: OnceLock<GenericDetour<Equip>> = OnceLock::new();
+static CEO_VALUE: OnceLock<GenericDetour<CeoValue>> = OnceLock::new();
+static CEO_INSTALLED: AtomicBool = AtomicBool::new(false);
+static CEO_STRENGTH: AtomicU32 = AtomicU32::new(0x3f800000);
+static CEO_FIT: Mutex<Option<HashMap<String, [f32; 3]>>> = Mutex::new(None);
+static CEO_CALLS: AtomicU64 = AtomicU64::new(0);
+static CEO_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static EQUIP_DETAILS: Cell<usize> = const { Cell::new(0) };
+}
+
+unsafe extern "C" fn equip_detour(mgr: *mut c_void, fac: *mut c_void, cat: i32, ctx: *mut c_void) {
+    let Some(h) = EQUIP.get() else { return };
+    let _g = crate::crash::enter("ai_equip");
+    let prev = EQUIP_DETAILS.with(|c| c.replace((mgr as usize).wrapping_sub(0xd10)));
+    h.call(mgr, fac, cat, ctx);
+    EQUIP_DETAILS.with(|c| c.set(prev));
+}
+
+unsafe extern "C" fn ceo_value_detour(ceo: *mut c_void) -> u32 {
+    let Some(h) = CEO_VALUE.get() else { return 0 };
+    let v = h.call(ceo);
+    let d = EQUIP_DETAILS.with(|c| c.get());
+    if d == 0 || v == 0 {
+        return v;
+    }
+    let s = f32::from_bits(CEO_STRENGTH.load(Ordering::Relaxed));
+    if s <= 1.0 {
+        return v;
+    }
+    CEO_CALLS.fetch_add(1, Ordering::Relaxed);
+    let role = match ROLE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied())) {
+        Some(r) if r < 3 => r as usize,
+        _ => return v,
+    };
+    let key = record_key(rq(rq(ceo as usize + 0x20) + 0x40));
+    let w = match CEO_FIT.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
+        Some(w) => w,
+        None => return v,
+    };
+    let other = (0..3).filter(|&i| i != role).map(|i| w[i]).fold(0.0f32, f32::max);
+    let e = (w[role] - other).clamp(-1.0, 1.0);
+    let nv = ((v as f32) * s.powf(e)).round().max(1.0);
+    let nv = if nv.is_finite() && nv < 4.0e9 { nv as u32 } else { v };
+    if nv != v {
+        CEO_CHANGED.fetch_add(1, Ordering::Relaxed);
+    }
+    nv
+}
+
+pub fn install_equipment(t: &Table) {
+    if !crate::build::ai_policy_enabled("ai_ceos") {
+        log!("ai equipment nudge disabled by script_extender.cfg (ai_ceos=0)");
+        return;
+    }
+    unsafe {
+        let e: Equip = core::mem::transmute(t.get("ai_equip_character"));
+        let v: CeoValue = core::mem::transmute(t.get("ceo_value"));
+        // SAFETY: anchor-verified; FUN_141ae6560 starts with register spills, FUN_1418bc5e0 with two
+        // register loads (no RIP-relative bytes; 12-byte getter + int3 padding).
+        let (Ok(de), Ok(dv)) = (GenericDetour::new(e, equip_detour), GenericDetour::new(v, ceo_value_detour)) else {
+            log!("ai equipment nudge: failed to create the detours");
+            return;
+        };
+        let _ = EQUIP.set(de);
+        let _ = CEO_VALUE.set(dv);
+        if let Err(err) = crate::freeze::enable_detour("ceo_value", "ai_ceos", v as usize, CEO_VALUE.get().unwrap()) {
+            log!("ai equipment nudge: failed to enable ceo_value: {err}");
+            return;
+        }
+        if let Err(err) = crate::freeze::enable_detour("ai_equip_character", "ai_ceos", e as usize, EQUIP.get().unwrap()) {
+            log!("ai equipment nudge: failed to enable ai_equip_character: {err}");
+            return;
+        }
+        CEO_INSTALLED.store(true, Ordering::SeqCst);
+        log!("ai equipment nudge installed (strength 1.0 = inert until the script sets it)");
+    }
+}
+
+/// se_nudge_ceo_fit(chunk) "key=g,gov,min;..." ("" clears) ; se_nudge_ceo_strength(x) ; se_nudge_ceo_stats()
+unsafe extern "C" fn se_nudge_ceo_fit(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let s = lua::to_str(l, 1);
+    let n = parse_fits(&CEO_FIT, &s);
+    (api.pushinteger)(l, n as isize);
+    1
+}
+
+unsafe extern "C" fn se_nudge_ceo_strength(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let x = (api.tonumber)(l, 1);
+    let x = if x.is_finite() { x.clamp(1.0, 4.0) } else { 1.0 };
+    CEO_STRENGTH.store(x.to_bits(), Ordering::SeqCst);
+    (api.pushnumber)(l, x);
+    1
+}
+
+unsafe extern "C" fn se_nudge_ceo_stats(l: *mut LuaState) -> c_int {
+    let fits = CEO_FIT.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
+    lua::push_str(l, &format!("installed={};strength={};values={};changed={};fits={fits}", CEO_INSTALLED.load(Ordering::SeqCst) as u8,
+        f32::from_bits(CEO_STRENGTH.load(Ordering::Relaxed)), CEO_CALLS.load(Ordering::Relaxed), CEO_CHANGED.load(Ordering::Relaxed)));
+    1
+}
+
+fn parse_fits(m: &Mutex<Option<HashMap<String, [f32; 3]>>>, s: &str) -> usize {
+    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if s.is_empty() {
+        map.clear();
+    }
+    let mut n = 0;
+    for item in s.split(';') {
+        let Some((k, v)) = item.split_once('=') else { continue };
+        let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+        if f.len() == 3 && !k.is_empty() {
+            map.insert(k.trim().to_string(), [f[0], f[1], f[2]]);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub unsafe fn register(l: *mut LuaState) {
+    lua::set_global_fn(l, "se_nudge_ceo_fit", se_nudge_ceo_fit);
+    lua::set_global_fn(l, "se_nudge_ceo_strength", se_nudge_ceo_strength);
+    lua::set_global_fn(l, "se_nudge_ceo_stats", se_nudge_ceo_stats);
     lua::set_global_fn(l, "se_nudge_skill_fit", se_nudge_skill_fit);
     lua::set_global_fn(l, "se_nudge_skill_role", se_nudge_skill_role);
     lua::set_global_fn(l, "se_nudge_skill_strength", se_nudge_skill_strength);

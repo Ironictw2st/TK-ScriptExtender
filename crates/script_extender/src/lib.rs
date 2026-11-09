@@ -152,6 +152,7 @@ fn bootstrap() {
     crash::boot("siege");
     siege::install(&table);
     ainudge::install(&table);
+    ainudge::install_equipment(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"

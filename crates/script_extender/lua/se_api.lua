@@ -3356,29 +3356,58 @@ function se.ai_nudge.publish_roles(f)
 	return n
 end
 
+-- role fits of every CEO with known effects -> DLL (equipment nudge)
+function se.ai_nudge.push_ceo_fits()
+	local f = G("se_nudge_ceo_fit")
+	if type(f) ~= "function" then return 0, "se_nudge_ceo_fit missing" end
+	f("")
+	local parts, total = {}, 0
+	for key, fx in pairs(se.ai_effects.ceo or {}) do
+		local g = se.ai_effects_fit(fx, "general")
+		if g then
+			parts[#parts + 1] = string.format("%s=%.3f,%.3f,%.3f", key, g, se.ai_effects_fit(fx, "governor"), se.ai_effects_fit(fx, "minister"))
+			if #parts >= 200 then total = total + f(table.concat(parts, ";")) parts = {} end
+		end
+	end
+	if #parts > 0 then total = total + f(table.concat(parts, ";")) end
+	se.ai_nudge.pushed_ceo_fits = true
+	return total
+end
+
+local function nudge_active()
+	local v = se.ai_nudge.values or {}
+	return (tonumber(v.skills) or 1) > 1 or (tonumber(v.ceos) or 1) > 1
+end
+
+--   values.ceos = strength (1 = off .. 4): the CAI's own item values are scaled by strength^d,
+--     d = fit for the wearer's role - best fit for another role (DLL ainudge.rs equipment nudge).
 function se.ai_nudge.apply(values)
 	values = values or {}
 	se.ai_nudge.values = values
 	local s = tonumber(values.skills) or 1
+	local c = tonumber(values.ceos) or 1
 	local set = G("se_nudge_skill_strength")
 	if type(set) == "function" then set(s) end
+	local setc = G("se_nudge_ceo_strength")
+	if type(setc) == "function" then setc(c) end
 	if s > 1 and not se.ai_nudge.pushed_fits then se.ai_nudge.push_skill_fits() end
-	if s > 1 and not se.ai_nudge.listening then
+	if c > 1 and not se.ai_nudge.pushed_ceo_fits then se.ai_nudge.push_ceo_fits() end
+	if nudge_active() and not se.ai_nudge.listening then
 		local core = se.core or G("core")
 		if type(core) == "table" then
 			se.ai_nudge.listening = true
 			core:add_listener("se_ai_nudge_roles", "FactionTurnStart", function(context)
-				return (tonumber(se.ai_nudge.values.skills) or 1) > 1 and ai_faction(context:faction())
+				return nudge_active() and ai_faction(context:faction())
 			end, function(context) se.ai_nudge.publish_roles(context:faction()) end, true)
 		end
 	end
-	log(string.format("ai_nudge: skills x%.2f", s))
+	log(string.format("ai_nudge: skills x%.2f, equipment x%.2f", s, c))
 	return true
 end
 
 function se.ai_nudge.stats()
-	local f = G("se_nudge_skill_stats")
-	return type(f) == "function" and f() or "not available"
+	local f, c = G("se_nudge_skill_stats"), G("se_nudge_ceo_stats")
+	return (type(f) == "function" and f() or "skills n/a") .. " | " .. (type(c) == "function" and c() or "ceos n/a")
 end
 
 -- se.ai_skills.trace(on): read-only log of every skill point an AI character spends (vanilla or
