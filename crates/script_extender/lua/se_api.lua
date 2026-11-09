@@ -3409,8 +3409,14 @@ function se.ai_nudge.is_ranged_effect(e)
 	e = str(e)
 	if not (key_has(e, "@character_to_character_own") or key_has(e, "@character_to_military_force_retinue_own")) then return false end
 	if key_has(e, "defence") or key_has(e, "block") or key_has(e, "resist") then return false end
-	return key_has(e, "mounted_fire") or key_has(e, "ammunition") or key_has(e, "missile") or key_has(e, "ranged")
-		or key_has(e, "reload") or key_has(e, "accuracy")
+	if key_has(e, "mounted_fire") or key_has(e, "ammunition") or key_has(e, "missile") or key_has(e, "ranged")
+		or key_has(e, "reload") or key_has(e, "accuracy") then return true end
+	-- ranged ABILITIES (owner 9 Nov: Huang Zhong's Warning Shot): 3k_main_skill_warning_shot, *_volley, *_arrows,
+	-- shot_to_the_heart, ep_dyn *_shot / multishot, *_snipe, maek_bow / gan_ning_bow (not "unbowed"), projectiles
+	for _, w in ipairs({ "shot", "volley", "arrow", "snipe", "_bow", "projectile" }) do
+		if key_has(e, w) then return true end
+	end
+	return false
 end
 
 -- 0..1: how much of an item is about shooting (any ranged effect on a 2-effect bow = 1)
