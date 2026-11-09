@@ -192,6 +192,44 @@ static CEO_CHANGED: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static EQUIP_DETAILS: Cell<usize> = const { Cell::new(0) };
 }
+static CEO_MISS_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+// Diagnostic (aicamp.8): who spends AI characters' skill points? FUN_141a630d0(tree, preset list) adds points
+// along a preset node list; count and log the first calls (tree, implied DETAILS = tree - 0x98, role known?).
+type Preset = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64;
+static PRESET: OnceLock<GenericDetour<Preset>> = OnceLock::new();
+static PRESET_CALLS: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn preset_detour(tree: *mut c_void, list: *mut c_void) -> u64 {
+    let Some(h) = PRESET.get() else { return 0 };
+    let n = PRESET_CALLS.fetch_add(1, Ordering::Relaxed);
+    let t = tree as usize;
+    let pts_before = rd(t + 0x28);
+    let r = h.call(tree, list);
+    if n < 20 {
+        let d = t.wrapping_sub(0x98);
+        let role = ROLE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied()));
+        log!("skill preset diag #{n}: tree={t:#x} details?={d:#x} role={role:?} list_count={} points {} -> {} ret={r}",
+            rd(list as usize + 4), pts_before, rd(t + 0x28));
+    }
+    r
+}
+
+pub fn install_preset_diag(t: &Table) {
+    if !crate::build::ai_policy_enabled("ai_skills") {
+        return;
+    }
+    unsafe {
+        let f: Preset = core::mem::transmute(t.get("skill_preset_apply"));
+        // SAFETY: anchor-verified prologue (mov [rsp+0x10],rdx; push rbp/rsi/r13; mov rbp,rsp): no RIP-relative bytes.
+        let Ok(d) = GenericDetour::new(f, preset_detour) else { return };
+        let _ = PRESET.set(d);
+        match crate::freeze::enable_detour("skill_preset_apply", "ai_skills", f as usize, PRESET.get().unwrap()) {
+            Ok(()) => log!("skill preset diag installed"),
+            Err(e) => log!("skill preset diag: {e}"),
+        }
+    }
+}
 
 unsafe extern "C" fn equip_detour(mgr: *mut c_void, fac: *mut c_void, cat: i32, ctx: *mut c_void) {
     let Some(h) = EQUIP.get() else { return };
@@ -213,23 +251,32 @@ unsafe extern "C" fn ceo_value_detour(ceo: *mut c_void) -> u32 {
         return v;
     }
     CEO_CALLS.fetch_add(1, Ordering::Relaxed);
-    let role = match ROLE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied())) {
-        Some(r) if r < 3 => r as usize,
-        _ => return v,
+    // [V live 9 Nov] ceo+0x20 = the CEO record (key = CA::String at +0); ceo+0x20+0x40 = its RARITY record,
+    // +0x18 = the rarity value: vanilla equips purely by rarity. Inside the routine every value is scaled x100
+    // (matched or not) so the role factor keeps precision and all compared values stay on one scale.
+    const SCALE: f32 = 100.0;
+    let base = (v as f32) * SCALE;
+    let role = ROLE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&d).copied()));
+    let key = crate::buildings::ca_string(rq(ceo as usize + 0x20));
+    let fit = CEO_FIT.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied()));
+    let factor = match (role, fit) {
+        (Some(r), Some(w)) if r < 3 => {
+            let r = r as usize;
+            let other = (0..3).filter(|&i| i != r).map(|i| w[i]).fold(0.0f32, f32::max);
+            s.powf((w[r] - other).clamp(-1.0, 1.0))
+        }
+        (r, f) => {
+            if CEO_MISS_LOGGED.fetch_add(1, Ordering::Relaxed) < 10 {
+                log!("ai_equip diag: no fit for details={d:#x} role={r:?} key='{key}' fit_known={}", f.is_some());
+            }
+            1.0
+        }
     };
-    let key = record_key(rq(rq(ceo as usize + 0x20) + 0x40));
-    let w = match CEO_FIT.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied())) {
-        Some(w) => w,
-        None => return v,
-    };
-    let other = (0..3).filter(|&i| i != role).map(|i| w[i]).fold(0.0f32, f32::max);
-    let e = (w[role] - other).clamp(-1.0, 1.0);
-    let nv = ((v as f32) * s.powf(e)).round().max(1.0);
-    let nv = if nv.is_finite() && nv < 4.0e9 { nv as u32 } else { v };
-    if nv != v {
+    let nv = (base * factor).round().max(1.0);
+    if factor != 1.0 {
         CEO_CHANGED.fetch_add(1, Ordering::Relaxed);
     }
-    nv
+    if nv.is_finite() && nv < 4.0e9 { nv as u32 } else { v }
 }
 
 pub fn install_equipment(t: &Table) {
@@ -281,8 +328,9 @@ unsafe extern "C" fn se_nudge_ceo_strength(l: *mut LuaState) -> c_int {
 
 unsafe extern "C" fn se_nudge_ceo_stats(l: *mut LuaState) -> c_int {
     let fits = CEO_FIT.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
-    lua::push_str(l, &format!("installed={};strength={};values={};changed={};fits={fits}", CEO_INSTALLED.load(Ordering::SeqCst) as u8,
-        f32::from_bits(CEO_STRENGTH.load(Ordering::Relaxed)), CEO_CALLS.load(Ordering::Relaxed), CEO_CHANGED.load(Ordering::Relaxed)));
+    lua::push_str(l, &format!("installed={};strength={};values={};changed={};fits={fits};misses={};preset_calls={}", CEO_INSTALLED.load(Ordering::SeqCst) as u8,
+        f32::from_bits(CEO_STRENGTH.load(Ordering::Relaxed)), CEO_CALLS.load(Ordering::Relaxed), CEO_CHANGED.load(Ordering::Relaxed),
+        CEO_MISS_LOGGED.load(Ordering::Relaxed), PRESET_CALLS.load(Ordering::Relaxed)));
     1
 }
 

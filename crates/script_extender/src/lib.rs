@@ -154,6 +154,7 @@ fn bootstrap() {
     ainudge::install(&table);
     ainudge::install_equipment(&table);
     ainudge::install_court(&table);
+    ainudge::install_preset_diag(&table);
     crash::boot("hook");
     if !hook::install(&table) {
         // without lua_gettop no Lua state ever gets the API: not "ready"
