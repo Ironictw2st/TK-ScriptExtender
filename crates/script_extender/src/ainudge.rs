@@ -304,7 +304,109 @@ fn parse_fits(m: &Mutex<Option<HashMap<String, [f32; 3]>>>, s: &str) -> usize {
     n
 }
 
+// ---------------------------------------------------------------------------------------------
+// Court (notes/AI_CAMPAIGN.md "Court / governor nudge"): the CAI's post assignment scores a candidate
+// for a post by one of his 5 attribute-based role values, FUN_141b33f00(role_analysis, out[5 x f32],
+// DETAILS) (cached per character, rank / age scaled). Vanilla ignores the minister effects of his
+// traits / items / skills. Nudge: the 5 returned values x (1 + (strength - 1) x v), v = 0..1 published
+// per character from Lua (se.ai_court: personality lean, main income type, his minister effects).
+// ---------------------------------------------------------------------------------------------
+
+type RoleValues = unsafe extern "C" fn(*mut c_void, *mut f32, *mut c_void) -> *mut f32;
+static ROLE_VALUES: OnceLock<GenericDetour<RoleValues>> = OnceLock::new();
+static COURT_INSTALLED: AtomicBool = AtomicBool::new(false);
+static COURT_STRENGTH: AtomicU32 = AtomicU32::new(0x3f800000);
+static COURT_VALUE: Mutex<Option<HashMap<usize, f32>>> = Mutex::new(None);
+static COURT_CALLS: AtomicU64 = AtomicU64::new(0);
+static COURT_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn role_values_detour(ra: *mut c_void, out: *mut f32, details: *mut c_void) -> *mut f32 {
+    let Some(h) = ROLE_VALUES.get() else { return out };
+    let r = h.call(ra, out, details);
+    let s = f32::from_bits(COURT_STRENGTH.load(Ordering::Relaxed));
+    if s <= 1.0 || out.is_null() {
+        return r;
+    }
+    COURT_CALLS.fetch_add(1, Ordering::Relaxed);
+    let v = match COURT_VALUE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(details as usize)).copied())) {
+        Some(v) if v > 0.0 => v.min(1.0),
+        _ => return r,
+    };
+    let m = 1.0 + (s - 1.0) * v;
+    if readable(out as usize, 20) {
+        for i in 0..5 {
+            let p = out.add(i);
+            let x = core::ptr::read_unaligned(p);
+            if x.is_finite() {
+                core::ptr::write_unaligned(p, x * m);
+            }
+        }
+        COURT_CHANGED.fetch_add(1, Ordering::Relaxed);
+    }
+    r
+}
+
+pub fn install_court(t: &Table) {
+    if !crate::build::ai_policy_enabled("ai_court") {
+        log!("ai court nudge disabled by script_extender.cfg (ai_court=0)");
+        return;
+    }
+    unsafe {
+        let f: RoleValues = core::mem::transmute(t.get("cai_role_values"));
+        // SAFETY: anchor-verified prologue (register spills, pushes): no RIP-relative bytes.
+        let Ok(d) = GenericDetour::new(f, role_values_detour) else {
+            log!("ai court nudge: failed to create the detour");
+            return;
+        };
+        let _ = ROLE_VALUES.set(d);
+        if let Err(e) = crate::freeze::enable_detour("cai_role_values", "ai_court", f as usize, ROLE_VALUES.get().unwrap()) {
+            log!("ai court nudge: failed to enable cai_role_values: {e}");
+            return;
+        }
+        COURT_INSTALLED.store(true, Ordering::SeqCst);
+        log!("ai court nudge installed (strength 1.0 = inert until the script sets it)");
+    }
+}
+
+/// se_nudge_court_value(q, cqi, v): 0..1 court value of a character (0 / negative forgets him).
+unsafe extern "C" fn se_nudge_court_value(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let v = (api.tonumber)(l, 3);
+    let ok = match crate::skills::tree_of(l, cqi) {
+        Ok((d, _)) => {
+            let mut g = COURT_VALUE.lock().unwrap_or_else(|p| p.into_inner());
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.len() > 20000 { m.clear(); }
+            if v.is_finite() && v > 0.0 { m.insert(d, v.min(1.0)); } else { m.remove(&d); }
+            true
+        }
+        Err(_) => false,
+    };
+    (api.pushboolean)(l, ok as c_int);
+    1
+}
+
+unsafe extern "C" fn se_nudge_court_strength(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let x = (api.tonumber)(l, 1);
+    let x = if x.is_finite() { x.clamp(1.0, 4.0) } else { 1.0 };
+    COURT_STRENGTH.store(x.to_bits(), Ordering::SeqCst);
+    (api.pushnumber)(l, x);
+    1
+}
+
+unsafe extern "C" fn se_nudge_court_stats(l: *mut LuaState) -> c_int {
+    let n = COURT_VALUE.lock().ok().and_then(|g| g.as_ref().map(|m| m.len())).unwrap_or(0);
+    lua::push_str(l, &format!("installed={};strength={};calls={};changed={};values={n}", COURT_INSTALLED.load(Ordering::SeqCst) as u8,
+        f32::from_bits(COURT_STRENGTH.load(Ordering::Relaxed)), COURT_CALLS.load(Ordering::Relaxed), COURT_CHANGED.load(Ordering::Relaxed)));
+    1
+}
+
 pub unsafe fn register(l: *mut LuaState) {
+    lua::set_global_fn(l, "se_nudge_court_value", se_nudge_court_value);
+    lua::set_global_fn(l, "se_nudge_court_strength", se_nudge_court_strength);
+    lua::set_global_fn(l, "se_nudge_court_stats", se_nudge_court_stats);
     lua::set_global_fn(l, "se_nudge_ceo_fit", se_nudge_ceo_fit);
     lua::set_global_fn(l, "se_nudge_ceo_strength", se_nudge_ceo_strength);
     lua::set_global_fn(l, "se_nudge_ceo_stats", se_nudge_ceo_stats);

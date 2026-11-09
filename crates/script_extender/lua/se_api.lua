@@ -3376,7 +3376,33 @@ end
 
 local function nudge_active()
 	local v = se.ai_nudge.values or {}
-	return (tonumber(v.skills) or 1) > 1 or (tonumber(v.ceos) or 1) > 1
+	return (tonumber(v.skills) or 1) > 1 or (tonumber(v.ceos) or 1) > 1 or (tonumber(v.court) or 1) > 1
+end
+
+-- court values of every character of an AI faction, normalised to 0..1 within the faction -> DLL
+function se.ai_nudge.publish_court(f)
+	local set = G("se_nudge_court_value")
+	if type(set) ~= "function" then return 0 end
+	local focus = se.ai_court.focus(f)
+	local rows, best = {}, 0
+	pcall(function()
+		local list = f:character_list()
+		for i = 0, list:num_items() - 1 do
+			local ch = list:item_at(i)
+			local ok, cqi = pcall(function() return ch:cqi() end)
+			if ok then
+				local v = se.ai_court.value(ch, focus)
+				rows[#rows + 1] = { cqi = cqi, v = v }
+				if v > best then best = v end
+			end
+		end
+	end)
+	local n = 0
+	for _, r in ipairs(rows) do
+		local q = se.character(r.cqi)
+		if q and set(q, r.cqi, best > 0 and r.v / best or 0) then n = n + 1 end
+	end
+	return n, focus
 end
 
 --   values.ceos = strength (1 = off .. 4): the CAI's own item values are scaled by strength^d,
@@ -3390,6 +3416,9 @@ function se.ai_nudge.apply(values)
 	if type(set) == "function" then set(s) end
 	local setc = G("se_nudge_ceo_strength")
 	if type(setc) == "function" then setc(c) end
+	local ct = tonumber(values.court) or 1
+	local setk = G("se_nudge_court_strength")
+	if type(setk) == "function" then setk(ct) end
 	if s > 1 and not se.ai_nudge.pushed_fits then se.ai_nudge.push_skill_fits() end
 	if c > 1 and not se.ai_nudge.pushed_ceo_fits then se.ai_nudge.push_ceo_fits() end
 	if nudge_active() and not se.ai_nudge.listening then
@@ -3398,16 +3427,21 @@ function se.ai_nudge.apply(values)
 			se.ai_nudge.listening = true
 			core:add_listener("se_ai_nudge_roles", "FactionTurnStart", function(context)
 				return nudge_active() and ai_faction(context:faction())
-			end, function(context) se.ai_nudge.publish_roles(context:faction()) end, true)
+			end, function(context)
+				local f = context:faction()
+				se.ai_nudge.publish_roles(f)
+				if (tonumber(se.ai_nudge.values.court) or 1) > 1 then pcall(se.ai_nudge.publish_court, f) end
+			end, true)
 		end
 	end
-	log(string.format("ai_nudge: skills x%.2f, equipment x%.2f", s, c))
+	log(string.format("ai_nudge: skills x%.2f, equipment x%.2f, court x%.2f", s, c, ct))
 	return true
 end
 
 function se.ai_nudge.stats()
-	local f, c = G("se_nudge_skill_stats"), G("se_nudge_ceo_stats")
+	local f, c, k = G("se_nudge_skill_stats"), G("se_nudge_ceo_stats"), G("se_nudge_court_stats")
 	return (type(f) == "function" and f() or "skills n/a") .. " | " .. (type(c) == "function" and c() or "ceos n/a")
+		.. " | " .. (type(k) == "function" and k() or "court n/a")
 end
 
 -- se.ai_skills.trace(on): read-only log of every skill point an AI character spends (vanilla or
