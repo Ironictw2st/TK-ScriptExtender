@@ -196,6 +196,11 @@ pub fn sync_tag() -> String {
     // the odds bands change which assaults the AI accepts
     feed("siege_odds_bands");
     feed(&crate::siege::bands_text());
+    // campaign-AI policies (feat/ai-campaign): default OFF, "1" enables them for AI factions
+    for key in AI_POLICY_KEYS {
+        feed(key);
+        feed(if ai_policy_enabled(key) { "1" } else { "0" });
+    }
     feed("marriage_blood_generations");
     feed(&crate::marriage::generations().to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
@@ -210,7 +215,14 @@ pub const KNOWN_KEYS: &[&str] = &[
     "diag_diplomacy", "diag_crash", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue",
     "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "audio", "ui_dev_loader", "engine_crash_guards",
     "cai_null_guard", "battle_xform_fast", "siege_odds_gate", "siege_odds_bands", "siege_force_assault",
+    "ai_skills", "ai_ceos", "ai_court", "ai_build",
 ];
+
+/// Campaign-AI policy switches (default off). In the sync tag: they change the simulation.
+pub const AI_POLICY_KEYS: [&str; 4] = ["ai_skills", "ai_ceos", "ai_court", "ai_build"];
+pub fn ai_policy_enabled(key: &str) -> bool {
+    AI_POLICY_KEYS.contains(&key) && config_value(key).as_deref() == Some("1")
+}
 
 /// An on-by-default hook switch (`ai_recruit_hook`, `followup_hooks`): only an explicit `0` turns
 /// the hook off, so an absent key and a written default give the same sync tag.

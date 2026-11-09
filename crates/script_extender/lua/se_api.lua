@@ -2725,9 +2725,25 @@ function se.ai_skills.score(n, role, element)
 	for _, x in ipairs(c.exclude or {}) do
 		if key_has(key, x) or key_has(str(n.node), x) then return 0 end
 	end
-	local tags = node_tags(n)
+	-- the actual bonuses first: effects of the level this point buys (generated data, else the live
+	-- next-level keys), weighted for the role; the ai_hint tags only when no effect is known
+	local effects = nil
+	local sk = se.ai_effects and se.ai_effects.skill and se.ai_effects.skill[key]
+	if type(sk) == "table" then effects = sk[(n.level or 0) + 1] end
+	if not effects then
+		effects = {}
+		for _, f in ipairs({ n.next1, n.next2, n.next3 }) do
+			for k in str(f or ""):gmatch("[^,]+") do effects[#effects + 1] = k end
+		end
+	end
+	local fit = se.ai_effects_fit and se.ai_effects_fit(effects, role)
 	local s
-	if tags[role] then s = c.role_match elseif tags.general or tags.governor or tags.minister then s = c.role_other else s = c.untagged end
+	if fit ~= nil then
+		s = c.role_other + (c.role_match - c.role_other) * fit
+	else
+		local tags = node_tags(n)
+		if tags[role] then s = c.role_match elseif tags.general or tags.governor or tags.minister then s = c.role_other else s = c.untagged end
+	end
 	if element and key_element(key) == element then s = s * c.element_match end
 	if (n.level or 0) > 0 then s = s * c.continue_bonus end
 	s = s * (se.ai_skills.skill_weight[key] or se.ai_skills.skill_weight[str(n.node)] or 1)
@@ -2840,6 +2856,7 @@ se.ai_ceos.config = se.ai_ceos.config or {
 	categories = { "weapon", "armour", "mount", "accessory", "follower" }, -- category key must contain one
 	exclude = { "personal_goal", "vow", "deed", "mission", "trait", "title" },
 	min_gain = 1,            -- upgrade an equipped item only for at least this much more value
+	min_fit = 0.5,           -- with effect data: skip items whose effects suit the character's role less than this
 	unknown_value = 1.5,     -- items with no value / rarity
 	max_per_faction = 6,     -- equips per faction turn
 	log_orders = true,
@@ -2860,6 +2877,37 @@ function se.ai_ceos.value(key)
 	return se.ai_ceos.config.unknown_value
 end
 
+-- Effect data (generated from the mod's DB by tools\aicamp\gen_ai_effects.py and loaded by the mod):
+--   se.ai_effects.effect_role[effect_key] = { general = w, governor = w, minister = w }   (0..1 each)
+--   se.ai_effects.ceo[ceo_key]            = { effect_key, ... }
+--   se.ai_effects.skill[skill_key]        = { [level] = { effect_key, ... } }
+se.ai_effects = se.ai_effects or { effect_role = {}, ceo = {}, skill = {} }
+
+-- fit of a list of effect keys for a role: share of the summed role weights, nil when nothing is known
+function se.ai_effects_fit(effects, role)
+	local er = se.ai_effects.effect_role or {}
+	local sum, best = 0, 0
+	for _, e in ipairs(effects or {}) do
+		local w = er[e]
+		if w then
+			sum = sum + (w[role] or 0)
+			best = best + math.max(w.general or 0, w.governor or 0, w.minister or 0)
+		end
+	end
+	if best <= 0 then return nil end
+	return sum / best
+end
+
+-- se.ai_ceos.score(ceo_key, role) = value(key) x (0.5 + fit) when effect data knows the item, else value(key);
+-- 0 (not for this character) when fit < config.min_fit
+function se.ai_ceos.score(key, role)
+	local v = se.ai_ceos.value(key)
+	local fit = se.ai_effects_fit(se.ai_effects.ceo and se.ai_effects.ceo[str(key)], role or "general")
+	if fit == nil then return v end
+	if fit < (se.ai_ceos.config.min_fit or 0) then return 0 end
+	return v * (0.5 + fit)
+end
+
 local function category_allowed(cat)
 	cat = str(cat)
 	local c = se.ai_ceos.config
@@ -2873,7 +2921,30 @@ local function item_allowed(key)
 	return true
 end
 
--- characters of a faction in priority order: leader, generals by rank (desc), others; ties by cqi
+-- Court posts of "prime-minister tier" (ministerial_positions.power_rating >= 10 in vanilla data):
+-- they and the faction leader get first pick of minister-type items. Mods add keys here.
+se.ai_ceos.prime_tier_posts = se.ai_ceos.prime_tier_posts or {
+	["3k_main_court_offices_prime_minister"] = true, ["3k_dlc04_court_offices_prime_minister"] = true,
+	["ep_court_offices_prime_minister"] = true, ["faction_heir"] = true,
+	["3k_dlc04_court_offices_grand_tutor"] = true, ["3k_dlc04_court_offices_general_in_chief"] = true,
+	["3k_dlc04_court_offices_grand_commandant"] = true, ["3k_dlc04_court_offices_grand_excellency_of_works"] = true,
+	["3k_dlc04_court_offices_grand_excellency_over_the_masses"] = true,
+}
+-- Which character class gets first pick per slot category ("battle" = generals by rank; "court" = faction
+-- leader + prime-tier posts, then other post holders). Categories not listed use "battle".
+se.ai_ceos.category_class = se.ai_ceos.category_class or { weapon = "battle", armour = "battle", mount = "battle", accessory = "court", follower = "court" }
+
+local function post_key(ch)
+	local k = nil
+	pcall(function()
+		local p = ch:character_post()
+		if p and not p:is_null_interface() then k = str(p:ministerial_position_record_key()) end
+	end)
+	return k
+end
+
+-- characters of a faction with their class tiers. battle_tier: 0 general (also a leader commanding
+-- a force), 1 others. court_tier: 0 faction leader / prime-tier post, 1 other post holders, 2 others.
 function se.ai_ceos.characters_of(f)
 	local out = {}
 	local okl, list = pcall(function() return f:character_list() end)
@@ -2884,17 +2955,36 @@ function se.ai_ceos.characters_of(f)
 		local ch = list:item_at(i)
 		local ok, row = pcall(function()
 			local cqi = ch:cqi()
-			local tier = (cqi == leader) and 0 or (ch:has_military_force() and 1 or 2)
-			return { cqi = cqi, ch = ch, tier = tier, rank = ch:rank() }
+			local pk = post_key(ch)
+			local court = (cqi == leader or (pk and se.ai_ceos.prime_tier_posts[pk])) and 0 or (pk and 1 or 2)
+			return { cqi = cqi, ch = ch, battle_tier = ch:has_military_force() and 0 or 1, court_tier = court, rank = ch:rank(), post = pk }
 		end)
 		if ok then out[#out + 1] = row end
 	end
-	table.sort(out, function(a, b)
-		if a.tier ~= b.tier then return a.tier < b.tier end
+	return out
+end
+
+local function class_of_category(cat)
+	local words = {}
+	for word in pairs(se.ai_ceos.category_class) do words[#words + 1] = word end
+	table.sort(words) -- fixed order (lockstep)
+	for _, word in ipairs(words) do
+		if key_has(str(cat), word) then return se.ai_ceos.category_class[word] end
+	end
+	return "battle"
+end
+
+-- characters ordered for one category class; ties by rank (desc) then cqi (deterministic)
+local function ordered(chars, class)
+	local t = {}
+	for i, c in ipairs(chars) do t[i] = c end
+	local tier = class == "court" and "court_tier" or "battle_tier"
+	table.sort(t, function(a, b)
+		if a[tier] ~= b[tier] then return a[tier] < b[tier] end
 		if a.rank ~= b.rank then return a.rank > b.rank end
 		return a.cqi < b.cqi
 	end)
-	return out
+	return t
 end
 
 -- se.ai_ceos.plan(faction_key) -> orders { {cqi, slot (index), category, ceo, old, value, old_value} }
@@ -2905,34 +2995,46 @@ function se.ai_ceos.plan(faction_key)
 	local f = cm:query_faction(faction_key)
 	local orders, used = {}, {}
 	local cap = se.ai_ceos.config.max_per_faction or 6
-	for _, c in ipairs(se.ai_ceos.characters_of(f)) do
-		if #orders >= cap then break end
-		local okm, slots = pcall(function() return c.ch:ceo_management():all_ceo_equipment_slots() end)
-		if okm and slots then
-			for s = 0, slots:num_items() - 1 do
-				if #orders >= cap then break end
-				local sl = slots:item_at(s)
-				local okc, cat = pcall(function() return sl:category_key() end)
-				if okc and category_allowed(cat) then
-					local cur = nil
-					pcall(function() local e = sl:equipped_ceo() if e and not e:is_null_interface() then cur = e end end)
-					local cur_key = cur and str(cur:ceo_data_key()) or nil
-					local cur_v = cur and se.ai_ceos.value(cur_key) or 0
-					local can_swap = cur == nil or (cur_key and item_allowed(cur_key) and select(2, pcall(function() return sl:can_unequip_ceo() end)) == true)
-					if can_swap then
-						local best, bv, bid = nil, 0, nil
-						local oko, opts = pcall(function() return sl:all_equippable_ceos() end)
-						for k = 0, (oko and opts and opts:num_items() or 0) - 1 do
-							local ceo = opts:item_at(k)
-							local okk, key, eq, id = pcall(function() return str(ceo:ceo_data_key()), ceo:is_equipped_in_slot(), ceo:command_queue_index() end)
-							if okk and not eq and not used[id] and item_allowed(key) then
-								local v = se.ai_ceos.value(key)
-								if v > bv or (v == bv and best and key < best) then best, bv, bid = key, v, id end
+	local chars = se.ai_ceos.characters_of(f)
+	-- one pass per class: battle gear to generals by rank first, court items to the leader and
+	-- prime-tier posts first. Only items equipped NOWHERE are handed out: nothing is ever taken off
+	-- another character.
+	for _, class in ipairs({ "battle", "court" }) do
+		for _, c in ipairs(ordered(chars, class)) do
+			if #orders >= cap then break end
+			-- role for scoring: battle gear always as a general; court items by the post
+			-- (governor post -> governor, leader / other posts -> minister, no post -> general)
+			local role = "general"
+			if class == "court" and c.court_tier <= 1 then
+				role = (c.post and key_has(c.post, "governor")) and "governor" or "minister"
+			end
+			local okm, slots = pcall(function() return c.ch:ceo_management():all_ceo_equipment_slots() end)
+			if okm and slots then
+				for s = 0, slots:num_items() - 1 do
+					if #orders >= cap then break end
+					local sl = slots:item_at(s)
+					local okc, cat = pcall(function() return sl:category_key() end)
+					if okc and category_allowed(cat) and class_of_category(cat) == class then
+						local cur = nil
+						pcall(function() local e = sl:equipped_ceo() if e and not e:is_null_interface() then cur = e end end)
+						local cur_key = cur and str(cur:ceo_data_key()) or nil
+						local cur_v = cur and se.ai_ceos.score(cur_key, role) or 0
+						local can_swap = cur == nil or (cur_key and item_allowed(cur_key) and select(2, pcall(function() return sl:can_unequip_ceo() end)) == true)
+						if can_swap then
+							local best, bv, bid = nil, 0, nil
+							local oko, opts = pcall(function() return sl:all_equippable_ceos() end)
+							for k = 0, (oko and opts and opts:num_items() or 0) - 1 do
+								local ceo = opts:item_at(k)
+								local okk, key, eq, id = pcall(function() return str(ceo:ceo_data_key()), ceo:is_equipped_in_slot(), ceo:command_queue_index() end)
+								if okk and not eq and not used[id] and item_allowed(key) then
+									local v = se.ai_ceos.score(key, role)
+									if v > bv or (v == bv and best and key < best) then best, bv, bid = key, v, id end
+								end
 							end
-						end
-						if best and (cur == nil or bv >= cur_v + (se.ai_ceos.config.min_gain or 1)) then
-							used[bid] = true
-							orders[#orders + 1] = { cqi = c.cqi, slot = s, category = str(cat), ceo = best, ceo_id = bid, old = cur_key, value = bv, old_value = cur_v }
+							if best and (cur == nil or bv >= cur_v + (se.ai_ceos.config.min_gain or 1)) then
+								used[bid] = true
+								orders[#orders + 1] = { cqi = c.cqi, slot = s, category = str(cat), ceo = best, ceo_id = bid, old = cur_key, value = bv, old_value = cur_v, role = role }
+							end
 						end
 					end
 				end
@@ -2992,6 +3094,214 @@ end
 
 function se.ai_ceos.disable()
 	se.ai_ceos.enabled = false
+	return true
+end
+
+----------------------------------------------------------------------------------------------
+-- AI court appointments (DLL 0.48 feat/ai-campaign): fill AI court posts by the faction's needs
+----------------------------------------------------------------------------------------------
+-- Owner's design (8 Nov): the faction's CAI personality decides what it looks for (income-based ->
+-- characters whose minister effects boost income, military-based -> military bonuses); for income it
+-- checks which income type it has most of (peasantry / industry / commerce, from its buildings' GDP)
+-- and prefers ministers whose effects boost that type. Needs se.ai_effects (generated data:
+-- personality leans, building GDP sectors, CEO / skill effects with sector tags).
+--   candidate value = sum over his minister-scope effects (traits/items via ceo_management():all_ceos(),
+--     skills taken) of minister weight x factor; factor: the faction's main income type 2, "all" 1.5,
+--     other income types 1, each economic factor x (1.5 - lean); military x (0.5 + lean); untyped 1.
+-- Defaults: only EMPTY posts are filled (replace = false), governor posts and faction leader / heir
+-- are left to the engine, generals commanding a force are not moved, at most max_changes per faction
+-- per cycle, every `every_turns` turns (staggered by faction key). Deterministic.
+se.ai_court = se.ai_court or {}
+se.ai_court.config = se.ai_court.config or {
+	every_turns = 5, max_changes = 2, replace = false, replace_gain = 1.5,
+	skip_generals = true, skip_posts = { "governor", "faction_leader", "faction_heir" },
+	log_orders = true,
+}
+
+local function key_hash(s)
+	local h = 0
+	for i = 1, #s do h = (h * 31 + s:byte(i)) % 1000003 end
+	return h
+end
+
+-- se.ai_court.focus(f) -> { lean (0 income .. 1 military), sector = main income type | nil, gdp = {peasantry,industry,commerce} }
+function se.ai_court.focus(f)
+	local fkey = str(f:name())
+	local lean = 0.5
+	local p = se.query.cai_personality and select(1, se.query.cai_personality(fkey))
+	if type(p) == "table" and se.ai_effects.personality then
+		lean = se.ai_effects.personality[p.record_key] or se.ai_effects.personality[p.key] or lean
+	end
+	local gdp = { peasantry = 0, industry = 0, commerce = 0 }
+	local B = se.ai_effects.building or {}
+	pcall(function()
+		local regions = f:region_list()
+		for i = 0, regions:num_items() - 1 do
+			local slots = regions:item_at(i):slot_list()
+			for s = 0, slots:num_items() - 1 do
+				local sl = slots:item_at(s)
+				if sl:has_building() then
+					local b = B[str(sl:building():name())]
+					if b then for k, v in pairs(b) do if gdp[k] then gdp[k] = gdp[k] + v end end end
+				end
+			end
+		end
+	end)
+	local sector, best = nil, 0
+	for _, k in ipairs({ "peasantry", "industry", "commerce" }) do -- fixed order (lockstep)
+		if gdp[k] > best then sector, best = k, gdp[k] end
+	end
+	return { lean = lean, sector = sector, gdp = gdp, personality = type(p) == "table" and p.record_key or nil }
+end
+
+-- effect keys a character brings to a post: his CEOs (traits, items, ...) and the skill levels he has
+function se.ai_court.effects_of(ch)
+	local out = {}
+	local C, S = se.ai_effects.ceo or {}, se.ai_effects.skill or {}
+	pcall(function()
+		local all = ch:ceo_management():all_ceos()
+		for i = 0, all:num_items() - 1 do
+			for _, e in ipairs(C[str(all:item_at(i):ceo_data_key())] or {}) do out[#out + 1] = e end
+		end
+	end)
+	local okc, cqi = pcall(function() return ch:cqi() end)
+	local t = okc and se.query.skill_tree and se.query.skill_tree(cqi)
+	if type(t) == "table" then
+		for _, n in ipairs(t.nodes or {}) do
+			local sk = S[str(n.skill)]
+			if sk and (n.level or 0) > 0 then
+				for l = 1, n.level do for _, e in ipairs(sk[l] or {}) do out[#out + 1] = e end end
+			end
+		end
+	end
+	return out
+end
+
+function se.ai_court.value(ch, focus)
+	local R = se.ai_effects.effect_role or {}
+	local lean = focus.lean or 0.5
+	local v = 0
+	for _, e in ipairs(se.ai_court.effects_of(ch)) do
+		local w = R[e]
+		if w and (w.minister or 0) > 0 then
+			local f = 1
+			if w.sector == "military" then f = 0.5 + lean
+			elseif w.sector then
+				f = (w.sector == focus.sector) and 2 or (w.sector == "all" and 1.5 or 1)
+				f = f * (1.5 - lean)
+			end
+			v = v + w.minister * f
+		end
+	end
+	return v
+end
+
+local function skip_post(k)
+	for _, x in ipairs(se.ai_court.config.skip_posts or {}) do if key_has(str(k), x) then return true end end
+	return false
+end
+
+-- se.ai_court.plan(faction_key) -> orders { {cqi, post, value, old_cqi, old_value} }, focus. Pure.
+function se.ai_court.plan(faction_key)
+	local cm = cm_()
+	if not cm then return {} end
+	local f = cm:query_faction(faction_key)
+	local c = se.ai_court.config
+	local focus = se.ai_court.focus(f)
+	-- free candidates: no post, not the leader, (optionally) not commanding a force
+	local leader = -1
+	pcall(function() leader = f:faction_leader():cqi() end)
+	local cands = {}
+	pcall(function()
+		local list = f:character_list()
+		for i = 0, list:num_items() - 1 do
+			local ch = list:item_at(i)
+			local ok, row = pcall(function()
+				local cqi = ch:cqi()
+				if cqi == leader then return nil end
+				if c.skip_generals and ch:has_military_force() then return nil end
+				local p = ch:character_post()
+				if p and not p:is_null_interface() then return nil end
+				return { cqi = cqi, ch = ch, value = se.ai_court.value(ch, focus) }
+			end)
+			if ok and row and row.value > 0 then cands[#cands + 1] = row end
+		end
+	end)
+	table.sort(cands, function(a, b) if a.value ~= b.value then return a.value > b.value end return a.cqi < b.cqi end)
+	-- posts: prime tier first, then by key
+	local posts = {}
+	pcall(function()
+		local pl = f:character_posts()
+		for i = 0, pl:num_items() - 1 do
+			local p = pl:item_at(i)
+			local k = str(p:ministerial_position_record_key())
+			if not skip_post(k) then
+				posts[#posts + 1] = { key = k, p = p, prime = se.ai_ceos.prime_tier_posts[k] and 0 or 1 }
+			end
+		end
+	end)
+	table.sort(posts, function(a, b) if a.prime ~= b.prime then return a.prime < b.prime end return a.key < b.key end)
+	local orders, ci = {}, 1
+	for _, post in ipairs(posts) do
+		if #orders >= (c.max_changes or 2) or ci > #cands then break end
+		local okh, cur, max = pcall(function() return post.p:current_post_holders(), post.p:maximum_post_holders() end)
+		if okh and cur < max then
+			local best = cands[ci]
+			ci = ci + 1
+			orders[#orders + 1] = { cqi = best.cqi, post = post.key, value = best.value }
+		elseif okh and c.replace then
+			local okp, holders = pcall(function() return post.p:post_holders() end)
+			if okp and holders and holders:num_items() > 0 then
+				local h = holders:item_at(0)
+				local hv = se.ai_court.value(h, focus)
+				local best = cands[ci]
+				if best.value >= hv * (c.replace_gain or 1.5) and best.value > hv then
+					ci = ci + 1
+					orders[#orders + 1] = { cqi = best.cqi, post = post.key, value = best.value, old_cqi = h:cqi(), old_value = hv }
+				end
+			end
+		end
+	end
+	return orders, focus
+end
+
+function se.ai_court.execute(orders, focus)
+	local cm = cm_()
+	local done, failed = 0, 0
+	for _, o in ipairs(orders or {}) do
+		local ok, err = pcall(function() cm:modify_character(o.cqi):assign_to_post(o.post) end)
+		if ok then done = done + 1 else failed = failed + 1 end
+		if se.ai_court.config.log_orders then
+			log(string.format("ai_court: char %s -> %s (value %.1f%s; lean %.2f, main income %s) -> %s", str(o.cqi), o.post, o.value,
+				o.old_cqi and string.format(", replaces %s %.1f", str(o.old_cqi), o.old_value) or "", focus and focus.lean or -1,
+				str(focus and focus.sector), ok and "ok" or ("error " .. str(err))))
+		end
+	end
+	return done, failed
+end
+
+function se.ai_court.enable()
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	se.ai_court.enabled = true
+	if se.ai_court.listening then return true, "already listening; enabled" end
+	se.ai_court.listening = true
+	core:add_listener("se_ai_court_turn_start", "FactionTurnStart", function(context)
+		if not (se.ai_court.enabled and ai_faction(context:faction())) then return false end
+		local okt, turn = pcall(function() return cm_():query_model():turn_number() end)
+		local every = se.ai_court.config.every_turns or 5
+		return okt and (turn + key_hash(str(context:faction():name()))) % every == 0
+	end, function(context)
+		local key = context:faction():name()
+		local okp, orders, focus = pcall(se.ai_court.plan, key)
+		if not okp then log("ai_court " .. str(key) .. ": plan error " .. str(orders)) return end
+		if #orders > 0 then se.ai_court.execute(orders, focus) end
+	end, true)
+	return true, "listening"
+end
+
+function se.ai_court.disable()
+	se.ai_court.enabled = false
 	return true
 end
 
@@ -3259,6 +3569,16 @@ local function auto_followup()
 		if type(se.ui.fix_ceo_panel) == "function" then
 			local ok, msg = se.ui.fix_ceo_panel()
 			log("character panel refresh: " .. str(ok) .. " " .. str(msg))
+		end
+		-- campaign-AI policies: ai_skills=1 / ai_ceos=1 in script_extender.cfg (default off; in the sync tag)
+		local cfg = G("se_ai_cfg")
+		if type(cfg) == "function" then
+			for _, p in ipairs({ { "ai_skills", se.ai_skills }, { "ai_ceos", se.ai_ceos }, { "ai_court", se.ai_court } }) do
+				if cfg(p[1]) and type(p[2]) == "table" then
+					local ok, msg = p[2].enable()
+					log(p[1] .. " policy enabled from cfg: " .. str(ok) .. " " .. str(msg))
+				end
+			end
 		end
 	end
 	local f = G("se_followup_propose")

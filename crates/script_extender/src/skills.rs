@@ -47,6 +47,16 @@ pub fn init(t: &Table) {
 pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_skill_nodes", se_skill_nodes);
     lua::set_global_fn(l, "se_skill_add", se_skill_add);
+    lua::set_global_fn(l, "se_ai_cfg", se_ai_cfg);
+}
+
+/// se_ai_cfg(key) -> bool: script_extender.cfg switch of a campaign-AI policy ("ai_skills",
+/// "ai_ceos", "ai_court", "ai_build"; default false). Only those keys; anything else is false.
+unsafe extern "C" fn se_ai_cfg(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let key = lua::to_str(l, 1);
+    (api.pushboolean)(l, crate::build::ai_policy_enabled(&key) as c_int);
+    1
 }
 
 /// Force legacy object of a DETAILS, as both CCQ executors reach it:
