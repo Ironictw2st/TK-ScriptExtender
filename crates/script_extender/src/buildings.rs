@@ -97,7 +97,7 @@ unsafe fn vf(obj: usize, off: usize) -> usize {
     rq(rq(obj) + off)
 }
 
-unsafe fn ca_string(sp: usize) -> String {
+pub(crate) unsafe fn ca_string(sp: usize) -> String {
     if !readable(sp, 16) {
         return String::new();
     }

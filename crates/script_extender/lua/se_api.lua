@@ -2656,6 +2656,369 @@ function se.ai_recruit.disable()
 end
 
 ----------------------------------------------------------------------------------------------
+-- AI skill allocation (DLL 0.48 feat/ai-campaign): spend AI characters' skill points by role
+----------------------------------------------------------------------------------------------
+-- The vanilla CAI weighs skills with 4 utilization hints for ~800 skills and all policy weights at
+-- 1.0 (notes/AI_CAMPAIGN.md), i.e. close to uniform. CA (and 190E) tag most skills with dummy
+-- effects 3k_main_effect_ai_hint_general / _governor / _minister; this policy reads them live
+-- from the node's next level (se.query.skill_tree next1..3) and spends each unspent point on the
+-- best node the engine allows (node.can_add: links, level caps and unlock requirements are the
+-- engine's own check, so 190E culture trees need no special case).
+--   score = role factor (tag for the character's role: role_match; only other roles: role_other;
+--           untagged: untagged) x element_match when the skill key carries the character's element
+--           x continue_bonus when the node already has points x skill_weight[skill or node key]
+-- Deterministic: ties break on (row, col); no clocks, addresses or random numbers. AI factions only.
+se.ai_skills = se.ai_skills or {}
+se.ai_skills.config = se.ai_skills.config or {
+	role_match = 3.0, role_other = 0.4, untagged = 1.0,
+	element_match = 1.25, continue_bonus = 1.2,
+	idle_role = "general",           -- characters without a force or a post are scored as this role
+	max_per_character = 3,           -- points spent per character per trigger
+	max_per_faction = 40,            -- per FactionTurnStart sweep
+	on_point_available = true,       -- also spend at CharacterSkillPointAvailable (AI characters)
+	exclude = { "personal_goal", "vow", "deed", "mission" }, -- node/skill keys containing these are never bought
+	log_orders = true,
+}
+se.ai_skills.skill_weight = se.ai_skills.skill_weight or {}
+local ELEMENT_WORDS = { wood = true, fire = true, earth = true, metal = true, water = true }
+
+local function key_element(k)
+	for w in str(k):gmatch("[^_]+") do if ELEMENT_WORDS[w] then return w end end
+	return nil
+end
+
+local function key_has(k, sub)
+	-- substring test for keys made of [%w_] only (no magic characters), via match: CA's
+	-- string.find takes only 2 args here and string.sub has a sticky error flag (avoid both).
+	return str(k):match(sub) ~= nil
+end
+
+-- role of a QUERY_CHARACTER: "general" | "governor" | "minister" | config.idle_role
+function se.ai_skills.role_of(ch)
+	local okf, f = pcall(function() return ch:has_military_force() end)
+	if okf and f then return "general" end
+	local okp, post = pcall(function() return ch:character_post() end)
+	local okn, null = pcall(function() return post == nil or post:is_null_interface() end)
+	if okp and okn and not null then
+		local okk, k = pcall(function() return post:ministerial_position_record_key() end)
+		if okk and key_has(str(k), "governor") then return "governor" end
+		return "minister"
+	end
+	return se.ai_skills.config.idle_role or "general"
+end
+
+local function node_tags(n)
+	local tags = {}
+	for _, f in ipairs({ n.next1, n.next2, n.next3 }) do
+		for k in str(f or ""):gmatch("[^,]+") do
+			for _, r in ipairs({ "general", "governor", "minister" }) do
+				if key_has(k, "ai_hint_" .. r) then tags[r] = true end
+			end
+		end
+	end
+	return tags
+end
+
+function se.ai_skills.score(n, role, element)
+	local c = se.ai_skills.config
+	local key = (n.skill ~= nil and n.skill ~= "") and n.skill or str(n.node)
+	for _, x in ipairs(c.exclude or {}) do
+		if key_has(key, x) or key_has(str(n.node), x) then return 0 end
+	end
+	local tags = node_tags(n)
+	local s
+	if tags[role] then s = c.role_match elseif tags.general or tags.governor or tags.minister then s = c.role_other else s = c.untagged end
+	if element and key_element(key) == element then s = s * c.element_match end
+	if (n.level or 0) > 0 then s = s * c.continue_bonus end
+	s = s * (se.ai_skills.skill_weight[key] or se.ai_skills.skill_weight[str(n.node)] or 1)
+	return s, key
+end
+
+-- se.ai_skills.best(cqi, ch) -> best node, score, role | nil: pure, reads the tree once
+function se.ai_skills.best(cqi, ch)
+	local t = se.query.skill_tree(cqi)
+	if type(t) ~= "table" or (t.points or 0) <= 0 then return nil end
+	local role = se.ai_skills.role_of(ch)
+	local okk, sub = pcall(function() return ch:character_subtype_key() end)
+	local element = okk and key_element(sub) or nil
+	local best, bs, bkey = nil, 0, nil
+	for _, n in ipairs(t.nodes or {}) do
+		if n.can_add then
+			local s, key = se.ai_skills.score(n, role, element)
+			if s > bs or (s == bs and best and s > 0 and (n.row < best.row or (n.row == best.row and n.col < best.col))) then
+				best, bs, bkey = n, s, key
+			end
+		end
+	end
+	if not best then return nil end
+	return best, bs, role, bkey, t.points
+end
+
+-- se.ai_skills.allocate(cqi) -> points spent: up to max_per_character points, one at a time
+-- (the tree is re-read after each point, so children unlocked by a purchase are considered).
+function se.ai_skills.allocate(cqi)
+	local ch = se.character(cqi)
+	if not ch then return 0 end
+	local spent = 0
+	for _ = 1, se.ai_skills.config.max_per_character or 3 do
+		local n, s, role, key = se.ai_skills.best(cqi, ch)
+		if not n then break end
+		local ok, msg = se.modify.skill_add(cqi, n.row, n.col)
+		if se.ai_skills.config.log_orders then
+			log(string.format("ai_skills: char %s (%s) %s (%d,%d) score %.2f -> %s %s", str(cqi), str(role), str(key), n.row, n.col, s, str(ok), str(msg or "")))
+		end
+		if not ok then break end
+		spent = spent + 1
+	end
+	return spent
+end
+
+local function ai_faction(f)
+	local ok, r = pcall(function() return not f:is_human() and not f:is_dead() end)
+	return ok and r
+end
+
+-- se.ai_skills.enable() / disable(): install the triggers (once per Lua state; call again after a load)
+function se.ai_skills.enable()
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	local okn, err = need("se_skill_nodes", "se_skill_add")
+	if not okn then return false, err end
+	se.ai_skills.enabled = true
+	if se.ai_skills.listening then return true, "already listening; enabled" end
+	se.ai_skills.listening = true
+	core:add_listener("se_ai_skills_turn_start", "FactionTurnStart", function(context)
+		return se.ai_skills.enabled and ai_faction(context:faction())
+	end, function(context)
+		local f = context:faction()
+		local okl, list = pcall(function() return f:character_list() end)
+		if not okl then return end
+		local total, cap = 0, se.ai_skills.config.max_per_faction or 40
+		for i = 0, list:num_items() - 1 do
+			if total >= cap then break end
+			local okc, cqi = pcall(function() return list:item_at(i):cqi() end)
+			if okc then
+				local okp, n = pcall(se.ai_skills.allocate, cqi)
+				if okp then total = total + n else log("ai_skills: error " .. str(n)) end
+			end
+		end
+		if total > 0 then log(string.format("ai_skills %s: %d points spent", str(f:name()), total)) end
+	end, true)
+	core:add_listener("se_ai_skills_point", "CharacterSkillPointAvailable", function(context)
+		if not (se.ai_skills.enabled and se.ai_skills.config.on_point_available) then return false end
+		local ok, r = pcall(function() return ai_faction(context:query_character():faction()) end)
+		return ok and r
+	end, function(context)
+		local okc, cqi = pcall(function() return context:query_character():cqi() end)
+		if okc then
+			local okp, e = pcall(se.ai_skills.allocate, cqi)
+			if not okp then log("ai_skills: error " .. str(e)) end
+		end
+	end, true)
+	return true, "listening"
+end
+
+function se.ai_skills.disable()
+	se.ai_skills.enabled = false
+	return true
+end
+
+----------------------------------------------------------------------------------------------
+-- AI equipment (DLL 0.48 feat/ai-campaign): put AI factions' unused items on their characters
+----------------------------------------------------------------------------------------------
+-- Stock script interfaces only (QUERY/MODIFY_CHARACTER_CEO_MANAGEMENT equip_ceo_in_slot). Per AI
+-- FactionTurnStart: characters in priority order (faction leader, generals by rank, then the rest;
+-- ties by cqi), each slot of an allowed category: an empty slot takes the best equippable item that
+-- is not equipped anywhere; an occupied slot is upgraded only when an unequipped item is worth at
+-- least min_gain more and the engine allows unequipping. Small batches (max_per_faction): mass CEO
+-- work in AI turns once broke every script (31 Oct). Never touches categories outside `categories`
+-- or items whose key matches `exclude` (personal goals, vows, deeds).
+--   value(item) = ceo_value[key] or rank of rarity[key] or of the key's suffix
+--                 (_common 1, _refined 2, _exceptional 3, _unique 4), else unknown_value.
+se.ai_ceos = se.ai_ceos or {}
+se.ai_ceos.config = se.ai_ceos.config or {
+	categories = { "weapon", "armour", "mount", "accessory", "follower" }, -- category key must contain one
+	exclude = { "personal_goal", "vow", "deed", "mission", "trait", "title" },
+	min_gain = 1,            -- upgrade an equipped item only for at least this much more value
+	unknown_value = 1.5,     -- items with no value / rarity
+	max_per_faction = 6,     -- equips per faction turn
+	log_orders = true,
+}
+se.ai_ceos.ceo_value = se.ai_ceos.ceo_value or {}  -- [ceo key] = number (mods)
+se.ai_ceos.rarity = se.ai_ceos.rarity or {}        -- [ceo key] = "common" | "refined" | "exceptional" | "unique"
+local RARITY_RANK = { common = 1, refined = 2, exceptional = 3, unique = 4 }
+
+function se.ai_ceos.value(key)
+	key = str(key)
+	local v = se.ai_ceos.ceo_value[key]
+	if type(v) == "number" then return v end
+	local r = RARITY_RANK[se.ai_ceos.rarity[key] or ""]
+	if r then return r end
+	for _, name in ipairs({ "unique", "exceptional", "refined", "common" }) do -- fixed order (lockstep)
+		if key:match("_" .. name .. "$") or key:match("_" .. name .. "_") then return RARITY_RANK[name] end
+	end
+	return se.ai_ceos.config.unknown_value
+end
+
+local function category_allowed(cat)
+	cat = str(cat)
+	local c = se.ai_ceos.config
+	for _, x in ipairs(c.exclude or {}) do if key_has(cat, x) then return false end end
+	for _, x in ipairs(c.categories or {}) do if key_has(cat, x) then return true end end
+	return false
+end
+
+local function item_allowed(key)
+	for _, x in ipairs(se.ai_ceos.config.exclude or {}) do if key_has(str(key), x) then return false end end
+	return true
+end
+
+-- characters of a faction in priority order: leader, generals by rank (desc), others; ties by cqi
+function se.ai_ceos.characters_of(f)
+	local out = {}
+	local okl, list = pcall(function() return f:character_list() end)
+	if not okl then return out end
+	local leader = -1
+	pcall(function() leader = f:faction_leader():cqi() end)
+	for i = 0, list:num_items() - 1 do
+		local ch = list:item_at(i)
+		local ok, row = pcall(function()
+			local cqi = ch:cqi()
+			local tier = (cqi == leader) and 0 or (ch:has_military_force() and 1 or 2)
+			return { cqi = cqi, ch = ch, tier = tier, rank = ch:rank() }
+		end)
+		if ok then out[#out + 1] = row end
+	end
+	table.sort(out, function(a, b)
+		if a.tier ~= b.tier then return a.tier < b.tier end
+		if a.rank ~= b.rank then return a.rank > b.rank end
+		return a.cqi < b.cqi
+	end)
+	return out
+end
+
+-- se.ai_ceos.plan(faction_key) -> orders { {cqi, slot (index), category, ceo, old, value, old_value} }
+-- Pure: reads the engine, changes nothing. Items are matched by ceo_data_key + command_queue_index.
+function se.ai_ceos.plan(faction_key)
+	local cm = cm_()
+	if not cm then return {} end
+	local f = cm:query_faction(faction_key)
+	local orders, used = {}, {}
+	local cap = se.ai_ceos.config.max_per_faction or 6
+	for _, c in ipairs(se.ai_ceos.characters_of(f)) do
+		if #orders >= cap then break end
+		local okm, slots = pcall(function() return c.ch:ceo_management():all_ceo_equipment_slots() end)
+		if okm and slots then
+			for s = 0, slots:num_items() - 1 do
+				if #orders >= cap then break end
+				local sl = slots:item_at(s)
+				local okc, cat = pcall(function() return sl:category_key() end)
+				if okc and category_allowed(cat) then
+					local cur = nil
+					pcall(function() local e = sl:equipped_ceo() if e and not e:is_null_interface() then cur = e end end)
+					local cur_key = cur and str(cur:ceo_data_key()) or nil
+					local cur_v = cur and se.ai_ceos.value(cur_key) or 0
+					local can_swap = cur == nil or (cur_key and item_allowed(cur_key) and select(2, pcall(function() return sl:can_unequip_ceo() end)) == true)
+					if can_swap then
+						local best, bv, bid = nil, 0, nil
+						local oko, opts = pcall(function() return sl:all_equippable_ceos() end)
+						for k = 0, (oko and opts and opts:num_items() or 0) - 1 do
+							local ceo = opts:item_at(k)
+							local okk, key, eq, id = pcall(function() return str(ceo:ceo_data_key()), ceo:is_equipped_in_slot(), ceo:command_queue_index() end)
+							if okk and not eq and not used[id] and item_allowed(key) then
+								local v = se.ai_ceos.value(key)
+								if v > bv or (v == bv and best and key < best) then best, bv, bid = key, v, id end
+							end
+						end
+						if best and (cur == nil or bv >= cur_v + (se.ai_ceos.config.min_gain or 1)) then
+							used[bid] = true
+							orders[#orders + 1] = { cqi = c.cqi, slot = s, category = str(cat), ceo = best, ceo_id = bid, old = cur_key, value = bv, old_value = cur_v }
+						end
+					end
+				end
+			end
+		end
+	end
+	return orders
+end
+
+-- se.ai_ceos.execute(orders) -> done, failed. Re-finds slot and item by index / command_queue_index.
+function se.ai_ceos.execute(orders)
+	local done, failed = 0, 0
+	local cm = cm_()
+	for _, o in ipairs(orders or {}) do
+		local ok, msg = pcall(function()
+			local q = cm:query_character(o.cqi)
+			local sl = q:ceo_management():all_ceo_equipment_slots():item_at(o.slot)
+			local opts = sl:all_equippable_ceos()
+			local item = nil
+			for k = 0, opts:num_items() - 1 do
+				local c = opts:item_at(k)
+				if c:command_queue_index() == o.ceo_id then item = c break end
+			end
+			if not item then return "item gone" end
+			cm:modify_character(o.cqi):ceo_management():equip_ceo_in_slot(sl, item)
+			return "equipped"
+		end)
+		local good = ok and msg == "equipped"
+		if good then done = done + 1 else failed = failed + 1 end
+		if se.ai_ceos.config.log_orders then
+			log(string.format("ai_ceos: char %s %s %s%s (%.1f%s) -> %s", str(o.cqi), o.category, o.old and (o.old .. " -> ") or "", o.ceo, o.value,
+				o.old and string.format(", was %.1f", o.old_value) or "", str(ok and msg or ("error " .. str(msg)))))
+		end
+	end
+	return done, failed
+end
+
+function se.ai_ceos.enable()
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available: set se.core = core first" end
+	se.ai_ceos.enabled = true
+	if se.ai_ceos.listening then return true, "already listening; enabled" end
+	se.ai_ceos.listening = true
+	core:add_listener("se_ai_ceos_turn_start", "FactionTurnStart", function(context)
+		return se.ai_ceos.enabled and ai_faction(context:faction())
+	end, function(context)
+		local key = context:faction():name()
+		local okp, orders = pcall(se.ai_ceos.plan, key)
+		if not okp then log("ai_ceos " .. str(key) .. ": plan error " .. str(orders)) return end
+		if #orders > 0 then
+			local d, fl = se.ai_ceos.execute(orders)
+			log(string.format("ai_ceos %s: %d equipped, %d failed", str(key), d, fl))
+		end
+	end, true)
+	return true, "listening"
+end
+
+function se.ai_ceos.disable()
+	se.ai_ceos.enabled = false
+	return true
+end
+
+-- se.ai_skills.trace(on): read-only log of every skill point an AI character spends (vanilla or
+-- ours): "[se] ai_skill_pick|faction|cqi|subtype|role|skill_key". Summarise with
+-- tools\aicamp\ai_campaign_summary.py (role fit by ai_hint tags).
+function se.ai_skills.trace(on)
+	se.ai_skills.tracing = on and true or false
+	if se.ai_skills.trace_listening or not on then return true end
+	local core = se.core or G("core")
+	if type(core) ~= "table" then return false, "core (event manager) is not available" end
+	se.ai_skills.trace_listening = true
+	core:add_listener("se_ai_skills_trace", "CharacterSkillPointAllocated", function(context)
+		if not se.ai_skills.tracing then return false end
+		local ok, r = pcall(function() return ai_faction(context:query_character():faction()) end)
+		return ok and r
+	end, function(context)
+		pcall(function()
+			local ch = context:query_character()
+			log(string.format("ai_skill_pick|%s|%s|%s|%s|%s", str(ch:faction():name()), str(ch:cqi()), str(ch:character_subtype_key()),
+				str(se.ai_skills.role_of(ch)), str(context:skill_key())))
+		end)
+	end, true)
+	return true
+end
+
+----------------------------------------------------------------------------------------------
 -- save chunking (DLL 0.42+): saved strings above the engine's 64 KiB cap
 ----------------------------------------------------------------------------------------------
 -- context:save_string() keeps at most ~65,536 bytes. cm:saving_game writes the whole

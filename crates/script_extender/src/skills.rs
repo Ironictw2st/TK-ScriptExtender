@@ -186,6 +186,22 @@ pub unsafe fn level_count(node: usize) -> u32 {
     rd(v + 4)
 }
 
+/// Keys of one per-level list of the skill record (as FUN_141a54020 walks them on commit):
+/// list at skill+off_count (u32 levels) / skill+off_count+4 (array of 0x10 {?, u32 n @+4, data @+8}),
+/// data = n CA::Strings of 0x10. off_count 0x74 / 0x84 / 0x94 = the three lists the commit resolves
+/// in three different DB tables. Index = the level the point would reach.
+pub unsafe fn level_keys(skill: usize, off_count: usize, level: u32) -> String {
+    if skill == 0 { return String::new(); }
+    let levels = rd(skill + off_count);
+    if level >= levels || levels > 32 { return String::new(); }
+    let arr = rq(skill + off_count + 4);
+    let e = arr + level as usize * 0x10;
+    let n = rd(e + 4);
+    let data = rq(e + 8);
+    if n == 0 || n > 64 || !readable(data, n as usize * 0x10) { return String::new(); }
+    (0..n as usize).map(|i| crate::buildings::ca_string(data + i * 0x10)).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(",")
+}
+
 pub unsafe fn can_add(node: usize) -> bool {
     match ENGINE.get() {
         Some(e) => rq(node) != 0 && (e.can_add)(node as *mut c_void) != 0,
@@ -230,7 +246,15 @@ unsafe extern "C" fn se_skill_nodes(l: *mut LuaState) -> c_int {
                 set_field_int(l, "col", n.col as isize);
                 set_field_int(l, "level", rb(n.addr + 0x10) as isize);
                 set_field_int(l, "max", count.saturating_sub(1) as isize);
-                set_field_bool(l, "can_add", can_add(n.addr));
+                let ca = can_add(n.addr);
+                set_field_bool(l, "can_add", ca);
+                if ca {
+                    let skill = rq(rec + 0x78);
+                    let next = rb(n.addr + 0x10) as u32 + 1;
+                    lua::set_field_str(l, "next1", &level_keys(skill, 0x74, next));
+                    lua::set_field_str(l, "next2", &level_keys(skill, 0x84, next));
+                    lua::set_field_str(l, "next3", &level_keys(skill, 0x94, next));
+                }
                 set_field_bool(l, "locked", rb(n.addr + 0x11) != 0);
                 lua::set_field_str(l, "node", &record_key(rec));
                 lua::set_field_str(l, "skill", &record_key(rq(rec + 0x78)));
