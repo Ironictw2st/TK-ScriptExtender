@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased (local branch fix/ui-uaf-phase-guards, not tagged)
+## 0.47.0-beta.4 (pre-release, NOT yet tagged; content of 0.47.0-beta.3 plus the following)
+
+- **Smarter campaign AI (AI factions only; settings in the 190E "AI Campaign" MCT tab).** The AI's own scores are nudged,
+  never replaced, so its choices stay its own:
+  - Equipment: items go to the character they suit (role, element, ranged abilities such as Warning Shot or volleys).
+    A named item (e.g. Huang Zhong's bow) stays with its owner: anyone else values it at the minimum.
+  - Court posts and skills: posts go to characters with the matching skills; skill picks lean toward the character's role.
+  - New Lua natives `se_db_rec_dump`, `se_db_rec_set_i32`, `se_db_rec_restore_all`: read / change loaded DB records
+    (the AI Campaign tab uses them for the AI's construction budget; the original values come back when the tab is off).
+  - Verified in game: equipment fit (Liu Biao keeps his hands off the bow), the construction budget (40 % doubled the AI
+    provinces that build in a 5-turn test), and the skill nudge being armed (3 AI turns, x1.5, clean).
+- Engine crash guards (below) were merged from fix/ui-uaf-phase-guards.
+
+### Engine crash guards
 
 - **Three more engine crash guards** in `engine_crash_guards`:
   - `clear_selection`: clicking a court seat whose court-screen selection list was already freed (exe+0x55b7e0, mod-manager report
