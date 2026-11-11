@@ -6,11 +6,12 @@
   never replaced, so its choices stay its own:
   - Equipment: items go to the character they suit (role, element, ranged abilities such as Warning Shot or volleys).
     A named item (e.g. Huang Zhong's bow) stays with its owner: anyone else values it at the minimum.
-  - Court posts and skills: posts go to characters with the matching skills; skill picks lean toward the character's role.
+  - Court posts: posts go to characters with the matching skills.
+  - Skills: the skill-pick nudge is in but OFF by default (slider 100): a same-save test showed no role-fit gain yet.
   - New Lua natives `se_db_rec_dump`, `se_db_rec_set_i32`, `se_db_rec_restore_all`: read / change loaded DB records
     (the AI Campaign tab uses them for the AI's construction budget; the original values come back when the tab is off).
   - Verified in game: equipment fit (Liu Biao keeps his hands off the bow), the construction budget (40 % doubled the AI
-    provinces that build in a 5-turn test), and the skill nudge being armed (3 AI turns, x1.5, clean).
+    provinces that build in a 5-turn test), and 30 AI turns clean with all nudges at x1.5.
 - Engine crash guards (below) were merged from fix/ui-uaf-phase-guards.
 
 ### Engine crash guards
