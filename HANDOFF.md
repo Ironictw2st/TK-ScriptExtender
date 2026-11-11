@@ -325,6 +325,10 @@ personality object; 0.15 registry self-check; **0.16 menu build number + cfg fil
   before each rebuild. No engine memory read or written. Opt-in cfg `ui_dev_loader=1` (default off;
   local, refused in multiplayer, not in the sync tag). Copies deleted at DLL load.
 
+- **0.48.0 stable (2026-11-11)** = 0.47.0-beta.3 + the AI Campaign work (equipment / court / skill nudges, per-character
+  item fit, DB record natives `se_db_rec_*`; skills nudge off by default) + engine guards clear_selection / phase_record /
+  payload_walk. Game-tested as 0.47.0-beta.4 (10 Nov: selftest PASS, 30 AI turns clean with the 190E AI Campaign tab).
+
 ## 7. When the game updates
 
 1. New `TimeDateStamp` / `SizeOfImage` -> update the constants in `src/addrs.rs`.

@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.47.0-beta.4 (pre-release, NOT yet tagged; content of 0.47.0-beta.3 plus the following)
+## 0.48.0 (stable, 2026-11-11)
+
+Stable release of everything since 0.46.0: the 0.47.0-beta.1 to beta.3 pre-releases plus the following (built and
+game-tested as 0.47.0-beta.4; only the version number changed for 0.48.0).
 
 - **Smarter campaign AI (AI factions only; settings in the 190E "AI Campaign" MCT tab).** The AI's own scores are nudged,
   never replaced, so its choices stay its own:
