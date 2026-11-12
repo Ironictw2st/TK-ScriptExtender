@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.48.1 (unreleased; branch fix/guards-1112, test builds 0.48.1-test.N)
+
+- **Two more engine crash guards** in `engine_crash_guards`, each with its own off switch (both in the version lock):
+  - `move_faction` (cfg `guard_move_faction`): `modify_character:move_to_faction_and_make_recruited(key)` on a character in a
+    recruitment pool with a faction key that is not in the campaign crashed the game (exe+0x17c60d0; 5 identical reports from
+    one player on 0.48.0, the 3-5 Nov End Turn reports). The engine routine (FUN_1415ec970) checks the faction for the court
+    move only and then uses it in the pool branch. A stub at exe+0x15ec9a8 sends a missing faction to the routine's own exit:
+    the move does nothing. A known key moves exactly as before.
+  - `cco_list_walk` (cfg `guard_cco_list_walk`): a UI list getter (FUN_142f99bf0) walking an engine list that was unlinked
+    while the UI refreshed, early end turns (exe+0x1c254d4; 2 player reports, seen in-house 5 and 8 Nov). Stubs at the loop
+    entry (exe+0x2f99c2b) and bottom (exe+0x2f99d50) end the walk on the function's own exits when a node is NULL, below
+    0x10000, misaligned or not a user address: the panel gets the entries read so far. A freed node that still looks like a
+    valid pointer is not caught.
+  - `se.diag.engine_guards()` gains `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`;
+    `se.diag.engine_guards_selftest()` checks the move jump and calls the list getter on test objects (NULL head stopped,
+    empty list unchanged).
+  - Unit tests: site pins, jump layout, and execution tests that run both stubs on every path.
+
 ## 0.48.0 (stable, 2026-11-11)
 
 Stable release of everything since 0.46.0: the 0.47.0-beta.1 to beta.3 pre-releases plus the following (built and

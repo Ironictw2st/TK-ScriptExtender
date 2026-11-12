@@ -23,6 +23,12 @@
 //!    (crash exe+0xce4a90). The call at exe+0x30505ca is redirected to a stub near the exe that
 //!    calls resolve and, on NULL, continues at exe+0x3050666 (the "already in the list" path).
 //!
+//! 5-8: weak_lock, clear_selection, phase_record, payload_walk (sections below).
+//! 9. move_faction (0.48.1): move_to_faction_and_make_recruited with an unknown faction key on a
+//!    recruitment-pool character (crash exe+0x17c60d0) becomes a no-op. Own switch guard_move_faction.
+//! 10. cco_list_walk (0.48.1): the UI Cco list getter FUN_142f99bf0 stops at a NULL / implausible
+//!    list node (crash exe+0x1c254d4). Own switch guard_cco_list_walk.
+//!
 //! cfg `engine_crash_guards` (default 1; 0 = none installed). Guard 2 is reachable from model code;
 //! it only changes what happens where vanilla would crash, but the key is in the sync tag anyway
 //! so two machines in one lobby always run the same guards.
@@ -326,6 +332,12 @@ pub static WEAK_HITS: AtomicU64 = AtomicU64::new(0);
 /// Only the flags differ from the original; what the skipped call would have returned (rax, rcx,
 /// rdx) is dead at the continuation.
 fn weak_stub(test: [u8; 3], orig: &[u8], cont: usize, counter: usize) -> Vec<u8> {
+    null_branch_stub(test, orig, cont, cont, counter)
+}
+
+/// `weak_stub` with its own continuation for the NULL case:
+/// `test reg,reg ; jz null ; <orig> ; jmp cont ; null: <count> ; jmp null_cont`.
+fn null_branch_stub(test: [u8; 3], orig: &[u8], cont: usize, null_cont: usize, counter: usize) -> Vec<u8> {
     let mut s = Vec::with_capacity(64 + orig.len());
     s.extend_from_slice(&test);
     s.extend_from_slice(&[0x74, 0x00]);
@@ -340,7 +352,7 @@ fn weak_stub(test: [u8; 3], orig: &[u8], cont: usize, counter: usize) -> Vec<u8>
     s.extend_from_slice(&(counter as u64).to_le_bytes());
     s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
     s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
-    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s.extend_from_slice(&(null_cont as u64).to_le_bytes());
     s
 }
 
@@ -614,6 +626,195 @@ unsafe fn install_payload_walk(base: usize) -> Result<(), String> {
     crate::freeze::enable_detour("guard_payload_walk", "engine_crash_guards", target, d)
 }
 
+// ---- move_to_faction_and_make_recruited with a faction key that does not exist -----------------
+// Crash exe+0x17c60d0 (Batch1104 MoveToFaction, 3-5 Nov; Batch1112 threads 1570313732217766004 /
+// 1570353268746489960, 5 identical reports on SE 0.48.0). FUN_1415ec970 (the engine routine behind
+// modify_character:move_to_faction_and_make_recruited) looks the faction up by key (rsi); when it
+// is NULL the `je` at 0x15ec9ae skips the court move but falls into the pool branch, which does
+// `lea rcx,[rsi+0xd60]; call FUN_1417c60c0` for a recruitment-pool character and reads 0xdb0.
+// The stub replaces `mov rsi,rax; test rax,rax; je` (8 bytes at 0x15ec9a8) and sends a NULL
+// faction to the function's epilogue at 0x15eca2c (rbx untouched on that path, rbp/rsi/rdi are
+// restored from the frame there): a move to an unknown key does nothing, for every caller.
+// A known key runs exactly as before. Off with guard_move_faction=0.
+const MOVE_SITE_RVA: usize = 0x15ec9a8;
+/// mov rsi,rax; test rax,rax; je 0x15ec9f9
+const MOVE_SITE_BYTES: [u8; 8] = [0x48, 0x8b, 0xf0, 0x48, 0x85, 0xc0, 0x74, 0x49];
+/// the instruction after the je (mov rcx,[rdi+18h]) = the "faction found" continuation
+const MOVE_CONT_RVA: usize = 0x15ec9b0;
+const MOVE_CONT_BYTES: [u8; 4] = [0x48, 0x8b, 0x4f, 0x18];
+/// epilogue: mov rcx,[rbp+8]; lea rax,[rip+..]
+const MOVE_EPILOGUE_RVA: usize = 0x15eca2c;
+const MOVE_EPILOGUE_BYTES: [u8; 7] = [0x48, 0x8b, 0x4d, 0x08, 0x48, 0x8d, 0x05];
+static MOVE_STUB: AtomicUsize = AtomicUsize::new(0);
+/// incremented by the stub itself
+pub static MOVE_HITS: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn install_move_faction(base: usize) -> Result<(), String> {
+    if !crate::build::hook_enabled("guard_move_faction") { return Err("off (guard_move_faction=0)".into()); }
+    let site = base + MOVE_SITE_RVA;
+    if bytes_at::<4>(base + MOVE_CONT_RVA) != Some(MOVE_CONT_BYTES) { return Err("continuation bytes differ".into()); }
+    if bytes_at::<7>(base + MOVE_EPILOGUE_RVA) != Some(MOVE_EPILOGUE_BYTES) { return Err("epilogue bytes differ".into()); }
+    if bytes_at::<8>(site) != Some(MOVE_SITE_BYTES) { return Err(format!("bytes at {site:#x} differ")); }
+    let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let code = null_branch_stub(
+        [0x48, 0x85, 0xc0],
+        &MOVE_SITE_BYTES[..3],
+        base + MOVE_CONT_RVA,
+        base + MOVE_EPILOGUE_RVA,
+        &MOVE_HITS as *const AtomicU64 as usize,
+    );
+    core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
+    make_executable(stub, code.len());
+    let patch = jmp_patch(site, stub, MOVE_SITE_BYTES.len())?;
+    write_code_for("guard_move_faction", "guard_move_faction", site, &patch)?;
+    MOVE_STUB.store(stub, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `jmp rel32 stub` padded with nops to `len` bytes.
+fn jmp_patch(site: usize, stub: usize, len: usize) -> Result<Vec<u8>, String> {
+    let disp = stub as i64 - (site as i64 + 5);
+    if disp < i32::MIN as i64 || disp > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = vec![0x90u8; len];
+    patch[0] = 0xe9;
+    patch[1..5].copy_from_slice(&(disp as i32).to_le_bytes());
+    Ok(patch)
+}
+
+/// True when the 5-byte jmp at `site` lands on `stub`.
+unsafe fn jumps_to(site: usize, stub: usize) -> bool {
+    stub != 0 && bytes_at::<1>(site) == Some([0xe9]) && {
+        let rel = core::ptr::read_unaligned((site + 1) as *const i32);
+        (site as isize + 5 + rel as isize) as usize == stub
+    }
+}
+
+// ---- UI Cco list getter walking an unlinked list -----------------------------------------------
+// Crash exe+0x1c254d4 `mov ecx,[rcx+0x228]` with rcx = 0x18 (Batch1112 threads 1570343238504550456
+// and 1570131720823382047, end turn early in a campaign; in-house 5 Nov SiegeAI soak and 8 Nov
+// InstallF dry run). FUN_142f99bf0(obj, out) walks the list at obj+0x38 (head [obj+0x40], next at
+// node+8, sentinel obj+0x38) and looks up node+0x18 for each node; a NULL next pointer (the list
+// was unlinked under the UI) reached the lookup as 0x18. Two stubs check the node before the body
+// uses it: at the loop entry (0x2f99c2b `cmp rbx,rbp; je 0x2f99d6d`) and at the loop bottom
+// (0x2f99d50 `mov rbx,[rbx+8]; cmp rbx,rbp; jne 0x2f99c40`). A node below 0x10000, not 8-aligned
+// or not a canonical user address ends the walk on the function's own exits (0x2f99d6d before the
+// first node, 0x2f99d5d after it), so the caller gets the entries collected so far. rax is kept
+// (live at the entry: the frame pointer); the flags are dead at every target. No direct branch in
+// .text lands inside either patched range (whole-.text scan, notes/guards_1112.md). A freed node
+// that is still a plausible pointer is not detected. Off with guard_cco_list_walk=0.
+const LIST_ENTRY_RVA: usize = 0x2f99c2b;
+/// cmp rbx,rbp; je 0x2f99d6d
+const LIST_ENTRY_BYTES: [u8; 9] = [0x48, 0x3b, 0xdd, 0x0f, 0x84, 0x39, 0x01, 0x00, 0x00];
+/// mov [rax+18h],rsi; mov [rax-8],rdi (the first-node continuation)
+const LIST_ENTRY_CONT_RVA: usize = 0x2f99c34;
+const LIST_ENTRY_CONT_BYTES: [u8; 8] = [0x48, 0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0xf8];
+const LIST_BOTTOM_RVA: usize = 0x2f99d50;
+/// mov rbx,[rbx+8]; cmp rbx,rbp; jne 0x2f99c40
+const LIST_BOTTOM_BYTES: [u8; 13] = [0x48, 0x8b, 0x5b, 0x08, 0x48, 0x3b, 0xdd, 0x0f, 0x85, 0xe3, 0xfe, 0xff, 0xff];
+/// loop head: mov rax,[rip+..]
+const LIST_HEAD_RVA: usize = 0x2f99c40;
+const LIST_HEAD_BYTES: [u8; 3] = [0x48, 0x8b, 0x05];
+/// exit after the loop (restores rdi, rsi, rbx, rbp): mov rdi,[rsp+0C0h]
+const LIST_DONE_RVA: usize = 0x2f99d5d;
+const LIST_DONE_BYTES: [u8; 8] = [0x48, 0x8b, 0xbc, 0x24, 0xc0, 0x00, 0x00, 0x00];
+/// exit for an empty list (restores rbx, rbp): mov rbx,[rsp+0D0h]
+const LIST_EMPTY_RVA: usize = 0x2f99d6d;
+const LIST_EMPTY_BYTES: [u8; 8] = [0x48, 0x8b, 0x9c, 0x24, 0xd0, 0x00, 0x00, 0x00];
+/// The function itself (prologue `mov rax,rsp; sub rsp,0C8h`), for the selftest call.
+const LIST_FN_RVA: usize = 0x2f99bf0;
+const LIST_FN_ANCHOR: [u8; 10] = [0x48, 0x8b, 0xc4, 0x48, 0x81, 0xec, 0xc8, 0x00, 0x00, 0x00];
+type CcoListGet = unsafe extern "C" fn(P, P);
+/// the stub page: entry stub at +0, bottom stub at +0x80
+static LIST_STUBS: AtomicUsize = AtomicUsize::new(0);
+/// incremented by the stubs themselves
+pub static LIST_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// ```text
+///   <prefix>                              ; bottom: mov rbx,[rbx+8]; entry: nothing
+///   cmp rbx,rbp ; je end
+///   cmp rbx,0x10000 ; jb bad
+///   test bl,7 ; jnz bad
+///   push rax ; mov rax,rbx ; shr rax,47 ; pop rax ; jnz bad     ; rax kept, flags from shr
+///   jmp [rip+0] ; dq cont
+/// end:
+///   jmp [rip+0] ; dq exit
+/// bad:
+///   push rax ; mov rax,counter ; lock inc qword [rax] ; pop rax
+///   jmp end
+/// ```
+fn list_stub(prefix: &[u8], cont: usize, exit: usize, counter: usize) -> Vec<u8> {
+    let mut s = Vec::with_capacity(96);
+    s.extend_from_slice(prefix);
+    s.extend_from_slice(&[0x48, 0x3b, 0xdd]); // cmp rbx,rbp
+    s.extend_from_slice(&[0x74, 0x00]);
+    let je_end = s.len() - 1;
+    let mut to_bad = Vec::new();
+    s.extend_from_slice(&[0x48, 0x81, 0xfb, 0x00, 0x00, 0x01, 0x00]); // cmp rbx,0x10000
+    s.extend_from_slice(&[0x72, 0x00]);
+    to_bad.push(s.len() - 1);
+    s.extend_from_slice(&[0xf6, 0xc3, 0x07]); // test bl,7
+    s.extend_from_slice(&[0x75, 0x00]);
+    to_bad.push(s.len() - 1);
+    s.extend_from_slice(&[0x50, 0x48, 0x89, 0xd8, 0x48, 0xc1, 0xe8, 0x2f, 0x58]); // push rax; mov rax,rbx; shr rax,47; pop rax
+    s.extend_from_slice(&[0x75, 0x00]);
+    to_bad.push(s.len() - 1);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    let end = s.len();
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(exit as u64).to_le_bytes());
+    let bad = s.len();
+    s.push(0x50);
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(counter as u64).to_le_bytes());
+    s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
+    s.extend_from_slice(&[0xeb, 0x00]);
+    let back = s.len();
+    s[back - 1] = (end as isize - back as isize) as i8 as u8;
+    s[je_end] = (end - (je_end + 1)) as u8;
+    for at in to_bad { s[at] = (bad - (at + 1)) as u8; }
+    s
+}
+
+unsafe fn install_cco_list_walk(base: usize) -> Result<(), String> {
+    if !crate::build::hook_enabled("guard_cco_list_walk") { return Err("off (guard_cco_list_walk=0)".into()); }
+    let checks: [(usize, &[u8]); 7] = [
+        (LIST_FN_RVA, &LIST_FN_ANCHOR),
+        (LIST_ENTRY_CONT_RVA, &LIST_ENTRY_CONT_BYTES),
+        (LIST_HEAD_RVA, &LIST_HEAD_BYTES),
+        (LIST_DONE_RVA, &LIST_DONE_BYTES),
+        (LIST_EMPTY_RVA, &LIST_EMPTY_BYTES),
+        (LIST_ENTRY_RVA, &LIST_ENTRY_BYTES),
+        (LIST_BOTTOM_RVA, &LIST_BOTTOM_BYTES),
+    ];
+    for (rva, b) in checks {
+        let a = base + rva;
+        if !readable(a, b.len()) || core::slice::from_raw_parts(a as *const u8, b.len()) != b { return Err(format!("bytes at {a:#x} differ")); }
+    }
+    let page = alloc_near(base + LIST_ENTRY_RVA).ok_or("no free page within rel32 reach")?;
+    let counter = &LIST_HITS as *const AtomicU64 as usize;
+    let entry = list_stub(&[], base + LIST_ENTRY_CONT_RVA, base + LIST_EMPTY_RVA, counter);
+    let bottom = list_stub(&LIST_BOTTOM_BYTES[..4], base + LIST_HEAD_RVA, base + LIST_DONE_RVA, counter);
+    let (entry_at, bottom_at) = (page, page + 0x80);
+    core::ptr::copy_nonoverlapping(entry.as_ptr(), entry_at as *mut u8, entry.len());
+    core::ptr::copy_nonoverlapping(bottom.as_ptr(), bottom_at as *mut u8, bottom.len());
+    make_executable(page, 0x80 + bottom.len());
+    let p_entry = jmp_patch(base + LIST_ENTRY_RVA, entry_at, LIST_ENTRY_BYTES.len())?;
+    let p_bottom = jmp_patch(base + LIST_BOTTOM_RVA, bottom_at, LIST_BOTTOM_BYTES.len())?;
+    write_code_for("guard_cco_list_bottom", "guard_cco_list_walk", base + LIST_BOTTOM_RVA, &p_bottom)?;
+    write_code_for("guard_cco_list_entry", "guard_cco_list_walk", base + LIST_ENTRY_RVA, &p_entry)?;
+    LIST_STUBS.store(page, Ordering::Relaxed);
+    Ok(())
+}
+
+static LIST_OUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static LIST_OUT_COUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `out` vtable slot 0x30 for the selftest: records the element count of the list it receives.
+unsafe extern "C" fn fake_list_out(_this: P, list: *const u32) {
+    LIST_OUT_CALLS.fetch_add(1, Ordering::Relaxed);
+    LIST_OUT_COUNT.store(core::ptr::read_unaligned(list.add(1)) as u64, Ordering::Relaxed);
+}
+
 pub fn install(t: &Table) {
     if !crate::build::hook_enabled("engine_crash_guards") {
         log!("engine crash guards off (engine_crash_guards=0 in script_extender.cfg)");
@@ -623,7 +824,7 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 8] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 10] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
@@ -632,6 +833,8 @@ pub fn install(t: &Table) {
             ("clear_selection", install_clear_selection),
             ("phase_record", install_phase),
             ("payload_walk", install_payload_walk),
+            ("move_faction", install_move_faction),
+            ("cco_list_walk", install_cco_list_walk),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -651,7 +854,7 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={};move_faction={};move_faction_hits={};cco_list_walk={};cco_list_walk_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
@@ -659,6 +862,8 @@ fn info() -> String {
         CLEAR_SEL.get().is_some_and(|d| d.is_enabled()) as u8, CLEAR_SEL_HITS.load(Ordering::Relaxed),
         (PHASE_STUB.load(Ordering::Relaxed) != 0) as u8, PHASE_HITS.load(Ordering::Relaxed),
         PAYLOAD_WALK.get().is_some_and(|d| d.is_enabled()) as u8, PAYLOAD_HITS.load(Ordering::Relaxed),
+        (MOVE_STUB.load(Ordering::Relaxed) != 0) as u8, MOVE_HITS.load(Ordering::Relaxed),
+        (LIST_STUBS.load(Ordering::Relaxed) != 0) as u8, LIST_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -761,6 +966,32 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
     } else {
         ok = false;
         lines.push("payload_walk: not installed".into());
+    }
+    // move_faction: the jump is in place (calling the move routine needs a live character)
+    let mv = jumps_to(base + MOVE_SITE_RVA, MOVE_STUB.load(Ordering::Relaxed));
+    ok &= mv;
+    lines.push(format!("move_faction: jump in place={mv}"));
+    // cco_list_walk: the getter on objects built here (the loop body, which reads the game, is
+    // never reached): a NULL head must end the walk (hit, empty list handed to out); an empty
+    // list (head = sentinel) must take the vanilla exit (no hit)
+    let page = LIST_STUBS.load(Ordering::Relaxed);
+    if page != 0 && jumps_to(base + LIST_ENTRY_RVA, page) && jumps_to(base + LIST_BOTTOM_RVA, page + 0x80) {
+        let mut vt = [0usize; 8];
+        vt[0x30 / 8] = fake_list_out as *const () as usize;
+        let out: [usize; 2] = [vt.as_ptr() as usize, 0];
+        let mut obj = [0usize; 10];
+        let f: CcoListGet = core::mem::transmute(base + LIST_FN_RVA);
+        let (h0, c0) = (LIST_HITS.load(Ordering::Relaxed), LIST_OUT_CALLS.load(Ordering::Relaxed));
+        f(obj.as_mut_ptr() as P, out.as_ptr() as P);
+        let guarded = LIST_HITS.load(Ordering::Relaxed) == h0 + 1 && LIST_OUT_CALLS.load(Ordering::Relaxed) == c0 + 1 && LIST_OUT_COUNT.load(Ordering::Relaxed) == 0;
+        obj[8] = obj.as_ptr() as usize + 0x38; // head = the sentinel at obj+0x38
+        f(obj.as_mut_ptr() as P, out.as_ptr() as P);
+        let control = LIST_HITS.load(Ordering::Relaxed) == h0 + 1 && LIST_OUT_CALLS.load(Ordering::Relaxed) == c0 + 2 && LIST_OUT_COUNT.load(Ordering::Relaxed) == 0;
+        ok &= guarded && control;
+        lines.push(format!("cco_list_walk: null head stopped={guarded} empty list vanilla={control}"));
+    } else {
+        ok = false;
+        lines.push("cco_list_walk: not installed".into());
     }
     let msg = lines.join("; ");
     log!("se_engine_guards_selftest: ok={ok}: {msg}");
@@ -1051,6 +1282,140 @@ mod tests {
             assert!(ceo_owner_unusable(empty.as_ptr() as usize));
             let full = [0usize, 0x1234];
             assert!(!ceo_owner_unusable(full.as_ptr() as usize));
+        }
+    }
+
+    #[test]
+    fn move_site_pins() {
+        // the je rel8 at site+6 went to 0x15ec9f9 (the vanilla NULL path that still reaches the pool branch)
+        assert_eq!(MOVE_SITE_RVA + 8 + MOVE_SITE_BYTES[7] as usize, 0x15ec9f9);
+        assert_eq!(MOVE_SITE_RVA + MOVE_SITE_BYTES.len(), MOVE_CONT_RVA);
+        // the triage's 1-byte proposal (49 -> 7c) lands on the same epilogue the stub uses
+        assert_eq!(MOVE_SITE_RVA + 8 + 0x7c, MOVE_EPILOGUE_RVA);
+        // the copied instruction is mov rsi,rax (rip-independent)
+        assert_eq!(MOVE_SITE_BYTES[..3], [0x48, 0x8b, 0xf0]);
+    }
+
+    #[test]
+    fn list_site_pins() {
+        // entry je rel32 -> empty exit; bottom jne rel32 -> loop head; bottom falls through to done
+        let je = i32::from_le_bytes(LIST_ENTRY_BYTES[5..9].try_into().unwrap());
+        assert_eq!((LIST_ENTRY_RVA as isize + 9 + je as isize) as usize, LIST_EMPTY_RVA);
+        assert_eq!(LIST_ENTRY_RVA + LIST_ENTRY_BYTES.len(), LIST_ENTRY_CONT_RVA);
+        let jne = i32::from_le_bytes(LIST_BOTTOM_BYTES[9..13].try_into().unwrap());
+        assert_eq!((LIST_BOTTOM_RVA as isize + 13 + jne as isize) as usize, LIST_HEAD_RVA);
+        assert_eq!(LIST_BOTTOM_RVA + LIST_BOTTOM_BYTES.len(), LIST_DONE_RVA);
+        // both patched ranges hold the 5-byte jmp
+        assert!(LIST_ENTRY_BYTES.len() >= 5 && LIST_BOTTOM_BYTES.len() >= 5 && MOVE_SITE_BYTES.len() >= 5);
+    }
+
+    #[test]
+    fn jmp_patch_layout() {
+        let p = jmp_patch(0x1000, 0x2000, 9).unwrap();
+        assert_eq!(p[0], 0xe9);
+        assert_eq!(i32::from_le_bytes(p[1..5].try_into().unwrap()), 0x2000 - 0x1005);
+        assert_eq!(&p[5..], &[0x90; 4]);
+        assert!(jmp_patch(0x1000, 0x1_0000_1000 + 0x1000, 5).is_err());
+    }
+
+    /// Executable rig: `run(rcx, rdx, r8) -> code` jumps to the stub with rbx = rcx, rbp = rdx,
+    /// rsi = 0x5a, rax = r8; exit n stores rax / rsi into SCRATCH and returns n.
+    struct Rig { page: usize }
+    static SCRATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static RIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl Rig {
+        unsafe fn new() -> Rig {
+            let page = VirtualAlloc(core::ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert!(page != 0);
+            Rig { page }
+        }
+        fn exit_at(&self, n: usize) -> usize { self.page + 0x100 + n * 0x40 }
+        unsafe fn build(&self, stub: &[u8], exits: usize) -> unsafe extern "C" fn(usize, usize, usize) -> u32 {
+            let stub_at = self.page + 0x400;
+            let mut h = vec![0x53, 0x55, 0x56]; // push rbx; push rbp; push rsi
+            h.extend_from_slice(&[0x48, 0x89, 0xcb, 0x48, 0x89, 0xd5]); // mov rbx,rcx; mov rbp,rdx
+            h.extend_from_slice(&[0xbe, 0x5a, 0, 0, 0]); // mov esi,0x5a
+            h.extend_from_slice(&[0x49, 0xbb]);
+            h.extend_from_slice(&(stub_at as u64).to_le_bytes()); // mov r11,stub
+            h.extend_from_slice(&[0x4c, 0x89, 0xc0]); // mov rax,r8
+            h.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11
+            core::ptr::copy_nonoverlapping(h.as_ptr(), self.page as *mut u8, h.len());
+            for n in 1..=exits {
+                let mut e = vec![0x49, 0xbb];
+                e.extend_from_slice(&(SCRATCH.as_ptr() as u64).to_le_bytes()); // mov r11,&SCRATCH
+                e.extend_from_slice(&[0x49, 0x89, 0x03, 0x49, 0x89, 0x73, 0x08]); // mov [r11],rax; mov [r11+8],rsi
+                e.extend_from_slice(&[0x5e, 0x5d, 0x5b, 0xb8, n as u8, 0, 0, 0, 0xc3]); // pop rsi; pop rbp; pop rbx; mov eax,n; ret
+                core::ptr::copy_nonoverlapping(e.as_ptr(), self.exit_at(n) as *mut u8, e.len());
+            }
+            core::ptr::copy_nonoverlapping(stub.as_ptr(), stub_at as *mut u8, stub.len());
+            FlushInstructionCache(GetCurrentProcess(), self.page as *const c_void, 0x1000);
+            core::mem::transmute(self.page)
+        }
+    }
+    fn scratch() -> (u64, u64) { (SCRATCH[0].load(Ordering::Relaxed), SCRATCH[1].load(Ordering::Relaxed)) }
+
+    #[test]
+    fn move_stub_executes() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let _g = RIG_LOCK.lock().unwrap();
+        unsafe {
+            let rig = Rig::new();
+            let stub = null_branch_stub([0x48, 0x85, 0xc0], &MOVE_SITE_BYTES[..3], rig.exit_at(1), rig.exit_at(2), &COUNTER as *const AtomicU64 as usize);
+            let run = rig.build(&stub, 2);
+            // faction found: continuation with rsi = rax (the copied mov), not counted
+            assert_eq!(run(0, 0, 0x1234_5678), 1);
+            assert_eq!(scratch(), (0x1234_5678, 0x1234_5678));
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+            // NULL faction: epilogue, counted
+            assert_eq!(run(0, 0, 0), 2);
+            assert_eq!(scratch().0, 0);
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn weak_stub_still_one_continuation() {
+        let s = weak_stub([0x4d, 0x85, 0xc0], &[0x90], 0x1111_2222_3333_4444, 0x5555);
+        let c = 0x1111_2222_3333_4444u64.to_le_bytes();
+        assert_eq!(s.windows(8).filter(|w| *w == c).count(), 2);
+    }
+
+    #[test]
+    fn list_stubs_execute() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let _g = RIG_LOCK.lock().unwrap();
+        unsafe {
+            let rig = Rig::new();
+            let ctr = &COUNTER as *const AtomicU64 as usize;
+            let sentinel = [0usize; 2];
+            let sent = sentinel.as_ptr() as usize;
+            let rax = 0x7777_0000_1110usize;
+            // entry stub: exit 1 = first-node continuation, exit 2 = empty-list exit
+            let entry = list_stub(&[], rig.exit_at(1), rig.exit_at(2), ctr);
+            let run = rig.build(&entry, 2);
+            let node = [0usize; 0x50];
+            let n = node.as_ptr() as usize;
+            assert_eq!(run(n, sent, rax), 1, "plausible first node walks on");
+            assert_eq!(scratch(), (rax as u64, 0x5a), "rax kept (frame pointer at the entry)");
+            assert_eq!(run(sent, sent, rax), 2, "empty list: vanilla exit");
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+            for bad in [0usize, 0x18, n + 4, 0x4e1d_29c3_fca5_21a7, 0xffff_8000_0000_0000] {
+                assert_eq!(run(bad, sent, rax), 2, "bad head {bad:#x} ends the walk");
+                assert_eq!(scratch().0, rax as u64);
+            }
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 5);
+            // bottom stub: rbx = current node (next at +8); exit 1 = loop head, exit 2 = done
+            let bottom = list_stub(&LIST_BOTTOM_BYTES[..4], rig.exit_at(1), rig.exit_at(2), ctr);
+            let run = rig.build(&bottom, 2);
+            let mut cur = [0usize; 2];
+            cur[1] = n;
+            assert_eq!(run(cur.as_ptr() as usize, sent, rax), 1, "next node walks on");
+            cur[1] = sent;
+            assert_eq!(run(cur.as_ptr() as usize, sent, rax), 2, "next = sentinel: done");
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 5);
+            cur[1] = 0;
+            assert_eq!(run(cur.as_ptr() as usize, sent, rax), 2, "NULL next (the crash): done");
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 6);
         }
     }
 }

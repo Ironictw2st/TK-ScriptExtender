@@ -3922,6 +3922,8 @@ end
 --   caught its NULL: { inactive_string = true, inactive_string_hits = 0, ceo_owner = true,
 --   ceo_owner_hits = 0, text_font = true, building_browser = true, building_browser_hits = 0 }.
 --   text_font has no counter (it is an in-place code patch). Read-only.
+--   0.48.1 adds move_faction / move_faction_hits (move_to_faction_and_make_recruited to an unknown
+--   faction key) and cco_list_walk / cco_list_walk_hits (UI list walk on an unlinked node).
 function se.diag.engine_guards()
 	local okn, err = need("se_engine_guards_info")
 	if not okn then return nil, err end
