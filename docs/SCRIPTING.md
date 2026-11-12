@@ -1375,6 +1375,7 @@ missing elsewhere:
 | `payload_walk` (branch fix/ui-uaf-phase-guards) | an event's payload list built from a payload container that was already freed (exe+0x19F23C2, closing start-of-turn notifications) | the message shows no payload list. It cannot stop a hang if the freed container still looks plausible |
 | `move_faction` (0.48.1) | a script moves a character who is in a recruitment pool to a faction key that is not in the campaign with `move_to_faction_and_make_recruited` (exe+0x17C60D0, often on End Turn) | the move does nothing; a known key moves as before. Own switch `guard_move_faction=0` |
 | `cco_list_walk` (0.48.1) | a UI panel reading an engine list that was unlinked while it refreshed, early end turns (exe+0x1C254D4) | the walk stops at a NULL or impossible list entry and the panel gets the entries read so far. A freed entry that still looks like a valid pointer is not caught. Own switch `guard_cco_list_walk=0` |
+| `garrison_holder` (0.48.1) | applying a battle result (Delegate, or the end of a fought battle) abandons a region with no owner or a dead owner, and removing its garrison reaches a force whose holder is already gone (exe+0x1A70740) | the unit is removed without the holder notifications (force stat refresh, "force changed" / "unit removed"), which crashed before. Own switch `guard_garrison_holder=0` |
 
 ```lua
 local g = se.diag.engine_guards()
@@ -1386,7 +1387,7 @@ local ok, msg = se.diag.engine_guards_selftest()  -- calls the guarded functions
 `building_browser` (true when installed) and `inactive_string_hits`, `ceo_owner_hits` and
 `building_browser_hits` (how often each one stepped in; `text_font` has no counter). The local branch
 fix/ui-uaf-phase-guards adds `clear_selection`, `clear_selection_hits`, `phase_record`, `phase_record_hits`, `payload_walk` and
-`payload_walk_hits`; 0.48.1 adds `move_faction`, `move_faction_hits`, `cco_list_walk` and `cco_list_walk_hits`. The
+`payload_walk_hits`; 0.48.1 adds `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`, `garrison_holder` and `garrison_holder_hits`. The
 `ceo_owner` lookup is also used by the campaign model, so `engine_crash_guards` is part of the
 multiplayer version lock. Natives: `se_engine_guards_info`, `se_engine_guards_selftest`.
 
@@ -2217,6 +2218,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
 | `guard_move_faction` | `1` (DLL 0.48.1+) | `0` leaves out the `move_faction` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `guard_cco_list_walk` | `1` (DLL 0.48.1+) | `0` leaves out the `cco_list_walk` engine guard (needs `engine_crash_guards=1`); in the version lock |
+| `guard_garrison_holder` | `1` (DLL 0.48.1+) | `0` leaves out the `garrison_holder` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `cai_null_guard` | `1` (DLL 0.46.0-sepatches.1+) | null guard on three AI call sites (`se.diag.sepatches`); in the version lock; `0` = off |
 | `battle_xform_fast` | `1` (DLL 0.46.0-sepatches.1+) | faster, bit-identical battle instance-record routine (`se.diag.sepatches`); not in the version lock; `0` = off |
 | `followup_respond_hook` | `1` (DLL 0.46.0-beta.1+) | repair of ACCEPT / REJECT on a follow-up offer to the player (the emperor holder's "Issue Ultimatum"); `0` = no hook (needs `followup_hooks=1`) |

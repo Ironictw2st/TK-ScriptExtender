@@ -28,6 +28,8 @@
 //!    recruitment-pool character (crash exe+0x17c60d0) becomes a no-op. Own switch guard_move_faction.
 //! 10. cco_list_walk (0.48.1): the UI Cco list getter FUN_142f99bf0 stops at a NULL / implausible
 //!    list node (crash exe+0x1c254d4). Own switch guard_cco_list_walk.
+//! 11. garrison_holder (0.48.1): removing a unit from a force whose holder is gone (post-battle
+//!    region abandon, crash exe+0x1a70740) skips the holder notifications. Own switch guard_garrison_holder.
 //!
 //! cfg `engine_crash_guards` (default 1; 0 = none installed). Guard 2 is reachable from model code;
 //! it only changes what happens where vanilla would crash, but the key is in the sync tag anyway
@@ -815,6 +817,87 @@ unsafe extern "C" fn fake_list_out(_this: P, list: *const u32) {
     LIST_OUT_COUNT.store(core::ptr::read_unaligned(list.add(1)) as u64, Ordering::Relaxed);
 }
 
+// ---- garrison unit removed from a force with no holder (0.48.1) ---------------------------------
+// Crash exe+0x1a70740 (Batch1112 section 4, thread 1570515706024431700, 7 identical reports on SE
+// 0.48.0, "siege of San pass, delegating is instant crash"): applying a battle result runs the
+// region cleanup at 0x1428c07, which abandons a region with no owner (or a dead one) through
+// FUN_1417f2fc0; tearing down its garrison reaches FUN_141778690(unit). That routine detaches the
+// unit from its force ([unit+0x1b0]) and calls FUN_141464f10(force, ...), which reads the force's
+// holder handle [force+0xc8] and hands the holder to the faction getter FUN_141a70740 with no
+// check: holder NULL -> read 0xf0. Every path through FUN_141464f10 dereferences the holder
+// (FUN_141810ed0 writes holder+0x44 even when the getter branch is skipped), so with a NULL holder
+// (or a NULL force) vanilla always crashes. The stub replaces `mov rcx,rdi; call FUN_141464f10`
+// (8 bytes at 0x1778716, rdi = force) and makes the call only when force and holder are non-NULL;
+// otherwise it counts and goes to the epilogue. Lost on that path (it crashed before): the force's
+// stat refresh (FUN_141454f30 / FUN_141411240) and the "force changed" / "unit removed" model
+// notifications for a unit that is already detached. Off with guard_garrison_holder=0.
+const GARRISON_SITE_RVA: usize = 0x1778716;
+/// mov rcx,rdi; call FUN_141464f10 (rel32 0xffcec7f2)
+const GARRISON_SITE_BYTES: [u8; 8] = [0x48, 0x8b, 0xcf, 0xe8, 0xf2, 0xc7, 0xce, 0xff];
+const GARRISON_CALLEE_RVA: usize = 0x1464f10;
+/// FUN_141464f10 prologue up to `push rsi`: mov [rsp+10h],rbx; mov [rsp+20h],rbp; mov [rsp+18h],r8w
+const GARRISON_CALLEE_BYTES: [u8; 16] = [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x66, 0x44, 0x89, 0x44, 0x24, 0x18];
+/// epilogue: mov rbx,[rsp+40h]; mov rbp,[rsp+48h]
+const GARRISON_EPILOGUE_RVA: usize = 0x177871e;
+const GARRISON_EPILOGUE_BYTES: [u8; 10] = [0x48, 0x8b, 0x5c, 0x24, 0x40, 0x48, 0x8b, 0x6c, 0x24, 0x48];
+static GARRISON_STUB: AtomicUsize = AtomicUsize::new(0);
+/// incremented by the stub itself
+pub static GARRISON_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// ```text
+///   test rdi,rdi ; jz null                       ; force
+///   mov rax,[rdi+0xc8] ; test rax,rax ; jz null  ; holder handle
+///   mov rax,[rax] ; test rax,rax ; jz null       ; holder
+///   mov rcx,rdi ; mov rax,target ; call rax      ; the original call, same rsp / args
+///   jmp [rip+0] ; dq cont
+/// null:
+///   push rax ; mov rax,counter ; lock inc qword [rax] ; pop rax
+///   jmp [rip+0] ; dq cont
+/// ```
+/// Entered by a jmp from the call site, so rsp, rdx, r8, r9 and the 5th argument at [rsp+20h] are
+/// exactly what the original call saw. rax and the flags are dead at the continuation (void callee,
+/// the epilogue reloads rbx/rbp/rsi from the frame).
+fn garrison_stub(target: usize, cont: usize, counter: usize) -> Vec<u8> {
+    let mut s = Vec::with_capacity(96);
+    let mut jz = Vec::new();
+    s.extend_from_slice(&[0x48, 0x85, 0xff, 0x74, 0x00]);
+    jz.push(s.len() - 1);
+    s.extend_from_slice(&[0x48, 0x8b, 0x87, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x00]);
+    jz.push(s.len() - 1);
+    s.extend_from_slice(&[0x48, 0x8b, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x00]);
+    jz.push(s.len() - 1);
+    s.extend_from_slice(&[0x48, 0x89, 0xf9, 0x48, 0xb8]);
+    s.extend_from_slice(&(target as u64).to_le_bytes());
+    s.extend_from_slice(&[0xff, 0xd0]);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    let null = s.len();
+    for j in jz { s[j] = (null - (j + 1)) as u8; }
+    s.push(0x50);
+    s.extend_from_slice(&[0x48, 0xb8]);
+    s.extend_from_slice(&(counter as u64).to_le_bytes());
+    s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s
+}
+
+unsafe fn install_garrison_holder(base: usize) -> Result<(), String> {
+    if !crate::build::hook_enabled("guard_garrison_holder") { return Err("off (guard_garrison_holder=0)".into()); }
+    let site = base + GARRISON_SITE_RVA;
+    if bytes_at::<16>(base + GARRISON_CALLEE_RVA) != Some(GARRISON_CALLEE_BYTES) { return Err("callee bytes differ".into()); }
+    if bytes_at::<10>(base + GARRISON_EPILOGUE_RVA) != Some(GARRISON_EPILOGUE_BYTES) { return Err("epilogue bytes differ".into()); }
+    if bytes_at::<8>(site) != Some(GARRISON_SITE_BYTES) { return Err(format!("bytes at {site:#x} differ")); }
+    let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let code = garrison_stub(base + GARRISON_CALLEE_RVA, base + GARRISON_EPILOGUE_RVA, &GARRISON_HITS as *const AtomicU64 as usize);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
+    make_executable(stub, code.len());
+    let patch = jmp_patch(site, stub, GARRISON_SITE_BYTES.len())?;
+    write_code_for("guard_garrison_holder", "guard_garrison_holder", site, &patch)?;
+    GARRISON_STUB.store(stub, Ordering::Relaxed);
+    Ok(())
+}
+
 pub fn install(t: &Table) {
     if !crate::build::hook_enabled("engine_crash_guards") {
         log!("engine crash guards off (engine_crash_guards=0 in script_extender.cfg)");
@@ -824,7 +907,7 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 10] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 11] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
@@ -835,6 +918,7 @@ pub fn install(t: &Table) {
             ("payload_walk", install_payload_walk),
             ("move_faction", install_move_faction),
             ("cco_list_walk", install_cco_list_walk),
+            ("garrison_holder", install_garrison_holder),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -854,7 +938,7 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={};move_faction={};move_faction_hits={};cco_list_walk={};cco_list_walk_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={};move_faction={};move_faction_hits={};cco_list_walk={};cco_list_walk_hits={};garrison_holder={};garrison_holder_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
@@ -864,6 +948,7 @@ fn info() -> String {
         PAYLOAD_WALK.get().is_some_and(|d| d.is_enabled()) as u8, PAYLOAD_HITS.load(Ordering::Relaxed),
         (MOVE_STUB.load(Ordering::Relaxed) != 0) as u8, MOVE_HITS.load(Ordering::Relaxed),
         (LIST_STUBS.load(Ordering::Relaxed) != 0) as u8, LIST_HITS.load(Ordering::Relaxed),
+        (GARRISON_STUB.load(Ordering::Relaxed) != 0) as u8, GARRISON_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -999,6 +1084,18 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
     } else {
         ok = false;
         lines.push("cco_list_walk: not installed".into());
+    }
+    // garrison_holder: the jump is in place and the stub still calls FUN_141464f10 / returns to the
+    // epilogue (the routine itself reads a live unit; the stub's paths run in the unit tests)
+    if !crate::build::hook_enabled("guard_garrison_holder") {
+        lines.push("garrison_holder: off (cfg)".into());
+    } else {
+        let stub = GARRISON_STUB.load(Ordering::Relaxed);
+        let jump = jumps_to(base + GARRISON_SITE_RVA, stub);
+        let want = garrison_stub(base + GARRISON_CALLEE_RVA, base + GARRISON_EPILOGUE_RVA, &GARRISON_HITS as *const AtomicU64 as usize);
+        let code = jump && core::slice::from_raw_parts(stub as *const u8, want.len()) == want.as_slice();
+        ok &= jump && code;
+        lines.push(format!("garrison_holder: jump in place={jump} stub intact={code}"));
     }
     let msg = lines.join("; ");
     log!("se_engine_guards_selftest: ok={ok}: {msg}");
@@ -1339,8 +1436,9 @@ mod tests {
         fn exit_at(&self, n: usize) -> usize { self.page + 0x100 + n * 0x40 }
         unsafe fn build(&self, stub: &[u8], exits: usize) -> unsafe extern "C" fn(usize, usize, usize) -> u32 {
             let stub_at = self.page + 0x400;
-            let mut h = vec![0x53, 0x55, 0x56]; // push rbx; push rbp; push rsi
-            h.extend_from_slice(&[0x48, 0x89, 0xcb, 0x48, 0x89, 0xd5]); // mov rbx,rcx; mov rbp,rdx
+            let mut h = vec![0x53, 0x55, 0x56, 0x57]; // push rbx; push rbp; push rsi; push rdi
+            h.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp,28h (shadow space, rsp 16-aligned for a call)
+            h.extend_from_slice(&[0x48, 0x89, 0xcb, 0x48, 0x89, 0xd5, 0x48, 0x89, 0xcf]); // mov rbx,rcx; mov rbp,rdx; mov rdi,rcx
             h.extend_from_slice(&[0xbe, 0x5a, 0, 0, 0]); // mov esi,0x5a
             h.extend_from_slice(&[0x49, 0xbb]);
             h.extend_from_slice(&(stub_at as u64).to_le_bytes()); // mov r11,stub
@@ -1351,6 +1449,7 @@ mod tests {
                 let mut e = vec![0x49, 0xbb];
                 e.extend_from_slice(&(SCRATCH.as_ptr() as u64).to_le_bytes()); // mov r11,&SCRATCH
                 e.extend_from_slice(&[0x49, 0x89, 0x03, 0x49, 0x89, 0x73, 0x08]); // mov [r11],rax; mov [r11+8],rsi
+                e.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28, 0x5f]); // add rsp,28h; pop rdi
                 e.extend_from_slice(&[0x5e, 0x5d, 0x5b, 0xb8, n as u8, 0, 0, 0, 0xc3]); // pop rsi; pop rbp; pop rbx; mov eax,n; ret
                 core::ptr::copy_nonoverlapping(e.as_ptr(), self.exit_at(n) as *mut u8, e.len());
             }
@@ -1377,6 +1476,58 @@ mod tests {
             assert_eq!(run(0, 0, 0), 2);
             assert_eq!(scratch().0, 0);
             assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn garrison_site_pins() {
+        // the copied call goes to FUN_141464f10 and the next instruction is the epilogue
+        let rel = i32::from_le_bytes(GARRISON_SITE_BYTES[4..8].try_into().unwrap());
+        assert_eq!((GARRISON_SITE_RVA as isize + 8 + rel as isize) as usize, GARRISON_CALLEE_RVA);
+        assert_eq!(GARRISON_SITE_RVA + GARRISON_SITE_BYTES.len(), GARRISON_EPILOGUE_RVA);
+        // mov rcx,rdi: the force is in rdi at the site
+        assert_eq!(GARRISON_SITE_BYTES[..3], [0x48, 0x8b, 0xcf]);
+    }
+
+    static G_CALLS: AtomicU64 = AtomicU64::new(0);
+    static G_RCX: AtomicU64 = AtomicU64::new(0);
+    static G_R8: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn fake_unit_removed(force: usize, _key: usize, r8: usize, _flag: usize) {
+        G_CALLS.fetch_add(1, Ordering::Relaxed);
+        G_RCX.store(force as u64, Ordering::Relaxed);
+        G_R8.store(r8 as u64, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn garrison_stub_executes() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let _g = RIG_LOCK.lock().unwrap();
+        unsafe {
+            let rig = Rig::new();
+            let stub = garrison_stub(fake_unit_removed as *const () as usize, rig.exit_at(1), &COUNTER as *const AtomicU64 as usize);
+            let run = rig.build(&stub, 1);
+            let holder = [0usize; 0x20];
+            let handle = [holder.as_ptr() as usize];
+            let mut force = [0usize; 0x20];
+            force[0xc8 / 8] = handle.as_ptr() as usize;
+            let f = force.as_ptr() as usize;
+            // force and holder present: the original call runs with rcx = force, r8 passed through
+            assert_eq!(run(f, 0, 0x4444), 1);
+            assert_eq!(G_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(G_RCX.load(Ordering::Relaxed), f as u64);
+            assert_eq!(G_R8.load(Ordering::Relaxed), 0x4444);
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+            // holder handle points at NULL (the crash): skipped, counted
+            let null_handle = [0usize];
+            force[0xc8 / 8] = null_handle.as_ptr() as usize;
+            assert_eq!(run(f, 0, 0x4444), 1);
+            // no handle at all
+            force[0xc8 / 8] = 0;
+            assert_eq!(run(f, 0, 0x4444), 1);
+            // no force
+            assert_eq!(run(0, 0, 0x4444), 1);
+            assert_eq!(G_CALLS.load(Ordering::Relaxed), 1, "the call never ran without a holder");
+            assert_eq!(COUNTER.load(Ordering::Relaxed), 3);
         }
     }
 

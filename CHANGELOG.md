@@ -2,7 +2,7 @@
 
 ## 0.48.1 (unreleased; branch fix/guards-1112, test builds 0.48.1-test.N)
 
-- **Two more engine crash guards** in `engine_crash_guards`, each with its own off switch (both in the version lock):
+- **Three more engine crash guards** in `engine_crash_guards`, each with its own off switch (all in the version lock):
   - `move_faction` (cfg `guard_move_faction`): `modify_character:move_to_faction_and_make_recruited(key)` on a character in a
     recruitment pool with a faction key that is not in the campaign crashed the game (exe+0x17c60d0; 5 identical reports from
     one player on 0.48.0, the 3-5 Nov End Turn reports). The engine routine (FUN_1415ec970) checks the faction for the court
@@ -13,10 +13,18 @@
     entry (exe+0x2f99c2b) and bottom (exe+0x2f99d50) end the walk on the function's own exits when a node is NULL, below
     0x10000, misaligned or not a user address: the panel gets the entries read so far. A freed node that still looks like a
     valid pointer is not caught.
-  - `se.diag.engine_guards()` gains `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`;
+  - `garrison_holder` (cfg `guard_garrison_holder`): applying a battle result (Delegate, or the end of a fought battle)
+    abandoned a region with no owner or a dead owner and crashed while removing its garrison (exe+0x1a70740; 7 identical
+    reports from one player on 0.48.0, siege of San Pass). FUN_141778690 detaches the unit and calls FUN_141464f10 on its force,
+    which uses the force's holder without a check; the holder was already gone. A stub at exe+0x1778716 makes that call only
+    when the force and its holder exist, otherwise it skips it (the unit is already detached; skipped: the force stat refresh
+    and the force-changed / unit-removed notifications, all of which crashed before).
+  - `se.diag.engine_guards()` gains `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`,
+    `garrison_holder`, `garrison_holder_hits`;
     `se.diag.engine_guards_selftest()` checks the move jump and calls the list getter on test objects (NULL head stopped,
-    empty list unchanged).
-  - Unit tests: site pins, jump layout, and execution tests that run both stubs on every path.
+    empty list unchanged) and the garrison jump + stub bytes. A guard switched off in the cfg is reported as `off (cfg)`,
+    not as a failure.
+  - Unit tests: site pins, jump layout, and execution tests that run all three stubs on every path.
 
 ## 0.48.0 (stable, 2026-11-11)
 
