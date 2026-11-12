@@ -817,60 +817,63 @@ unsafe extern "C" fn fake_list_out(_this: P, list: *const u32) {
     LIST_OUT_COUNT.store(core::ptr::read_unaligned(list.add(1)) as u64, Ordering::Relaxed);
 }
 
-// ---- garrison unit removed from a force with no holder (0.48.1) ---------------------------------
+// ---- force left without a holder after a unit was removed (0.48.1) -----------------------------
 // Crash exe+0x1a70740 (Batch1112 section 4, thread 1570515706024431700, 7 identical reports on SE
 // 0.48.0, "siege of San pass, delegating is instant crash"): applying a battle result runs the
 // region cleanup at 0x1428c07, which abandons a region with no owner (or a dead one) through
-// FUN_1417f2fc0; tearing down its garrison reaches FUN_141778690(unit). That routine detaches the
-// unit from its force ([unit+0x1b0]) and calls FUN_141464f10(force, ...), which reads the force's
-// holder handle [force+0xc8] and hands the holder to the faction getter FUN_141a70740 with no
-// check: holder NULL -> read 0xf0. Every path through FUN_141464f10 dereferences the holder
-// (FUN_141810ed0 writes holder+0x44 even when the getter branch is skipped), so with a NULL holder
-// (or a NULL force) vanilla always crashes. The stub replaces `mov rcx,rdi; call FUN_141464f10`
-// (8 bytes at 0x1778716, rdi = force) and makes the call only when force and holder are non-NULL;
-// otherwise it counts and goes to the epilogue. Lost on that path (it crashed before): the force's
-// stat refresh (FUN_141454f30 / FUN_141411240) and the "force changed" / "unit removed" model
-// notifications for a unit that is already detached. Off with guard_garrison_holder=0.
-const GARRISON_SITE_RVA: usize = 0x1778716;
-/// mov rcx,rdi; call FUN_141464f10 (rel32 0xffcec7f2)
-const GARRISON_SITE_BYTES: [u8; 8] = [0x48, 0x8b, 0xcf, 0xe8, 0xf2, 0xc7, 0xce, 0xff];
-const GARRISON_CALLEE_RVA: usize = 0x1464f10;
-/// FUN_141464f10 prologue up to `push rsi`: mov [rsp+10h],rbx; mov [rsp+20h],rbp; mov [rsp+18h],r8w
-const GARRISON_CALLEE_BYTES: [u8; 16] = [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x66, 0x44, 0x89, 0x44, 0x24, 0x18];
-/// epilogue: mov rbx,[rsp+40h]; mov rbp,[rsp+48h]
-const GARRISON_EPILOGUE_RVA: usize = 0x177871e;
-const GARRISON_EPILOGUE_BYTES: [u8; 10] = [0x48, 0x8b, 0x5c, 0x24, 0x40, 0x48, 0x8b, 0x6c, 0x24, 0x48];
+// FUN_1417f2fc0; tearing down its garrison reaches FUN_141778690(unit). That routine unlinks the
+// unit from its force (it clears the force's holder link [force+0xc8] itself when the unit was the
+// holder) and calls FUN_141464f10(force, ...). FUN_141464f10 refreshes the force, lets
+// FUN_14142cbb0 pick a new holder, and then reads [force+0xc8] on every remaining path: the
+// faction getter FUN_141a70740 (the crash, read 0xf0), FUN_141810ed0 (writes holder+0x44) and
+// FUN_141a53d70. With no holder after the reassignment vanilla always crashes.
+// NOTE (in game, 12 Nov): the holder link is NULL at the call in FUN_141778690 on every ordinary
+// holder removal, so the guard must sit after the reassignment, not at the call.
+// The stub replaces `xor esi,esi; cmp byte [rsp+38h],sil; jne 0x1464ff3` (13 bytes at 0x1464f56,
+// right after FUN_14142cbb0 returns): with a holder it does exactly that (esi = 0, same branch);
+// with none it counts and goes to the function's epilogue at 0x1465096. Lost on that path (it
+// crashed before): the holder notifications and the "force changed" / "unit removed" model events
+// for a force that is being torn down. Off with guard_garrison_holder=0.
+const GARRISON_SITE_RVA: usize = 0x1464f56;
+/// xor esi,esi; cmp byte [rsp+38h],sil; jne rel32 0x90 (-> 0x1464ff3)
+const GARRISON_SITE_BYTES: [u8; 13] = [0x33, 0xf6, 0x40, 0x38, 0x74, 0x24, 0x38, 0x0f, 0x85, 0x90, 0x00, 0x00, 0x00];
+/// both continuations start with mov rax,[rdi+0C8h]
+const GARRISON_CONT_RVA: usize = 0x1464f63;
+const GARRISON_ALT_RVA: usize = 0x1464ff3;
+const GARRISON_CONT_BYTES: [u8; 7] = [0x48, 0x8b, 0x87, 0xc8, 0x00, 0x00, 0x00];
+/// epilogue: mov rbx,[rsp+78h]; mov rbp,[rsp+88h]
+const GARRISON_EPILOGUE_RVA: usize = 0x1465096;
+const GARRISON_EPILOGUE_BYTES: [u8; 13] = [0x48, 0x8b, 0x5c, 0x24, 0x78, 0x48, 0x8b, 0xac, 0x24, 0x88, 0x00, 0x00, 0x00];
 static GARRISON_STUB: AtomicUsize = AtomicUsize::new(0);
 /// incremented by the stub itself
 pub static GARRISON_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// ```text
-///   test rdi,rdi ; jz null                       ; force
-///   mov rax,[rdi+0xc8] ; test rax,rax ; jz null  ; holder handle
-///   mov rax,[rax] ; test rax,rax ; jz null       ; holder
-///   mov rcx,rdi ; mov rax,target ; call rax      ; the original call, same rsp / args
+///   xor esi,esi
+///   mov rax,[rdi+0xc8] ; test rax,rax ; jz null   ; holder link
+///   cmp [rax],rsi ; jz null                       ; holder
+///   cmp byte [rsp+0x38],sil ; jnz alt             ; the original test
 ///   jmp [rip+0] ; dq cont
+/// alt: jmp [rip+0] ; dq alt
 /// null:
 ///   push rax ; mov rax,counter ; lock inc qword [rax] ; pop rax
-///   jmp [rip+0] ; dq cont
+///   jmp [rip+0] ; dq epilogue
 /// ```
-/// Entered by a jmp from the call site, so rsp, rdx, r8, r9 and the 5th argument at [rsp+20h] are
-/// exactly what the original call saw. rax and the flags are dead at the continuation (void callee,
-/// the epilogue reloads rbx/rbp/rsi from the frame).
-fn garrison_stub(target: usize, cont: usize, counter: usize) -> Vec<u8> {
+/// rax and the flags are dead at every target (cont / alt reload rax from [rdi+0xc8]; the epilogue
+/// reloads rbx/rbp and pops r14/rdi/rsi). rsi = 0 on the two vanilla paths, as before.
+fn garrison_stub(cont: usize, alt: usize, epilogue: usize, counter: usize) -> Vec<u8> {
     let mut s = Vec::with_capacity(96);
     let mut jz = Vec::new();
-    s.extend_from_slice(&[0x48, 0x85, 0xff, 0x74, 0x00]);
-    jz.push(s.len() - 1);
+    s.extend_from_slice(&[0x33, 0xf6]);
     s.extend_from_slice(&[0x48, 0x8b, 0x87, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x00]);
     jz.push(s.len() - 1);
-    s.extend_from_slice(&[0x48, 0x8b, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x00]);
+    s.extend_from_slice(&[0x48, 0x39, 0x30, 0x74, 0x00]);
     jz.push(s.len() - 1);
-    s.extend_from_slice(&[0x48, 0x89, 0xf9, 0x48, 0xb8]);
-    s.extend_from_slice(&(target as u64).to_le_bytes());
-    s.extend_from_slice(&[0xff, 0xd0]);
+    s.extend_from_slice(&[0x40, 0x38, 0x74, 0x24, 0x38, 0x75, 0x0e]);
     s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
     s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
+    s.extend_from_slice(&(alt as u64).to_le_bytes());
     let null = s.len();
     for j in jz { s[j] = (null - (j + 1)) as u8; }
     s.push(0x50);
@@ -878,18 +881,23 @@ fn garrison_stub(target: usize, cont: usize, counter: usize) -> Vec<u8> {
     s.extend_from_slice(&(counter as u64).to_le_bytes());
     s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x00, 0x58]);
     s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]);
-    s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s.extend_from_slice(&(epilogue as u64).to_le_bytes());
     s
+}
+
+fn garrison_stub_for(base: usize) -> Vec<u8> {
+    garrison_stub(base + GARRISON_CONT_RVA, base + GARRISON_ALT_RVA, base + GARRISON_EPILOGUE_RVA, &GARRISON_HITS as *const AtomicU64 as usize)
 }
 
 unsafe fn install_garrison_holder(base: usize) -> Result<(), String> {
     if !crate::build::hook_enabled("guard_garrison_holder") { return Err("off (guard_garrison_holder=0)".into()); }
     let site = base + GARRISON_SITE_RVA;
-    if bytes_at::<16>(base + GARRISON_CALLEE_RVA) != Some(GARRISON_CALLEE_BYTES) { return Err("callee bytes differ".into()); }
-    if bytes_at::<10>(base + GARRISON_EPILOGUE_RVA) != Some(GARRISON_EPILOGUE_BYTES) { return Err("epilogue bytes differ".into()); }
-    if bytes_at::<8>(site) != Some(GARRISON_SITE_BYTES) { return Err(format!("bytes at {site:#x} differ")); }
+    if bytes_at::<7>(base + GARRISON_CONT_RVA) != Some(GARRISON_CONT_BYTES) { return Err("continuation bytes differ".into()); }
+    if bytes_at::<7>(base + GARRISON_ALT_RVA) != Some(GARRISON_CONT_BYTES) { return Err("branch target bytes differ".into()); }
+    if bytes_at::<13>(base + GARRISON_EPILOGUE_RVA) != Some(GARRISON_EPILOGUE_BYTES) { return Err("epilogue bytes differ".into()); }
+    if bytes_at::<13>(site) != Some(GARRISON_SITE_BYTES) { return Err(format!("bytes at {site:#x} differ")); }
     let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
-    let code = garrison_stub(base + GARRISON_CALLEE_RVA, base + GARRISON_EPILOGUE_RVA, &GARRISON_HITS as *const AtomicU64 as usize);
+    let code = garrison_stub_for(base);
     core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
     make_executable(stub, code.len());
     let patch = jmp_patch(site, stub, GARRISON_SITE_BYTES.len())?;
@@ -1085,14 +1093,14 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
         ok = false;
         lines.push("cco_list_walk: not installed".into());
     }
-    // garrison_holder: the jump is in place and the stub still calls FUN_141464f10 / returns to the
-    // epilogue (the routine itself reads a live unit; the stub's paths run in the unit tests)
+    // garrison_holder: the jump is in place and the stub is intact (the routine reads a live force;
+    // the stub's paths run in the unit tests)
     if !crate::build::hook_enabled("guard_garrison_holder") {
         lines.push("garrison_holder: off (cfg)".into());
     } else {
         let stub = GARRISON_STUB.load(Ordering::Relaxed);
         let jump = jumps_to(base + GARRISON_SITE_RVA, stub);
-        let want = garrison_stub(base + GARRISON_CALLEE_RVA, base + GARRISON_EPILOGUE_RVA, &GARRISON_HITS as *const AtomicU64 as usize);
+        let want = garrison_stub_for(base);
         let code = jump && core::slice::from_raw_parts(stub as *const u8, want.len()) == want.as_slice();
         ok &= jump && code;
         lines.push(format!("garrison_holder: jump in place={jump} stub intact={code}"));
@@ -1437,7 +1445,8 @@ mod tests {
         unsafe fn build(&self, stub: &[u8], exits: usize) -> unsafe extern "C" fn(usize, usize, usize) -> u32 {
             let stub_at = self.page + 0x400;
             let mut h = vec![0x53, 0x55, 0x56, 0x57]; // push rbx; push rbp; push rsi; push rdi
-            h.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp,28h (shadow space, rsp 16-aligned for a call)
+            h.extend_from_slice(&[0x48, 0x83, 0xec, 0x48]); // sub rsp,48h (shadow space + a frame slot at [rsp+38h], rsp 16-aligned)
+            h.extend_from_slice(&[0x88, 0x54, 0x24, 0x38]); // mov [rsp+38h],dl (the garrison stub's flag byte)
             h.extend_from_slice(&[0x48, 0x89, 0xcb, 0x48, 0x89, 0xd5, 0x48, 0x89, 0xcf]); // mov rbx,rcx; mov rbp,rdx; mov rdi,rcx
             h.extend_from_slice(&[0xbe, 0x5a, 0, 0, 0]); // mov esi,0x5a
             h.extend_from_slice(&[0x49, 0xbb]);
@@ -1449,7 +1458,7 @@ mod tests {
                 let mut e = vec![0x49, 0xbb];
                 e.extend_from_slice(&(SCRATCH.as_ptr() as u64).to_le_bytes()); // mov r11,&SCRATCH
                 e.extend_from_slice(&[0x49, 0x89, 0x03, 0x49, 0x89, 0x73, 0x08]); // mov [r11],rax; mov [r11+8],rsi
-                e.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28, 0x5f]); // add rsp,28h; pop rdi
+                e.extend_from_slice(&[0x48, 0x83, 0xc4, 0x48, 0x5f]); // add rsp,48h; pop rdi
                 e.extend_from_slice(&[0x5e, 0x5d, 0x5b, 0xb8, n as u8, 0, 0, 0, 0xc3]); // pop rsi; pop rbp; pop rbx; mov eax,n; ret
                 core::ptr::copy_nonoverlapping(e.as_ptr(), self.exit_at(n) as *mut u8, e.len());
             }
@@ -1481,21 +1490,11 @@ mod tests {
 
     #[test]
     fn garrison_site_pins() {
-        // the copied call goes to FUN_141464f10 and the next instruction is the epilogue
-        let rel = i32::from_le_bytes(GARRISON_SITE_BYTES[4..8].try_into().unwrap());
-        assert_eq!((GARRISON_SITE_RVA as isize + 8 + rel as isize) as usize, GARRISON_CALLEE_RVA);
-        assert_eq!(GARRISON_SITE_RVA + GARRISON_SITE_BYTES.len(), GARRISON_EPILOGUE_RVA);
-        // mov rcx,rdi: the force is in rdi at the site
-        assert_eq!(GARRISON_SITE_BYTES[..3], [0x48, 0x8b, 0xcf]);
-    }
-
-    static G_CALLS: AtomicU64 = AtomicU64::new(0);
-    static G_RCX: AtomicU64 = AtomicU64::new(0);
-    static G_R8: AtomicU64 = AtomicU64::new(0);
-    extern "C" fn fake_unit_removed(force: usize, _key: usize, r8: usize, _flag: usize) {
-        G_CALLS.fetch_add(1, Ordering::Relaxed);
-        G_RCX.store(force as u64, Ordering::Relaxed);
-        G_R8.store(r8 as u64, Ordering::Relaxed);
+        // the copied jne went to the alt target, and the patch ends at the continuation
+        let jne = i32::from_le_bytes(GARRISON_SITE_BYTES[9..13].try_into().unwrap());
+        assert_eq!((GARRISON_SITE_RVA as isize + 13 + jne as isize) as usize, GARRISON_ALT_RVA);
+        assert_eq!(GARRISON_SITE_RVA + GARRISON_SITE_BYTES.len(), GARRISON_CONT_RVA);
+        assert!(GARRISON_CONT_RVA < GARRISON_ALT_RVA && GARRISON_ALT_RVA < GARRISON_EPILOGUE_RVA);
     }
 
     #[test]
@@ -1504,29 +1503,28 @@ mod tests {
         let _g = RIG_LOCK.lock().unwrap();
         unsafe {
             let rig = Rig::new();
-            let stub = garrison_stub(fake_unit_removed as *const () as usize, rig.exit_at(1), &COUNTER as *const AtomicU64 as usize);
-            let run = rig.build(&stub, 1);
+            // exit 1 = continuation (flag 0), 2 = alt (flag set), 3 = epilogue (no holder)
+            let stub = garrison_stub(rig.exit_at(1), rig.exit_at(2), rig.exit_at(3), &COUNTER as *const AtomicU64 as usize);
+            let run = rig.build(&stub, 3);
             let holder = [0usize; 0x20];
-            let handle = [holder.as_ptr() as usize];
+            let link = [holder.as_ptr() as usize];
             let mut force = [0usize; 0x20];
-            force[0xc8 / 8] = handle.as_ptr() as usize;
+            force[0xc8 / 8] = link.as_ptr() as usize;
             let f = force.as_ptr() as usize;
-            // force and holder present: the original call runs with rcx = force, r8 passed through
-            assert_eq!(run(f, 0, 0x4444), 1);
-            assert_eq!(G_CALLS.load(Ordering::Relaxed), 1);
-            assert_eq!(G_RCX.load(Ordering::Relaxed), f as u64);
-            assert_eq!(G_R8.load(Ordering::Relaxed), 0x4444);
+            // holder present: vanilla branch on the flag byte, rsi = 0 (xor esi,esi), not counted
+            assert_eq!(run(f, 0, 0), 1);
+            assert_eq!(scratch().1, 0, "rsi cleared like the original xor");
+            assert_eq!(run(f, 1, 0), 2);
+            assert_eq!(scratch().1, 0);
             assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
-            // holder handle points at NULL (the crash): skipped, counted
-            let null_handle = [0usize];
-            force[0xc8 / 8] = null_handle.as_ptr() as usize;
-            assert_eq!(run(f, 0, 0x4444), 1);
-            // no handle at all
+            // link points at NULL (the crash state after the reassignment): epilogue, counted
+            let null_link = [0usize];
+            force[0xc8 / 8] = null_link.as_ptr() as usize;
+            assert_eq!(run(f, 0, 0), 3);
+            assert_eq!(run(f, 1, 0), 3);
+            // no link at all
             force[0xc8 / 8] = 0;
-            assert_eq!(run(f, 0, 0x4444), 1);
-            // no force
-            assert_eq!(run(0, 0, 0x4444), 1);
-            assert_eq!(G_CALLS.load(Ordering::Relaxed), 1, "the call never ran without a holder");
+            assert_eq!(run(f, 0, 0), 3);
             assert_eq!(COUNTER.load(Ordering::Relaxed), 3);
         }
     }

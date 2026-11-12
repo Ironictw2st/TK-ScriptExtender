@@ -16,9 +16,11 @@
   - `garrison_holder` (cfg `guard_garrison_holder`): applying a battle result (Delegate, or the end of a fought battle)
     abandoned a region with no owner or a dead owner and crashed while removing its garrison (exe+0x1a70740; 7 identical
     reports from one player on 0.48.0, siege of San Pass). FUN_141778690 detaches the unit and calls FUN_141464f10 on its force,
-    which uses the force's holder without a check; the holder was already gone. A stub at exe+0x1778716 makes that call only
-    when the force and its holder exist, otherwise it skips it (the unit is already detached; skipped: the force stat refresh
-    and the force-changed / unit-removed notifications, all of which crashed before).
+    which picks a new holder for the force and then uses it without a check; with no holder left every remaining path
+    crashed. A stub at exe+0x1464f56, right after the holder is picked, sends a force without a holder to the function's exit
+    (skipped: the holder notifications and the force-changed / unit-removed events, all of which crashed before); with a
+    holder it runs exactly as before. Reproduced natively in game without the player's save (holder link cleared at that
+    point under a debugger: same fault, same stack).
   - `se.diag.engine_guards()` gains `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`,
     `garrison_holder`, `garrison_holder_hits`;
     `se.diag.engine_guards_selftest()` checks the move jump and calls the list getter on test objects (NULL head stopped,
