@@ -968,14 +968,21 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
         lines.push("payload_walk: not installed".into());
     }
     // move_faction: the jump is in place (calling the move routine needs a live character)
-    let mv = jumps_to(base + MOVE_SITE_RVA, MOVE_STUB.load(Ordering::Relaxed));
-    ok &= mv;
-    lines.push(format!("move_faction: jump in place={mv}"));
+    // A guard switched off in the cfg is reported, not failed (its own switch exists for that).
+    if !crate::build::hook_enabled("guard_move_faction") {
+        lines.push("move_faction: off (cfg)".into());
+    } else {
+        let mv = jumps_to(base + MOVE_SITE_RVA, MOVE_STUB.load(Ordering::Relaxed));
+        ok &= mv;
+        lines.push(format!("move_faction: jump in place={mv}"));
+    }
     // cco_list_walk: the getter on objects built here (the loop body, which reads the game, is
     // never reached): a NULL head must end the walk (hit, empty list handed to out); an empty
     // list (head = sentinel) must take the vanilla exit (no hit)
     let page = LIST_STUBS.load(Ordering::Relaxed);
-    if page != 0 && jumps_to(base + LIST_ENTRY_RVA, page) && jumps_to(base + LIST_BOTTOM_RVA, page + 0x80) {
+    if !crate::build::hook_enabled("guard_cco_list_walk") {
+        lines.push("cco_list_walk: off (cfg)".into());
+    } else if page != 0 && jumps_to(base + LIST_ENTRY_RVA, page) && jumps_to(base + LIST_BOTTOM_RVA, page + 0x80) {
         let mut vt = [0usize; 8];
         vt[0x30 / 8] = fake_list_out as *const () as usize;
         let out: [usize; 2] = [vt.as_ptr() as usize, 0];
