@@ -29,7 +29,8 @@
 //! 10. cco_list_walk (0.48.1): the UI Cco list getter FUN_142f99bf0 stops at a NULL / implausible
 //!    list node (crash exe+0x1c254d4). Own switch guard_cco_list_walk.
 //! 11. garrison_holder (0.48.1): removing a unit from a force whose holder is gone (post-battle
-//!    region abandon, crash exe+0x1a70740) skips the holder notifications. Own switch guard_garrison_holder.
+//!    region abandon, crash exe+0x1a70740) skips the holder notifications. OPT-IN (guard_garrison_holder=1):
+//!    in game (12 Nov, test.4) the force left without a holder crashed later (exe+0x149f150), so it is off by default.
 //!
 //! cfg `engine_crash_guards` (default 1; 0 = none installed). Guard 2 is reachable from model code;
 //! it only changes what happens where vanilla would crash, but the key is in the sync tag anyway
@@ -833,7 +834,11 @@ unsafe extern "C" fn fake_list_out(_this: P, list: *const u32) {
 // right after FUN_14142cbb0 returns): with a holder it does exactly that (esi = 0, same branch);
 // with none it counts and goes to the function's epilogue at 0x1465096. Lost on that path (it
 // crashed before): the holder notifications and the "force changed" / "unit removed" model events
-// for a force that is being torn down. Off with guard_garrison_holder=0.
+// for a force that is being torn down. Opt-in (guard_garrison_holder=1): with the guard on, a forced
+// null holder in game crashed ~10 s later at exe+0x149f150 (12 Nov), so it only moves the crash.
+pub fn garrison_holder_enabled() -> bool {
+    crate::build::config_value("guard_garrison_holder").as_deref() == Some("1")
+}
 const GARRISON_SITE_RVA: usize = 0x1464f56;
 /// xor esi,esi; cmp byte [rsp+38h],sil; jne rel32 0x90 (-> 0x1464ff3)
 const GARRISON_SITE_BYTES: [u8; 13] = [0x33, 0xf6, 0x40, 0x38, 0x74, 0x24, 0x38, 0x0f, 0x85, 0x90, 0x00, 0x00, 0x00];
@@ -890,7 +895,7 @@ fn garrison_stub_for(base: usize) -> Vec<u8> {
 }
 
 unsafe fn install_garrison_holder(base: usize) -> Result<(), String> {
-    if !crate::build::hook_enabled("guard_garrison_holder") { return Err("off (guard_garrison_holder=0)".into()); }
+    if !garrison_holder_enabled() { return Err("off (opt-in: guard_garrison_holder=1)".into()); }
     let site = base + GARRISON_SITE_RVA;
     if bytes_at::<7>(base + GARRISON_CONT_RVA) != Some(GARRISON_CONT_BYTES) { return Err("continuation bytes differ".into()); }
     if bytes_at::<7>(base + GARRISON_ALT_RVA) != Some(GARRISON_CONT_BYTES) { return Err("branch target bytes differ".into()); }
@@ -1095,7 +1100,7 @@ unsafe extern "C" fn se_engine_guards_selftest(l: *mut LuaState) -> c_int {
     }
     // garrison_holder: the jump is in place and the stub is intact (the routine reads a live force;
     // the stub's paths run in the unit tests)
-    if !crate::build::hook_enabled("guard_garrison_holder") {
+    if !garrison_holder_enabled() {
         lines.push("garrison_holder: off (cfg)".into());
     } else {
         let stub = GARRISON_STUB.load(Ordering::Relaxed);

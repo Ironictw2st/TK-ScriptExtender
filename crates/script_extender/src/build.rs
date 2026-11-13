@@ -187,10 +187,13 @@ pub fn sync_tag() -> String {
     feed(&income_category.to_string());
     // save_chunking decides whether a large saved value survives a reload, so peers that differ
     // in it diverge after the first save / load
-    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue", "naval_to_land", "followup_respond_hook", "engine_crash_guards", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder", "cai_null_guard", "siege_force_assault"] {
+    for key in ["ai_recruit_hook", "followup_hooks", "marriage_inlaws", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue", "naval_to_land", "followup_respond_hook", "engine_crash_guards", "guard_move_faction", "guard_cco_list_walk", "cai_null_guard", "siege_force_assault"] {
         feed(key);
         feed(if hook_enabled(key) { "1" } else { "0" });
     }
+    // opt-in (default off): the 0.48.1 garrison guard only moved the crash in game
+    feed("guard_garrison_holder");
+    feed(if crate::engineguard::garrison_holder_enabled() { "1" } else { "0" });
     feed("siege_odds_gate");
     feed(if crate::siege::gate_enabled() { "1" } else { "0" });
     // the odds bands change which assaults the AI accepts

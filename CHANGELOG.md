@@ -2,7 +2,8 @@
 
 ## 0.48.1 (unreleased; branch fix/guards-1112, test builds 0.48.1-test.N)
 
-- **Three more engine crash guards** in `engine_crash_guards`, each with its own off switch (all in the version lock):
+- **Two more engine crash guards** in `engine_crash_guards`, plus one experimental guard that is off by default; each
+  has its own switch (all in the version lock):
   - `move_faction` (cfg `guard_move_faction`): `modify_character:move_to_faction_and_make_recruited(key)` on a character in a
     recruitment pool with a faction key that is not in the campaign crashed the game (exe+0x17c60d0; 5 identical reports from
     one player on 0.48.0, the 3-5 Nov End Turn reports). The engine routine (FUN_1415ec970) checks the faction for the court
@@ -13,19 +14,20 @@
     entry (exe+0x2f99c2b) and bottom (exe+0x2f99d50) end the walk on the function's own exits when a node is NULL, below
     0x10000, misaligned or not a user address: the panel gets the entries read so far. A freed node that still looks like a
     valid pointer is not caught.
-  - `garrison_holder` (cfg `guard_garrison_holder`): applying a battle result (Delegate, or the end of a fought battle)
-    abandoned a region with no owner or a dead owner and crashed while removing its garrison (exe+0x1a70740; 7 identical
-    reports from one player on 0.48.0, siege of San Pass). FUN_141778690 detaches the unit and calls FUN_141464f10 on its force,
-    which picks a new holder for the force and then uses it without a check; with no holder left every remaining path
-    crashed. A stub at exe+0x1464f56, right after the holder is picked, sends a force without a holder to the function's exit
-    (skipped: the holder notifications and the force-changed / unit-removed events, all of which crashed before); with a
-    holder it runs exactly as before. Reproduced natively in game without the player's save (holder link cleared at that
-    point under a debugger: same fault, same stack).
+  - `garrison_holder` (cfg `guard_garrison_holder`, **opt-in, default 0**): applying a battle result (Delegate, or the
+    end of a fought battle) abandoned a region with no owner or a dead owner and crashed while removing its garrison
+    (exe+0x1a70740; 7 identical reports from one player on 0.48.0, siege of San Pass). FUN_141778690 detaches the unit and
+    calls FUN_141464f10 on its force, which picks a new holder for the force and then uses it without a check. A stub at
+    exe+0x1464f56, right after the holder is picked, sends a force without a holder to the function's exit; with a holder
+    it runs exactly as before. Reproduced natively in game without the player's save (holder link cleared at that point
+    under a debugger: same fault, same stack). **Not a fix yet**: with the guard on, the same forced case crashed about
+    10 s later at exe+0x149f150 (a reader that expects every force to have a holder), so it stays off until the
+    underlying state is handled. 3 AI turns with the guard on: 0 hits, no change in normal play.
   - `se.diag.engine_guards()` gains `move_faction`, `move_faction_hits`, `cco_list_walk`, `cco_list_walk_hits`,
     `garrison_holder`, `garrison_holder_hits`;
     `se.diag.engine_guards_selftest()` checks the move jump and calls the list getter on test objects (NULL head stopped,
-    empty list unchanged) and the garrison jump + stub bytes. A guard switched off in the cfg is reported as `off (cfg)`,
-    not as a failure.
+    empty list unchanged) and, when it is on, the garrison jump + stub bytes. A guard switched off in the cfg (or
+    not opted in) is reported as `off (cfg)`, not as a failure.
   - Unit tests: site pins, jump layout, and execution tests that run all three stubs on every path.
 
 ## 0.48.0 (stable, 2026-11-11)
