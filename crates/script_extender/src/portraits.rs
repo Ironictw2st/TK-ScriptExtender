@@ -141,11 +141,21 @@ fn fit(src: &Rgba, tw: u32, th: u32) -> Vec<u8> {
 }
 
 fn write_png(path: &PathBuf, w: u32, h: u32, px: &[u8]) -> Result<(), String> {
+    write_png_c(path, w, h, px, None)
+}
+
+/// `comment`: PNG tEXt "Comment". Character composites need the placement comment
+/// `[type:<mood>;x:..;y:..;z-order:0;pivot_x:..;pivot_y:..;]` or the court / character panel
+/// portrait is drawn blank (lead memory composite-png-comment-chunk).
+fn write_png_c(path: &PathBuf, w: u32, h: u32, px: &[u8], comment: Option<&str>) -> Result<(), String> {
     if let Some(d) = path.parent() { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
     let f = std::fs::File::create(path).map_err(|e| format!("write {}: {e}", path.display()))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
+    if let Some(c) = comment {
+        enc.add_text_chunk("Comment".to_string(), c.to_string()).map_err(|e| e.to_string())?;
+    }
     let mut wr = enc.write_header().map_err(|e| e.to_string())?;
     wr.write_image_data(px).map_err(|e| e.to_string())
 }
@@ -273,11 +283,32 @@ fn install_into(file: &PathBuf, slot: i64) -> Result<(), String> {
         let comp = fit(&img, 1300, 1300);
         for panel in ["large_panel", "small_panel"] {
             for mood in ["norm", "happy", "angry"] {
-                write_png(&base.join("composites").join(panel).join(mood).join(format!("{mood}.png")), 1300, 1300, &comp)?;
+                let comment = format!("[type:{mood};x:0;y:0;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]");
+                write_png_c(&base.join("composites").join(panel).join(mood).join(format!("{mood}.png")), 1300, 1300, &comp, Some(&comment))?;
                 n += 1;
             }
         }
         log!("custom portrait: {} ({}x{}) -> {} ({n} files)", file.display(), img.w, img.h, base.display());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn composite_has_comment_chunk_and_fit_sizes() {
+        let src = Rgba { w: 40, h: 60, px: vec![200u8; 40 * 60 * 4] };
+        let out = fit(&src, 13, 13);
+        assert_eq!(out.len(), 13 * 13 * 4);
+        let p = std::env::temp_dir().join("se_portrait_test_norm.png");
+        write_png_c(&p, 13, 13, &out, Some("[type:norm;x:0;y:0;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]")).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(hay.contains("tEXtComment\u{0}[type:norm;"), "no tEXt Comment chunk");
+        let dec = decode(&{ let q = std::env::temp_dir().join("se_portrait_test_rt.png"); std::fs::write(&q, &bytes).unwrap(); q }).unwrap();
+        assert_eq!((dec.w, dec.h), (13, 13));
+        assert!(valid_name("se test portrait.png") && !valid_name("..\\x.png") && !valid_name("a/b.png") && !valid_name("x.dds"));
     }
 }

@@ -77,11 +77,11 @@ dependencies = [
 
 [[package]]
 name = "inject_core"
-version = "0.49.0-creator.8"
+version = "0.49.0-creator.9"
 
 [[package]]
 name = "injector"
-version = "0.49.0-creator.8"
+version = "0.49.0-creator.9"
 dependencies = [
  "inject_core",
 ]
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "script_extender"
-version = "0.49.0-creator.8"
+version = "0.49.0-creator.9"
 dependencies = [
  "png",
  "retour",
