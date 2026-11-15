@@ -142,6 +142,8 @@ fn bootstrap() {
     marriage::install(&table);
     crash::boot("prebattle");
     prebattle::install(&table);
+    crash::boot("creator");
+    creator::install(&table);
     crash::boot("navalland");
     navalland::install(&table);
     crash::boot("ceoguard");

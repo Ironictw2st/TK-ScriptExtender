@@ -1276,6 +1276,19 @@ function se.modify.faction_flag(key, dir, c1, c2, c3)
 	end)
 end
 
+-- se.modify.faction_cosmetics_clear(faction_key) : forget the custom name + flag registration; the
+-- engine's own values return on its next cosmetics refresh (load, leader change ...)
+function se.modify.faction_cosmetics_clear(key)
+	local okn, err = need("se_faction_cosmetics_clear")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_cosmetics_clear: single player only" end
+	return on_model("faction_cosmetics_clear(" .. str(key) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_cosmetics_clear(f)
+	end)
+end
+
 ----------------------------------------------------------------------------------------------
 -- effect bundles
 ----------------------------------------------------------------------------------------------
