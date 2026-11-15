@@ -60,6 +60,7 @@ pub fn init(t: &Table) {
     };
     let _ = ENGINE.set(e);
     init_colours(t);
+    init_art(t);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
@@ -72,6 +73,8 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_faction_colours_get", se_faction_colours_get);
     lua::set_global_fn(l, "se_faction_colours_set", se_faction_colours_set);
     lua::set_global_fn(l, "se_faction_colours_reset", se_faction_colours_reset);
+    lua::set_global_fn(l, "se_char_art_info", se_char_art_info);
+    lua::set_global_fn(l, "se_char_art_set", se_char_art_set);
 }
 
 #[link(name = "kernel32")]
@@ -649,6 +652,125 @@ unsafe extern "C" fn se_faction_colours_reset(l: *mut LuaState) -> c_int {
     match out {
         Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
         Err(er) => { log!("se_faction_colours_reset: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+// ------------------------------------------------------------------------------------------
+// S3 diagnostic: CHARACTER_ART_SET_INFO (loader FUN_141a1a750: 5 Strings @+0/+0x10/+0x20/+0x30/
+// +0x40, byte @+0x50) lives at CHARACTER_DETAILS (*(*(ch+0x260))) +0x4f0 (loader FUN_141a22cc0).
+// Read only.
+// ------------------------------------------------------------------------------------------
+
+/// se_char_art_info(q_char, cqi) -> string
+unsafe extern "C" fn se_char_art_info(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let out = (|| -> Result<String, String> {
+        let ch = character(l, cqi)?;
+        let det = rq(rq(ch + 0x260));
+        if det == 0 || !readable(det, 0x600) { return Err("no CHARACTER_DETAILS".into()); }
+        let a = det + 0x4f0;
+        let mut s = format!("character {cqi} ch={ch:#x} details={det:#x} art_set_info:");
+        for i in 0..5 { s.push_str(&format!(" s{i}='{}'", string_at(a + i * 0x10, false))); }
+        s.push_str(&format!(" flag={}", rd(a + 0x50) & 0xff));
+        // all narrow strings inside DETAILS 0..0x800 that look like keys, for orientation
+        let mut found = Vec::new();
+        let mut o = 0usize;
+        while o < 0x800 {
+            let t = string_at(det + o, false);
+            if t.len() >= 6 && t.len() < 120 && t.bytes().all(|b| (0x20..0x7f).contains(&b)) && t.contains('_') {
+                found.push(format!("+{o:#x}='{t}'"));
+            }
+            o += 8;
+        }
+        s.push_str(&format!(" | keys: {}", found.join(" ")));
+        Ok(s)
+    })();
+    match out {
+        Ok(m) => { log!("se_char_art_info: {m}"); lua::push_str(l, &m); }
+        Err(e) => { lua::push_str(l, &format!("error: {e}")); }
+    }
+    1
+}
+
+// ------------------------------------------------------------------------------------------
+// S3: character art set (notes/creator_spikes.md). Test natives.
+//   CHARACTER +0x550 = campaign_character_art_sets record (portrait path FUN_141a71f00 reads its
+//   per-age list {count +0x14, data +0x18, 0x58-byte entries}); record key String at record+8.
+//   Table getter FUN_14085fc40(db) ("campaign_character_art_sets_table"), lookup record_base(table, &String).
+// ------------------------------------------------------------------------------------------
+
+const CH_ART_SET: usize = 0x550;
+
+struct ArtFns {
+    db_get: unsafe extern "C" fn(P) -> P,
+    art_table: unsafe extern "C" fn(P) -> P,
+    record_base: unsafe extern "C" fn(P, *const c_void) -> P,
+    string_from_cstr: unsafe extern "C" fn(P, *const u8) -> P,
+    string_dtor: unsafe extern "C" fn(P),
+}
+static ART: OnceLock<ArtFns> = OnceLock::new();
+
+pub fn init_art(t: &Table) {
+    let _ = ART.set(unsafe {
+        ArtFns {
+            db_get: core::mem::transmute(t.get("db_get")),
+            art_table: core::mem::transmute(t.get("art_sets_table")),
+            record_base: core::mem::transmute(t.get("record_base")),
+            string_from_cstr: core::mem::transmute(t.get("string_from_cstr")),
+            string_dtor: core::mem::transmute(t.get("string_dtor")),
+        }
+    });
+}
+
+unsafe fn art_key(rec: usize) -> String {
+    if rec == 0 || !readable(rec, 0x20) { return String::new(); }
+    let k = string_at(rec + 8, false);
+    if !k.is_empty() && !k.starts_with('<') { return k; }
+    string_at(rq(rec + 8), false)
+}
+
+/// se_char_art_set(q_char, cqi, key) -> ok, msg ; key "" = only report the current art set
+unsafe extern "C" fn se_char_art_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let key = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let a = ART.get().ok_or("art table missing")?;
+        let ch = character(l, cqi)?;
+        let cur = rq(ch + CH_ART_SET);
+        if key.is_empty() {
+            let g = rq(ch + 0x570);
+            let birth: Vec<String> = (0..4).map(|i| format!("{:08x}", rd(ch + 0x4e0 + i * 4))).collect();
+            return Ok(format!("character {cqi}: art set '{}' ({cur:#x}, vt {:#x}) | +0x570 rec '{}' ({g:#x}) is_male={} | +0x4e0 birth {}",
+                art_key(cur), rq(cur), art_key(g), if g != 0 && readable(g, 0x88) { rd(g + 0x80) & 0xff } else { 255 }, birth.join(" ")));
+        }
+        if key.len() > 120 || key.bytes().any(|b| !(0x21..0x7f).contains(&b)) { return Err("bad key".into()); }
+        if cur == 0 || !readable(cur, 0x20) { return Err("character has no art set record".into()); }
+        let model = rq(rq(ch + 0x250) + 0x78);
+        if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
+        let db = (a.db_get)((model + 0x3b38) as P);
+        if db.is_null() { return Err("no db".into()); }
+        let table = (a.art_table)(db);
+        if table.is_null() { return Err("art set table not loaded".into()); }
+        let mut c = key.as_bytes().to_vec();
+        c.push(0);
+        let mut s = [0u8; 64];
+        (a.string_from_cstr)(s.as_mut_ptr() as P, c.as_ptr());
+        let rec = (a.record_base)(table, s.as_ptr() as *const c_void) as usize;
+        (a.string_dtor)(s.as_mut_ptr() as P);
+        if rec == 0 || !readable(rec, 0x20) { return Err(format!("no art set '{key}'")); }
+        if rq(rec) != rq(cur) { return Err(format!("record type differs (vt {:#x} vs {:#x}); refusing", rq(rec), rq(cur))); }
+        if art_key(rec) != key { return Err(format!("lookup returned '{}'", art_key(rec))); }
+        core::ptr::write_unaligned((ch + CH_ART_SET) as *mut usize, rec);
+        let msg = format!("character {cqi}: art set '{}' -> '{}'", art_key(cur), key);
+        log!("se_char_art_set: {msg}");
+        Ok(msg)
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_char_art_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
 }

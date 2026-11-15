@@ -119,7 +119,7 @@ local function on_model(what, f, cb)
 		ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
 		if not ok_mp or type(mp) ~= "boolean" then mp = true end
 	end
-	local ok_can, can = pcall(function() return cm:can_modify() end)
+	local ok_can, can = pcall(function() return cm:can_modify(true) end)
 	if mp == true and not (ok_can and can == true) then
 		return false, "refused in multiplayer: " .. what .. " was called outside a model callback (it would only run on this machine and desync)"
 	end
@@ -1331,6 +1331,29 @@ function se.modify.faction_cosmetics_clear(key)
 		local f, e = faction_q(key)
 		if not f then return false, e end
 		return se_faction_cosmetics_clear(f)
+	end)
+end
+
+-- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);
+-- se.modify.character_art_set(cqi, art_set_key) swaps the campaign_character_art_sets record.
+function se.query.character_art(cqi)
+	local okn, err = need("se_char_art_set")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	local ok, msg = se_char_art_set(q, num(cqi), "")
+	return msg
+end
+
+function se.modify.character_art_set(cqi, key)
+	local okn, err = need("se_char_art_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_art_set: single player only" end
+	if type(key) ~= "string" or key == "" then return false, "key must be an art set key" end
+	return on_model("character_art_set(" .. str(cqi) .. ", " .. key .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_char_art_set(q, num(cqi), key)
 	end)
 end
 

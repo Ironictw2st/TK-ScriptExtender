@@ -76,6 +76,8 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // FUN_1419f3df0(faction): faction cosmetics refresh (pending name from cosmetic override /
     // leader name, flag dir reset); creator.rs re-asserts registered custom names / flags after it
     ("faction_cosmetics_refresh", 0x19f3df0, [0x48, 0x8b, 0xc4, 0x55, 0x57, 0x48, 0x8d, 0x68]),
+    // DATABASE lazy getter of campaign_character_art_sets_table (FUN_14085fc40), creator S3
+    ("art_sets_table", 0x85fc40, [0x40, 0x53, 0x57, 0x48, 0x81, 0xec, 0xe8, 0x00]),
     // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
     // Faction Color Editor also anchor-reads it (read only, never patched)
     ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
@@ -134,14 +136,13 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     ("char_name_ctor", 0x188c4a0, [0x33, 0xd2, 0x48, 0x8d, 0x05, 0x45, 0xef, 0x3c]),
     ("char_name_set_text", 0x18c2da0, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83]),
     ("char_set_name_part", 0x1a6d840, [0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c]),
-    // engine String = String (FUN_140664020), UniString = UniString copy (FUN_140664180),
-    // String from char* (FUN_140662df0); used by the creator faction name / flag natives
-    ("string_assign", 0x664020, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    // UniString = UniString copy (FUN_140664180), used by the creator faction name natives
     ("unistring_assign_copy", 0x664180, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
-    ("string_from_cstr", 0x662df0, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
     // FUN_1419f3df0(faction): faction cosmetics refresh (pending name from cosmetic override /
     // leader name, flag dir reset); creator.rs re-asserts registered custom names / flags after it
     ("faction_cosmetics_refresh", 0x19f3df0, [0x48, 0x8b, 0xc4, 0x55, 0x57, 0x48, 0x8d, 0x68]),
+    // DATABASE lazy getter of campaign_character_art_sets_table (FUN_14085fc40), creator S3
+    ("art_sets_table", 0x85fc40, [0x40, 0x53, 0x57, 0x48, 0x81, 0xec, 0xe8, 0x00]),
     // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
     // Faction Color Editor also anchor-reads it (read only, never patched)
     ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
