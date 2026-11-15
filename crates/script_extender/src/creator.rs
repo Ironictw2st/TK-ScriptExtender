@@ -61,6 +61,7 @@ pub fn init(t: &Table) {
     let _ = ENGINE.set(e);
     init_colours(t);
     init_art(t);
+    init_loc(t);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
@@ -77,6 +78,8 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_char_art_set", se_char_art_set);
     lua::set_global_fn(l, "se_char_art2", se_char_art2);
     lua::set_global_fn(l, "se_char_birth_set", se_char_birth_set);
+    lua::set_global_fn(l, "se_loc_get", se_loc_get);
+    lua::set_global_fn(l, "se_loc_set", se_loc_set);
 }
 
 #[link(name = "kernel32")]
@@ -886,6 +889,103 @@ unsafe extern "C" fn se_char_birth_set(l: *mut LuaState) -> c_int {
     match out {
         Ok(m) => { log!("se_char_birth_set: {m}"); (api.pushboolean)(l, 1); lua::push_str(l, &m); }
         Err(er) => { (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+// ------------------------------------------------------------------------------------------
+// S7: localised text of the creator's custom slots (item names). notes/custom_items.md
+//   loc STRING_TABLE = *(db + 0x15578) (FUN_140986060 loads every *.loc into it; stored by
+//   FUN_1407eb230 / FUN_140934e20), db = db_get(model+0x3b38).
+//   STRING_TABLE::set(table, &String key, &UniString text, bool) exported at RVA 0x3a3700;
+//   STRING_TABLE::possibly_null_string_get(table, &String key) -> UniString* | null at 0x394480.
+// Only keys containing "190e_custom_" may be written (named slots, never arbitrary loc).
+// ------------------------------------------------------------------------------------------
+
+const DB_LOC_TABLE: usize = 0x15578;
+
+struct LocFns {
+    db_get: unsafe extern "C" fn(P) -> P,
+    set: unsafe extern "C" fn(P, P, P, u8),
+    get: unsafe extern "C" fn(P, P) -> P,
+}
+static LOC: OnceLock<LocFns> = OnceLock::new();
+
+pub fn init_loc(t: &Table) {
+    let _ = LOC.set(unsafe {
+        LocFns {
+            db_get: core::mem::transmute(t.get("db_get")),
+            set: core::mem::transmute(t.get("string_table_set")),
+            get: core::mem::transmute(t.get("string_table_get")),
+        }
+    });
+}
+
+unsafe fn loc_table(l: *mut LuaState) -> Result<usize, String> {
+    let lf = LOC.get().ok_or("loc table missing")?;
+    let f = crate::progression::faction_from_arg(l, 1)?;
+    let model = rq(rq(f + 0x288) + 0x78);
+    if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
+    let db = (lf.db_get)((model + 0x3b38) as P) as usize;
+    if db == 0 || !readable(db + DB_LOC_TABLE, 8) { return Err("no database manager".into()); }
+    let t = rq(db + DB_LOC_TABLE);
+    if t == 0 || !readable(t, 0x20) { return Err("loc table not loaded".into()); }
+    Ok(t)
+}
+
+fn custom_loc_key(k: &str) -> bool {
+    k.len() <= 160 && k.contains("190e_custom_") && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// se_loc_get(q_faction, key) -> text | nil   (read-only; any key)
+unsafe extern "C" fn se_loc_get(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let key = lua::to_str(l, 2);
+    let out = (|| -> Result<String, String> {
+        let lf = LOC.get().ok_or("loc table missing")?;
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        let t = loc_table(l)?;
+        if key.is_empty() || key.len() > 200 { return Err("bad key".into()); }
+        let mut c = key.as_bytes().to_vec(); c.push(0);
+        let ks: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+        (e.str_from_cstr)(ks.as_mut_ptr() as P, c.as_ptr());
+        let r = (lf.get)(t as P, ks.as_mut_ptr() as P) as usize;
+        if r == 0 { return Err(format!("no loc entry '{key}'")); }
+        Ok(string_at(r, true))
+    })();
+    match out {
+        Ok(s) => { lua::push_str(l, &s); 1 }
+        Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// se_loc_set(q_faction, key, text) -> ok, msg   (keys containing "190e_custom_" only)
+unsafe extern "C" fn se_loc_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let key = lua::to_str(l, 2);
+    let text = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let lf = LOC.get().ok_or("loc table missing")?;
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        if !custom_loc_key(&key) { return Err("only loc keys containing 190e_custom_ may be written".into()); }
+        if text.chars().count() > 120 || text.chars().any(|c| c.is_control()) { return Err("text must be at most 120 characters, no control characters".into()); }
+        let t = loc_table(l)?;
+        let mut c = key.as_bytes().to_vec(); c.push(0);
+        let ks: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+        (e.str_from_cstr)(ks.as_mut_ptr() as P, c.as_ptr());
+        let mut w: Vec<u16> = text.encode_utf16().collect(); w.push(0);
+        let us: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+        (e.from_wcstr)(us.as_mut_ptr() as P, w.as_ptr());
+        let before = { let r = (lf.get)(t as P, ks.as_mut_ptr() as P) as usize; if r == 0 { "<none>".to_string() } else { string_at(r, true) } };
+        (lf.set)(t as P, ks.as_mut_ptr() as P, us.as_mut_ptr() as P, 1);
+        let after = { let r = (lf.get)(t as P, ks.as_mut_ptr() as P) as usize; if r == 0 { "<none>".to_string() } else { string_at(r, true) } };
+        let msg = format!("loc '{key}': '{before}' -> '{after}'");
+        log!("se_loc_set: {msg}");
+        if after == text { Ok(msg) } else { Err(format!("did not take: {msg}")) }
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_loc_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
 }

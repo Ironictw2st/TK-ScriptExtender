@@ -1357,6 +1357,34 @@ function se.modify.faction_cosmetics_clear(key)
 	end)
 end
 
+-- Localised text of the creator's custom slots (S7 item names). Writes only keys that contain
+-- "190e_custom_"; process-wide until the game exits, so re-apply every session. SP only.
+local function any_faction_q()
+	local cm = G("cm")
+	if not cm then return nil, "no cm" end
+	local ok, f = pcall(function() return cm:query_local_faction(true) end)
+	if not ok or is_null(f) then return nil, "no local faction" end
+	return f
+end
+-- se.query.loc_text(key) -> text | nil, msg
+function se.query.loc_text(key)
+	local okn, err = need("se_loc_get")
+	if not okn then return nil, err end
+	local f, e = any_faction_q()
+	if not f then return nil, e end
+	return se_loc_get(f, key)
+end
+-- se.modify.loc_text(key, text) -> ok, msg
+function se.modify.loc_text(key, text)
+	local okn, err = need("se_loc_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "loc_text: single player only" end
+	if type(key) ~= "string" or type(text) ~= "string" then return false, "key and text must be strings" end
+	local f, e = any_faction_q()
+	if not f then return false, e end
+	return se_loc_set(f, key, text)
+end
+
 -- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);
 -- se.modify.character_art_set(cqi, art_set_key) swaps the campaign_character_art_sets record.
 function se.query.character_art(cqi)
