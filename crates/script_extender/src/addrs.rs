@@ -81,6 +81,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // UTILITYDLL::STRING_TABLE::set / possibly_null_string_get (exported), creator loc overrides
     ("string_table_set", 0x3a3700, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c]),
     ("string_table_get", 0x394480, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    // DATABASE lazy getters: ceos_to_equipment_variants_table, ceo_to_ui_display_junctions_table (creator S7)
+    ("ceo_variants_table", 0x8cd390, [0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x57, 0x48]),
+    ("ceo_ui_display_table", 0x8ccc10, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
     // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
     // Faction Color Editor also anchor-reads it (read only, never patched)
     ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
@@ -149,6 +152,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // UTILITYDLL::STRING_TABLE::set / possibly_null_string_get (exported), creator loc overrides
     ("string_table_set", 0x3a3700, [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c]),
     ("string_table_get", 0x394480, [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b]),
+    // DATABASE lazy getters: ceos_to_equipment_variants_table, ceo_to_ui_display_junctions_table (creator S7)
+    ("ceo_variants_table", 0x8cd390, [0x48, 0x89, 0x4c, 0x24, 0x08, 0x53, 0x57, 0x48]),
+    ("ceo_ui_display_table", 0x8ccc10, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
     // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
     // Faction Color Editor also anchor-reads it (read only, never patched)
     ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),

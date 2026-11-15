@@ -62,6 +62,7 @@ pub fn init(t: &Table) {
     init_colours(t);
     init_art(t);
     init_loc(t);
+    init_items(t);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
@@ -80,6 +81,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_char_birth_set", se_char_birth_set);
     lua::set_global_fn(l, "se_loc_get", se_loc_get);
     lua::set_global_fn(l, "se_loc_set", se_loc_set);
+    lua::set_global_fn(l, "se_item_rows", se_item_rows);
 }
 
 #[link(name = "kernel32")]
@@ -988,4 +990,95 @@ unsafe extern "C" fn se_loc_set(l: *mut LuaState) -> c_int {
         Err(er) => { log!("se_loc_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
+}
+
+// ------------------------------------------------------------------------------------------
+// S7: item look tables, read-only layout probe (next slot). Lazy DB getters:
+//   ceos_to_equipment_variants_table FUN_1408cd390(db), ceo_to_ui_display_junctions_table
+//   FUN_1408ccc10(db) (cache db+0x55f8). Table: list {count +0x14, data +0x18} of record pointers.
+// se_item_rows(q_faction, table "variants"|"ui_display", ceo_key) -> dump of matching rows' String
+// fields (offset=text). Only these two tables; read only.
+// ------------------------------------------------------------------------------------------
+
+struct ItemFns {
+    db_get: unsafe extern "C" fn(P) -> P,
+    variants: unsafe extern "C" fn(P) -> P,
+    ui_display: unsafe extern "C" fn(P) -> P,
+}
+static ITEMS: OnceLock<ItemFns> = OnceLock::new();
+
+pub fn init_items(t: &Table) {
+    let _ = ITEMS.set(unsafe {
+        ItemFns {
+            db_get: core::mem::transmute(t.get("db_get")),
+            variants: core::mem::transmute(t.get("ceo_variants_table")),
+            ui_display: core::mem::transmute(t.get("ceo_ui_display_table")),
+        }
+    });
+}
+
+unsafe fn record_strings(rec: usize, span: usize) -> Vec<(usize, String)> {
+    let mut v = Vec::new();
+    let mut o = 8usize;
+    while o + 16 <= span {
+        let s = string_at(rec + o, false);
+        if !s.is_empty() && !s.starts_with('<') && s.len() < 200 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            v.push((o, s));
+        }
+        o += 8;
+    }
+    v
+}
+
+/// se_item_rows(q_faction, table, ceo_key) -> string
+unsafe extern "C" fn se_item_rows(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let which = lua::to_str(l, 2);
+    let key = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let it = ITEMS.get().ok_or("items table missing")?;
+        let f = crate::progression::faction_from_arg(l, 1)?;
+        let model = rq(rq(f + 0x288) + 0x78);
+        if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
+        let db = (it.db_get)((model + 0x3b38) as P);
+        if db.is_null() { return Err("no db".into()); }
+        let table = match which.as_str() {
+            "variants" => (it.variants)(db) as usize,
+            "ui_display" => (it.ui_display)(db) as usize,
+            _ => return Err("table must be variants or ui_display".into()),
+        };
+        if table == 0 || !readable(table, 0x20) { return Err("table not loaded".into()); }
+        let n = rd(table + 0x14) as usize;
+        let data = rq(table + 0x18);
+        if n == 0 || n > 200000 || !readable(data, n * 8) { return Err(format!("odd table (count {n})")); }
+        let mut out = format!("{which}: {n} rows;");
+        let mut hits = 0;
+        for i in 0..n {
+            let rec = rq(data + i * 8);
+            if rec == 0 || !readable(rec, 0x100) { continue; }
+            let fields = record_strings(rec, 0x100);
+            // records may hold the ceo key directly or behind a pointer to the ceos record
+            let direct = fields.iter().any(|(_, s)| *s == key);
+            let mut via = String::new();
+            for o in (8..0x100usize).step_by(8) {
+                let p = rq(rec + o);
+                if p > 0x10000 && readable(p, 0x20) {
+                    let k = string_at(p + 8, false);
+                    if k == key { via = format!(" key via ptr +{o:#x}"); break; }
+                }
+            }
+            if direct || !via.is_empty() {
+                hits += 1;
+                let fs: Vec<String> = fields.iter().map(|(o, s)| format!("+{o:#x}='{s}'")).collect();
+                out.push_str(&format!(" | row {i} rec {rec:#x} vt {:#x}{via}: {}", rq(rec), fs.join(" ")));
+                if hits >= 4 { break; }
+            }
+        }
+        if hits == 0 { out.push_str(" no row matches"); }
+        Ok(out)
+    })();
+    match out {
+        Ok(s) => { log!("se_item_rows: {s}"); lua::push_str(l, &s); 1 }
+        Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
 }
