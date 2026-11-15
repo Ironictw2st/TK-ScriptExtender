@@ -3984,9 +3984,9 @@ end
 -- Battle fixes (Alex Zhao's DLL mods ported into the SE, with his permission; technical help from Wyccc).
 -- Features (cfg key battle_<name>, default 1 = installed this session, in the sync tag):
 --   elephant_gate, shieldwall_hold, shieldwall_width, charge_hold, turtle_missile_block,
---   turtle_flank_immunity, cantabrian
+--   turtle_flank_immunity, cantabrian, ranged_melee_targets, ranged_spread_targets
 local BATTLE_FIXES = { "elephant_gate", "shieldwall_hold", "shieldwall_width", "charge_hold",
-	"turtle_missile_block", "turtle_flank_immunity", "cantabrian" }
+	"turtle_missile_block", "turtle_flank_immunity", "cantabrian", "ranged_melee_targets", "ranged_spread_targets" }
 
 -- se.diag.battle_fixes() -> table
 --   { <name> = true/false (installed this session), <name>_on = true/false (runtime switch),
@@ -3994,7 +3994,9 @@ local BATTLE_FIXES = { "elephant_gate", "shieldwall_hold", "shieldwall_width", "
 --   ele_calls, ele_orig_true, ele_passed (gate predicate; passed = elephants let through),
 --   cancel_calls, cancel_suppressed, width_calls, width_set, cq_gated, cq_not_charging,
 --   af_turtle_miss, af_gated, af_blocked (360-degree missile block), morale_flank_neg,
---   morale_ignored, cu_charge_state, cu_halts }. Counters are per process.
+--   morale_ignored, cu_charge_state, cu_halts, and for the ranged spread filter sp_calls, sp_queries,
+--   sp_queries_none, sp_accepts, sp_rejects, sp_forced, sp_resets (one per new Lua VM = battle load),
+--   sp_other_thread (must stay 0), vm_created, sp_k (current candidate estimate) }. Counters are per process.
 function se.diag.battle_fixes()
 	local okn, err = need("se_battlefix_info")
 	if not okn then return nil, err end

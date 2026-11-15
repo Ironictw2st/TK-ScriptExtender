@@ -227,6 +227,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "ai_skills", "ai_ceos", "ai_court", "ai_build", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder",
     "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
     "battle_turtle_missile_block", "battle_turtle_flank_immunity", "battle_cantabrian",
+    "battle_ranged_melee_targets", "battle_ranged_spread_targets",
 ];
 
 /// Campaign-AI nudge switches: install the detours unless the key is "0" (default on; the nudges stay inert at strength 1.0 until the MCT values reach them). In the sync tag.

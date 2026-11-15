@@ -59,15 +59,18 @@ pub const F_CHARGE: usize = 3; // D3 "not charging" from the interrupt timer + D
 pub const F_MISSILE: usize = 4; // D4 360-degree missile block for 5/9/10
 pub const F_FLANK: usize = 5; // D5 flank/rear morale immunity for 5/9/10
 pub const F_CANTABRIAN: usize = 6; // the two .data floats
-pub const N_FEATURES: usize = 7;
+pub const F_MELEE: usize = 7; // 3a auto-fire may target enemies in melee with friendlies (1 byte)
+pub const F_SPREAD: usize = 8; // 3b spread the picked entity across the target unit (call-site detour)
+pub const N_FEATURES: usize = 9;
 pub const KEYS: [&str; N_FEATURES] = [
     "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
     "battle_turtle_missile_block", "battle_turtle_flank_immunity", "battle_cantabrian",
+    "battle_ranged_melee_targets", "battle_ranged_spread_targets",
 ];
 /// Short names used by se.modify.battle_fixes / se.diag.battle_fixes.
 pub const NAMES: [&str; N_FEATURES] = [
     "elephant_gate", "shieldwall_hold", "shieldwall_width", "charge_hold", "turtle_missile_block",
-    "turtle_flank_immunity", "cantabrian",
+    "turtle_flank_immunity", "cantabrian", "ranged_melee_targets", "ranged_spread_targets",
 ];
 static CFG: OnceLock<[bool; N_FEATURES]> = OnceLock::new();
 /// The cfg value of every feature, read once (install and the sync tag agree for the session).
@@ -541,6 +544,12 @@ unsafe fn write_feature_bytes(b: usize, f: usize, on: bool) -> Result<(), String
         if bytes(b + rva, want.len()).as_deref() == Some(want) { continue; }
         crate::engineguard::write_code_for(name, KEYS[f], b + rva, want)?;
     }
+    if f == F_MELEE {
+        let want: &[u8] = if on { &[0x00] } else { &[MELEE_ANCHOR[15]] };
+        if bytes(b + MELEE_PATCH_RVA, 1).as_deref() != Some(want) {
+            crate::engineguard::write_code_for("ranged_melee_targets", KEYS[f], b + MELEE_PATCH_RVA, want)?;
+        }
+    }
     if f == F_CANTABRIAN {
         for (name, rva, vanilla, new) in FLOAT_PATCHES {
             let at = b + rva;
@@ -616,6 +625,200 @@ pub fn set_feature(f: usize, want: bool) -> Result<bool, String> {
 }
 
 // --------------------------------------------------------------------------------------------
+// 3. ranged target acquisition (Alex Zhao's z_fresh_ranged, Workshop 3830576592; spec §3)
+// --------------------------------------------------------------------------------------------
+
+/// 3a: `test al,al ; jne +0x45` after "candidate is in melee with a friendly" in auto-fire target
+/// selection; the jne becomes `jne +0` so engaged enemies stay candidates.
+/// 16 bytes from 0x23a8f60 (unique in .text): `.. call FUN_1421ac9d0 ; mov rbx,[rsp+0x30] ; test al,al ; jne +0x45`
+const MELEE_ANCHOR_RVA: usize = 0x23a8f60;
+const MELEE_ANCHOR: [u8; 16] = [0x00, 0x00, 0xe8, 0x69, 0x3a, 0xe0, 0xff, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x84, 0xc0, 0x75, 0x45];
+const MELEE_PATCH_RVA: usize = 0x23a8f6f;
+/// 3b: the candidate test `call FUN_1422e3370(ctx, shooter, cand)` inside the nearest-candidate loop
+/// of FUN_142385143 (the loop keeps the nearest candidate the test accepts).
+const SPREAD_SITE_RVA: usize = 0x23854b7;
+/// 21 bytes from 0x23854a7 (unique in .text): `mov rdx,r14 ; mov ecx,ebx ; mov rdi,[rax+rcx*8] ; lea rcx,[rbp-0x40] ; mov r8,rdi ; call`
+const SPREAD_ANCHOR_RVA: usize = 0x23854a7;
+const SPREAD_ANCHOR: [u8; 21] = [0x49, 0x8b, 0xd6, 0x8b, 0xcb, 0x48, 0x8b, 0x3c, 0xc8, 0x48, 0x8d, 0x4d, 0xc0, 0x4c, 0x8b, 0xc7, 0xe8, 0xb4, 0xde, 0xf5, 0xff];
+const SPREAD_CALLEE_RVA: usize = 0x22e3370;
+const SPREAD_CALLEE_ANCHOR: [u8; 5] = [0x48, 0x89, 0x5c, 0x24, 0x08];
+/// lua_newstate(alloc, ud): calls alloc(ud, NULL, 0, sizeof(LG) = 0x268). Every VM (frontend,
+/// campaign, battle) is made here, on every peer, before that VM's simulation runs.
+const NEWSTATE_RVA: usize = 0x75c490;
+/// 37 bytes (unique in .text; the 16-byte prologue alone is not): up to `mov r9d,0x268 ; xor r8d,r8d ; xor edx,edx ; call rsi`
+const NEWSTATE_ANCHOR: [u8; 37] = [
+    0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xfa, 0x48,
+    0x8b, 0xf1, 0x48, 0x8b, 0xcf, 0x41, 0xb9, 0x68, 0x02, 0x00, 0x00, 0x45, 0x33, 0xc0, 0x33, 0xd2, 0xff, 0xd6,
+];
+
+const SPREAD_K0: i32 = 120;
+const SPREAD_P: i32 = 3;
+const SPREAD_SEED: u32 = 0x9e37_79b9;
+
+/// Alex's filter state, reset whenever a new Lua VM is made (GEN changes) so every battle starts
+/// from the same state on every machine (his DLL seeds it once per process: MP desync).
+struct Spread {
+    gen: u64,
+    k: i32,
+    rng: u32,
+    q_ctx: usize,
+    q_shooter: usize,
+    count: i32,
+    accepted: i32,
+    forced: i32,
+    thr: i32,
+    thread: u32,
+}
+static SPREAD: std::sync::Mutex<Spread> = std::sync::Mutex::new(Spread {
+    gen: u64::MAX, k: SPREAD_K0, rng: SPREAD_SEED, q_ctx: 0, q_shooter: 0, count: 0, accepted: 0, forced: 0, thr: 0, thread: 0,
+});
+static VM_GEN: AtomicU64 = AtomicU64::new(0);
+static ORIG_SPREAD: AtomicUsize = AtomicUsize::new(0);
+static NEWSTATE: OnceLock<retour::GenericDetour<NewState>> = OnceLock::new();
+type NewState = unsafe extern "C" fn(P, P) -> P;
+counters!(SP_CALLS, SP_QUERIES, SP_QUERIES_NONE, SP_ACCEPTS, SP_REJECTS, SP_FORCED, SP_RESETS, SP_OTHER_THREAD, VM_CREATED);
+
+extern "system" { fn GetCurrentThreadId() -> u32; }
+
+unsafe extern "C" fn newstate_detour(alloc: P, ud: P) -> P {
+    let Some(h) = NEWSTATE.get() else { return core::ptr::null_mut() };
+    let l = h.call(alloc, ud);
+    VM_GEN.fetch_add(1, Ordering::SeqCst);
+    bump(&VM_CREATED);
+    l
+}
+
+/// Alex's xorshift32 (13/17/5): returns the raw output; a zero output stores 0x1234567 instead.
+fn xs(s: &mut u32) -> u32 {
+    let mut x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    let y = x ^ (x << 5);
+    *s = if y == 0 { 0x0123_4567 } else { y };
+    y
+}
+
+impl Spread {
+    fn reset(&mut self, gen: u64) {
+        self.gen = gen;
+        self.k = SPREAD_K0;
+        self.rng = SPREAD_SEED;
+        self.q_ctx = 0;
+        self.q_shooter = 0;
+        self.count = 0;
+        self.accepted = 0;
+        self.forced = 0;
+        self.thr = 0;
+    }
+    /// Alex's filter for a candidate the engine already accepted; true = keep it.
+    fn accept(&mut self, ctx: usize, shooter: usize) -> bool {
+        if ctx == self.q_ctx && shooter == self.q_shooter {
+            self.count += 1;
+        } else {
+            // new query: adapt K from the previous query's candidate count n
+            let mut k = self.k.max(1);
+            let n = self.count;
+            let m;
+            if n > 0 {
+                let s = 3 * k + n;
+                if s > 0x8003 {
+                    m = 0x1000;
+                    k = 0x2000;
+                } else {
+                    k = s >> 2;
+                    m = (s >> 3).max(1);
+                }
+                self.k = k;
+            } else {
+                m = (k >> 1).max(1);
+            }
+            if self.accepted == 0 { bump(&SP_QUERIES_NONE); }
+            bump(&SP_QUERIES);
+            self.q_ctx = ctx;
+            self.q_shooter = shooter;
+            self.accepted = 0;
+            let y = xs(&mut self.rng);
+            self.forced = (y % m as u32) as i32 + m + 1;
+            self.thr = if SPREAD_P >= k { 1_000_000 } else { (SPREAD_P * 1_000_000 / k).max(1000) };
+            self.count = 1;
+        }
+        let x = (xs(&mut self.rng) % 1_000_000) as i32;
+        let ok = if x < self.thr {
+            true
+        } else if self.accepted == 0 && self.forced <= self.count {
+            bump(&SP_FORCED);
+            true
+        } else {
+            false
+        };
+        if ok { self.accepted += 1; bump(&SP_ACCEPTS); } else { bump(&SP_REJECTS); }
+        ok
+    }
+}
+
+unsafe extern "C" fn spread_detour(ctx: P, shooter: P, cand: P) -> u8 {
+    let orig: unsafe extern "C" fn(P, P, P) -> u8 = core::mem::transmute(ORIG_SPREAD.load(Ordering::Relaxed));
+    let r = orig(ctx, shooter, cand);
+    if r == 0 || !on(F_SPREAD) { return r; }
+    bump(&SP_CALLS);
+    let mut st = SPREAD.lock().unwrap_or_else(|e| e.into_inner());
+    let gen = VM_GEN.load(Ordering::SeqCst);
+    if st.gen != gen {
+        st.reset(gen);
+        st.thread = GetCurrentThreadId();
+        bump(&SP_RESETS);
+    } else if st.thread != GetCurrentThreadId() {
+        bump(&SP_OTHER_THREAD); // the test checks this stays 0 (sim thread only)
+    }
+    if st.accept(ctx as usize, shooter as usize) { r } else { 0 }
+}
+
+unsafe fn install_melee(b: usize) -> Result<(), String> {
+    let mut patched = MELEE_ANCHOR;
+    patched[15] = 0x00;
+    match crate::engineguard::bytes_at::<16>(b + MELEE_ANCHOR_RVA) {
+        Some(x) if x == MELEE_ANCHOR => Ok(()),
+        Some(x) if x == patched => Err(format!("exe+{MELEE_PATCH_RVA:#x} is already 00: another native mod (Alex Zhao's z_fresh_ranged DLL?) patched it")),
+        Some(x) => Err(format!("anchor bytes at exe+{MELEE_ANCHOR_RVA:#x} differ ({})", hex(&x))),
+        None => Err(format!("exe+{MELEE_ANCHOR_RVA:#x} not readable")),
+    }
+    // the byte itself is written by write_feature_bytes (runtime switch)
+}
+
+unsafe fn install_spread(b: usize) -> Result<(), String> {
+    use crate::engineguard::{alloc_near, bytes_at, make_executable, write_code_for};
+    let site = b + SPREAD_SITE_RVA;
+    match bytes_at::<21>(b + SPREAD_ANCHOR_RVA) {
+        Some(x) if x == SPREAD_ANCHOR => {}
+        Some(x) if x[..16] == SPREAD_ANCHOR[..16] && x[16] == 0xe8 => return Err(format!("the candidate call at exe+{SPREAD_SITE_RVA:#x} is already redirected ({}): another native mod (Alex Zhao's z_fresh_ranged DLL?) patched it", hex(&x[16..]))),
+        Some(x) => return Err(format!("anchor bytes at exe+{SPREAD_ANCHOR_RVA:#x} differ ({})", hex(&x))),
+        None => return Err(format!("exe+{SPREAD_SITE_RVA:#x} not readable")),
+    }
+    if bytes_at::<5>(b + SPREAD_CALLEE_RVA) != Some(SPREAD_CALLEE_ANCHOR) { return Err(format!("callee exe+{SPREAD_CALLEE_RVA:#x} differs")); }
+    // battle-start signal first: without it the filter would not be deterministic between peers
+    let ns = b + NEWSTATE_RVA;
+    if bytes_at::<37>(ns) != Some(NEWSTATE_ANCHOR) { return Err(format!("lua_newstate exe+{NEWSTATE_RVA:#x} differs (needed for the per-battle reset)")); }
+    if NEWSTATE.get().is_none() {
+        let f: NewState = core::mem::transmute(ns);
+        let d = retour::GenericDetour::new(f, newstate_detour as NewState).map_err(|e| format!("lua_newstate: {e}"))?;
+        let _ = NEWSTATE.set(d);
+        crate::freeze::enable_detour("battle_vm_created", KEYS[F_SPREAD], ns, NEWSTATE.get().ok_or("detour not stored")?)?;
+    }
+    ORIG_SPREAD.store(b + SPREAD_CALLEE_RVA, Ordering::SeqCst);
+    let page = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let mut code = vec![0x48, 0xb8];
+    code.extend_from_slice(&(spread_detour as *const () as u64).to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xe0]);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+    make_executable(page, code.len());
+    let rel = page as i64 - (site as i64 + 5);
+    if rel < i32::MIN as i64 || rel > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = [0xe8u8, 0, 0, 0, 0];
+    patch[1..].copy_from_slice(&(rel as i32).to_le_bytes());
+    write_code_for("battle_ranged_spread", KEYS[F_SPREAD], site, &patch)
+}
+
+// --------------------------------------------------------------------------------------------
 // Alex's own DLLs: present?
 // --------------------------------------------------------------------------------------------
 
@@ -652,7 +855,7 @@ fn alex_modules() -> Vec<String> {
         while ok {
             let n = e.sz_module.iter().position(|&c| c == 0).unwrap_or(256);
             let name = String::from_utf16_lossy(&e.sz_module[..n]).to_ascii_lowercase();
-            if name.starts_with("elephant_gate_fix") || name.starts_with("z_shieldwall_rebuilt") { out.push(name); }
+            if name.starts_with("elephant_gate_fix") || name.starts_with("z_shieldwall_rebuilt") || name.starts_with("z_fresh_ranged") { out.push(name); }
             ok = Module32NextW(snap, &mut e) != 0;
         }
         CloseHandle(snap);
@@ -680,7 +883,7 @@ pub fn install(t: &Table) {
         };
     }
 
-    let formation: Vec<usize> = (F_HOLD..N_FEATURES).filter(|&f| cfg[f]).collect();
+    let formation: Vec<usize> = (F_HOLD..=F_CANTABRIAN).filter(|&f| cfg[f]).collect();
     if !formation.is_empty() {
         let outcome = if let Some(m) = alex.iter().find(|m| m.starts_with("z_shieldwall_rebuilt")) {
             Err(format!("inert: {m} is loaded and provides the same fixes"))
@@ -695,8 +898,31 @@ pub fn install(t: &Table) {
             };
         }
     }
+    let fresh = alex.iter().find(|m| m.starts_with("z_fresh_ranged")).cloned();
+    for (f, inst) in [(F_MELEE, install_melee as unsafe fn(usize) -> Result<(), String>), (F_SPREAD, install_spread)] {
+        if !cfg[f] { continue; }
+        states[f] = if let Some(m) = &fresh {
+            format!("inert: {m} is loaded and provides the same fix")
+        } else {
+            // SAFETY: anchors verified first; written with the other threads frozen.
+            match unsafe { inst(b) } {
+                Ok(()) => { INSTALLED[f].store(true, Ordering::SeqCst); "installed".to_string() }
+                Err(e) => format!("inert: {e}"),
+            }
+        };
+    }
     for f in 0..N_FEATURES {
-        if INSTALLED[f].load(Ordering::SeqCst) { ON[f].store(true, Ordering::SeqCst); }
+        if INSTALLED[f].load(Ordering::SeqCst) {
+            if f == F_MELEE {
+                // SAFETY: anchor verified in install_melee
+                if let Err(e) = unsafe { write_feature_bytes(b, f, true) } {
+                    INSTALLED[f].store(false, Ordering::SeqCst);
+                    states[f] = format!("inert: patch failed: {e}");
+                    continue;
+                }
+            }
+            ON[f].store(true, Ordering::SeqCst);
+        }
         log!("battle fix {} ({}): {}", NAMES[f], KEYS[f], states[f]);
     }
     let _ = STATES.set(states);
@@ -711,10 +937,13 @@ fn info() -> String {
     s.push_str(&format!(
         "ele_calls={};ele_orig_true={};ele_passed={};cancel_calls={};cancel_suppressed={};\
          width_calls={};width_set={};cq_gated={};cq_not_charging={};af_turtle_miss={};af_gated={};af_blocked={};\
-         morale_flank_neg={};morale_ignored={};cu_charge_state={};cu_halts={}",
+         morale_flank_neg={};morale_ignored={};cu_charge_state={};cu_halts={};\
+         sp_calls={};sp_queries={};sp_queries_none={};sp_accepts={};sp_rejects={};sp_forced={};sp_resets={};sp_other_thread={};vm_created={};sp_k={}",
         c(&ELE_CALLS), c(&ELE_ORIG_TRUE), c(&ELE_PASSED), c(&CANCEL_CALLS), c(&CANCEL_SUPPRESSED),
         c(&WIDTH_CALLS), c(&WIDTH_SET), c(&CQ_GATED), c(&CQ_NOT_CHARGING), c(&AF_TURTLE_MISS), c(&AF_GATED), c(&AF_BLOCKED),
         c(&MORALE_FLANK_NEG), c(&MORALE_IGNORED), c(&CU_CHARGE_STATE), c(&CU_HALTS),
+        c(&SP_CALLS), c(&SP_QUERIES), c(&SP_QUERIES_NONE), c(&SP_ACCEPTS), c(&SP_REJECTS), c(&SP_FORCED), c(&SP_RESETS),
+        c(&SP_OTHER_THREAD), c(&VM_CREATED), SPREAD.lock().map(|s| s.k).unwrap_or(-1),
     ));
     if let Some(st) = STATES.get() {
         for f in 0..N_FEATURES { s.push_str(&format!("|{}_state={}", NAMES[f], st[f].replace('|', "/"))); }
@@ -773,5 +1002,89 @@ mod tests {
             assert_eq!(srva + 17, ret);
             assert_eq!((ret as i64 + rel) as usize, RVA_ACTIVE_FORMATION);
         }
+    }
+
+    #[test]
+    fn ranged_anchors_cover_sites() {
+        assert_eq!(MELEE_ANCHOR_RVA + 15, MELEE_PATCH_RVA);
+        assert_eq!(&MELEE_ANCHOR[12..], &[0x84, 0xc0, 0x75, 0x45]);
+        // the call in the melee anchor is FUN_1421ac9d0 (not charge_query 0x21ac920)
+        let rel = i32::from_le_bytes(MELEE_ANCHOR[3..7].try_into().unwrap()) as i64;
+        assert_eq!((MELEE_ANCHOR_RVA as i64 + 7 + rel) as usize, 0x21ac9d0);
+        assert_eq!(SPREAD_ANCHOR_RVA + 16, SPREAD_SITE_RVA);
+        let rel = i32::from_le_bytes(SPREAD_ANCHOR[17..21].try_into().unwrap()) as i64;
+        assert_eq!((SPREAD_SITE_RVA as i64 + 5 + rel) as usize, SPREAD_CALLEE_RVA);
+        assert_eq!(&NEWSTATE_ANCHOR[24..30], &[0x41, 0xb9, 0x68, 0x02, 0x00, 0x00]);
+    }
+
+    fn fresh() -> Spread {
+        let mut s = Spread { gen: 0, k: 0, rng: 0, q_ctx: 0, q_shooter: 0, count: 0, accepted: 0, forced: 0, thr: 0, thread: 0 };
+        s.reset(1);
+        s
+    }
+
+    /// queries of `n` candidates each for shooter ids 1.., returns the accept pattern
+    fn run(s: &mut Spread, queries: &[usize]) -> Vec<bool> {
+        let mut out = Vec::new();
+        for (q, &n) in queries.iter().enumerate() {
+            for _ in 0..n { out.push(s.accept(0x1000, q + 1)); }
+        }
+        out
+    }
+
+    #[test]
+    fn xorshift_matches_alex() {
+        // Alex: state 0x9e3779b9 -> first output (13/17/5)
+        let mut st = SPREAD_SEED;
+        let mut x = SPREAD_SEED;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        assert_eq!(xs(&mut st), x);
+        assert_eq!(st, x);
+        // a zero output stores 0x1234567 (and returns 0)
+        let mut z = 0u32;
+        assert_eq!(xs(&mut z), 0);
+        assert_eq!(z, 0x0123_4567);
+    }
+
+    #[test]
+    fn spread_is_deterministic_after_reset() {
+        let qs = [40usize, 40, 3, 120, 7, 60, 1, 200];
+        let (mut a, mut b) = (fresh(), fresh());
+        let ra = run(&mut a, &qs);
+        // b first runs another history, then resets as at battle start
+        run(&mut b, &[500, 2, 77]);
+        b.reset(2);
+        assert_eq!(run(&mut b, &qs), ra);
+        assert_eq!(a.k, b.k);
+    }
+
+    #[test]
+    fn spread_accepts_something_in_every_long_query() {
+        let mut s = fresh();
+        for q in 0..200usize {
+            let n = 5 + (q * 37) % 150;
+            let acc = (0..n).filter(|_| s.accept(0x1000, q + 1)).count();
+            // forced accept fires by candidate 2m <= ~K: long queries always keep one
+            if n >= 2 * (s.k.max(1) as usize) { assert!(acc > 0, "query {q} n={n} k={}", s.k); }
+        }
+    }
+
+    #[test]
+    fn spread_small_units_always_shot() {
+        // once K has adapted to tiny targets (K <= P), every candidate passes
+        let mut s = fresh();
+        run(&mut s, &[3; 60]);
+        assert!(s.k <= SPREAD_P, "k={}", s.k);
+        assert!(run(&mut s, &[3; 5]).iter().all(|&x| x));
+    }
+
+    #[test]
+    fn spread_k_clamp() {
+        let mut s = fresh();
+        s.k = 0x2000;
+        s.count = 0x2100; // 3K + n = 0x8100 > 0x8003
+        s.q_shooter = 99;
+        s.accept(0x1000, 1);
+        assert_eq!(s.k, 0x2000);
     }
 }
