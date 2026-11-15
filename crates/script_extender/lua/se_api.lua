@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
@@ -1225,6 +1225,54 @@ function se.modify.character_name_part(cqi, part, text)
 		local q, e = se.character(cqi)
 		if not q then return false, e end
 		return se_char_name_set(q, num(cqi), num(part), text)
+	end)
+end
+
+local function faction_q(key)
+	local cm = G("cm")
+	if not cm then return nil, "no cm" end
+	local ok, f = pcall(function() return cm:query_faction(key) end)
+	if not ok or is_null(f) then return nil, "no faction " .. str(key) end
+	return f
+end
+
+-- se.query.faction_cosmetics(faction_key) -> dump: name objects, flag dir, colours
+function se.query.faction_cosmetics(key)
+	local okn, err = need("se_faction_cosmetics")
+	if not okn then return nil, err end
+	local f, e = faction_q(key)
+	if not f then return nil, e end
+	return se_faction_cosmetics(f)
+end
+
+-- se.modify.faction_name(faction_key, text [, mode]) : mode "pending" (default, the engine applies it
+-- on the next model tick) or "direct". Single player only.
+function se.modify.faction_name(key, text, mode)
+	local okn, err = need("se_faction_name_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_name: single player only" end
+	if type(text) ~= "string" then return false, "text must be a string" end
+	return on_model("faction_name(" .. str(key) .. ", " .. text .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_name_set(f, text, mode or "pending")
+	end)
+end
+
+-- se.modify.faction_flag(faction_key, flag_dir, {r,g,b}, {r,g,b}, {r,g,b}) : flag_dir like
+-- "ui/flags/3k_main_faction_cao_cao" ("" keeps it); colours 0..255, nil keeps. Single player only.
+function se.modify.faction_flag(key, dir, c1, c2, c3)
+	local okn, err = need("se_faction_flag_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_flag: single player only" end
+	local function t(c) if type(c) == "table" then return c[1], c[2], c[3] end return -1, 0, 0 end
+	return on_model("faction_flag(" .. str(key) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		local r1, g1, b1 = t(c1)
+		local r2, g2, b2 = t(c2)
+		local r3, g3, b3 = t(c3)
+		return se_faction_flag_set(f, dir or "", r1, g1, b1, r2, g2, b2, r3, g3, b3)
 	end)
 end
 
