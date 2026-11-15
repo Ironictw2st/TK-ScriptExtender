@@ -3,12 +3,12 @@
 //! Players drop PNG files into ONE fixed folder:
 //!   %APPDATA%\The Creative Assembly\ThreeKingdoms\190E_portraits\
 //! `se_custom_portraits_list()` lists them (sanitised names, PNG magic, size cap, no subfolders).
-//! `se_custom_portrait_install(file, slot)` decodes one file and writes the 16 images of a 3K
-//! character art folder, centre-cropped and scaled, as loose files under the user maps folder
-//! (a VFS search root of the game):
+//! `se_custom_portrait_install(file)` decodes one file and writes the 16 images of a 3K character
+//! art folder, centre-cropped and scaled, as loose files under the user maps folder (a VFS search
+//! root of the game), in a slot the SE allocates (manifest; see `load_manifest`):
 //!   %APPDATA%\The Creative Assembly\ThreeKingdoms\maps\ui\characters\190e_custom_portrait_<slot>\
 //! The game then serves `ui/characters/190e_custom_portrait_<slot>/...` from there. No other paths
-//! are read or written; the natives take a file name and a slot number, never a path.
+//! are read or written; the natives take a file name, never a path.
 
 use crate::log;
 use crate::lua::{self, LuaState};
@@ -160,17 +160,108 @@ const STILLS: &[(&str, u32, u32, u32, u32)] = &[
     ("unitcards", 82, 272, 131, 435),
 ];
 
-/// se_custom_portrait_install(file_name, slot) -> art_key | nil, msg
+// ---- slot allocation (the SE owns it; a used slot is never overwritten) ----------------------
+// Manifest: <maps>\190e_custom_portrait_manifest.txt, one line per slot: "slot<TAB>hash<TAB>file".
+// hash = FNV-1a 64 of the source file bytes (identity, not security). A slot folder that exists on
+// disk without a manifest line (manifest lost or edited by hand) counts as used with an unknown hash.
+
+fn chars_dir() -> Option<PathBuf> { tw_root().map(|r| r.join("maps").join("ui").join("characters")) }
+fn manifest_path() -> Option<PathBuf> { tw_root().map(|r| r.join("maps").join("190e_custom_portrait_manifest.txt")) }
+fn slot_key(slot: i64) -> String { format!("190e_custom_portrait_{slot}") }
+
+fn fnv64(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for x in b { h ^= *x as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
+/// slot -> (hash or None when unknown, file name)
+fn load_manifest() -> std::collections::BTreeMap<i64, (Option<u64>, String)> {
+    let mut m = std::collections::BTreeMap::new();
+    if let Some(p) = manifest_path() {
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            for line in t.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() != 3 { continue; }
+                let Ok(slot) = f[0].trim().parse::<i64>() else { continue };
+                if !(1..=MAX_SLOT).contains(&slot) { continue; }
+                let hash = u64::from_str_radix(f[1].trim(), 16).ok();
+                let name = if valid_name(f[2].trim()) { f[2].trim().to_string() } else { String::new() };
+                m.insert(slot, (hash, name));
+            }
+        }
+    }
+    // folders on disk that the manifest does not know: used, hash unknown
+    if let Some(dir) = chars_dir() {
+        for slot in 1..=MAX_SLOT {
+            if !m.contains_key(&slot) && dir.join(slot_key(slot)).exists() {
+                m.insert(slot, (None, String::new()));
+            }
+        }
+    }
+    m
+}
+
+fn save_manifest(m: &std::collections::BTreeMap<i64, (Option<u64>, String)>) -> Result<(), String> {
+    let p = manifest_path().ok_or("APPDATA not set")?;
+    if let Some(d) = p.parent() { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
+    let mut t = String::from("");
+    for (slot, (hash, name)) in m {
+        t.push_str(&format!("{slot}\t{}\t{name}\n", hash.map(|h| format!("{h:016x}")).unwrap_or_else(|| "?".into())));
+    }
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, t).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+}
+
+/// se_custom_portrait_install(file_name) -> art_key, slot | nil, msg
+/// Same picture (same bytes) as an installed slot -> that slot; otherwise a never-used slot.
 unsafe extern "C" fn se_custom_portrait_install(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let name = lua::to_str(l, 1);
-    let slot = (api.tointeger)(l, 2) as i64;
-    let out = (|| -> Result<String, String> {
-        if !(1..=MAX_SLOT).contains(&slot) { return Err(format!("slot must be 1..{MAX_SLOT}")); }
+    let out = (|| -> Result<(String, i64, bool), String> {
         let file = checked_file(&name)?;
-        let img = decode(&file)?;
-        let key = format!("190e_custom_portrait_{slot}");
-        let base = tw_root().ok_or("APPDATA not set")?.join("maps").join("ui").join("characters").join(&key);
+        let bytes = std::fs::read(&file).map_err(|e| format!("read {name}: {e}"))?;
+        if bytes.len() as u64 > MAX_FILE { return Err(format!("{name} is larger than 16 MB")); }
+        let hash = fnv64(&bytes);
+        let mut man = load_manifest();
+        let chars = chars_dir().ok_or("APPDATA not set")?;
+        if let Some((slot, _)) = man.iter().find(|(_, (h, _))| *h == Some(hash)) {
+            let slot = *slot;
+            let probe = chars.join(slot_key(slot)).join("stills").join("halfbody_large").join(format!("{}.png", slot_key(slot)));
+            if probe.exists() {
+                return Ok((slot_key(slot), slot, true));
+            }
+            // the manifest knows the picture but its files are gone: rebuild them in the same slot
+            install_into(&file, slot)?;
+            return Ok((slot_key(slot), slot, false));
+        }
+        let Some(slot) = (1..=MAX_SLOT).find(|s| !man.contains_key(s) && !chars.join(slot_key(*s)).exists()) else {
+            return Err(format!("all {MAX_SLOT} custom portrait slots are in use (campaigns may still show them); none was overwritten"));
+        };
+        install_into(&file, slot)?;
+        man.insert(slot, (Some(hash), name.clone()));
+        save_manifest(&man)?;
+        Ok((slot_key(slot), slot, false))
+    })();
+    match out {
+        Ok((k, slot, reused)) => {
+            log!("se_custom_portrait_install: {name} -> slot {slot}{}", if reused { " (same picture, reused)" } else { "" });
+            lua::push_str(l, &k);
+            (api.pushinteger)(l, slot as _);
+            2
+        }
+        Err(e) => { log!("se_custom_portrait_install: {e}"); (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// Decode `file` and write the 16 images of slot `slot` (only ever called for a free slot, or to
+/// rebuild a slot whose manifest hash matches this very picture).
+fn install_into(file: &PathBuf, slot: i64) -> Result<(), String> {
+    {
+        let img = decode(file)?;
+        let key = slot_key(slot);
+        let base = chars_dir().ok_or("APPDATA not set")?.join(&key);
         let png_name = format!("{key}.png");
         let mut n = 0;
         for (sub, w, h, lw, lh) in STILLS {
@@ -186,11 +277,7 @@ unsafe extern "C" fn se_custom_portrait_install(l: *mut LuaState) -> c_int {
                 n += 1;
             }
         }
-        log!("se_custom_portrait_install: {name} ({}x{}) -> {} ({n} files)", img.w, img.h, base.display());
-        Ok(key)
-    })();
-    match out {
-        Ok(k) => { lua::push_str(l, &k); 1 }
-        Err(e) => { log!("se_custom_portrait_install: {e}"); (api.pushnil)(l); lua::push_str(l, &e); 2 }
+        log!("custom portrait: {} ({}x{}) -> {} ({n} files)", file.display(), img.w, img.h, base.display());
+        Ok(())
     }
 }

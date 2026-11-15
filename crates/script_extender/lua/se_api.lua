@@ -99,14 +99,15 @@ function se.frontend.list_custom_portraits()
 	for name in string.gmatch(s, "[^|]+") do out[#out + 1] = name end
 	return out
 end
--- se.frontend.install_custom_portrait(file_name, slot) -> art_key ("190e_custom_portrait_<slot>") | nil, msg
+-- se.frontend.install_custom_portrait(file_name) -> art_key ("190e_custom_portrait_<slot>"), slot | nil, msg
 -- Writes the scaled character art folder as loose files under ...\ThreeKingdoms\maps\ui\characters\.
--- Use a slot that was not displayed yet this session (the game caches textures by path).
-function se.frontend.install_custom_portrait(file_name, slot)
+-- The SE picks the slot: the same picture reuses its slot, a new picture gets a never-used slot, a
+-- used slot (an older campaign may show it) is never overwritten; refused when all 64 are used.
+function se.frontend.install_custom_portrait(file_name)
 	local f = G("se_custom_portrait_install")
 	if type(f) ~= "function" then return nil, "native se_custom_portrait_install is not available" end
 	if type(file_name) ~= "string" then return nil, "file_name must be a string" end
-	return f(file_name, num(slot) or 0)
+	return f(file_name)
 end
 
 local function need(...)
