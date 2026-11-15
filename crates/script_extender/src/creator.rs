@@ -59,6 +59,7 @@ pub fn init(t: &Table) {
         }
     };
     let _ = ENGINE.set(e);
+    init_colours(t);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
@@ -68,6 +69,9 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_faction_name_set", se_faction_name_set);
     lua::set_global_fn(l, "se_faction_flag_set", se_faction_flag_set);
     lua::set_global_fn(l, "se_faction_cosmetics_clear", se_faction_cosmetics_clear);
+    lua::set_global_fn(l, "se_faction_colours_get", se_faction_colours_get);
+    lua::set_global_fn(l, "se_faction_colours_set", se_faction_colours_set);
+    lua::set_global_fn(l, "se_faction_colours_reset", se_faction_colours_reset);
 }
 
 #[link(name = "kernel32")]
@@ -480,6 +484,171 @@ unsafe extern "C" fn se_faction_cosmetics_clear(l: *mut LuaState) -> c_int {
     match out {
         Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
         Err(er) => { (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+// ------------------------------------------------------------------------------------------
+// Faction colours (the 190E Faction Color Editor's DLL functions, folded into the SE; based on
+// Alex Zhao's Faction Color Editor, Workshop 3839399323, full permission). notes/colour_editor_natives.md
+//   campaign: factions DB record (F+0xbf0) +0xa8 / +0xb4 / +0xc0 = 3 RGB f32 triples (0..1);
+//     FUN_141435830 copies them into the FACTION flag block (+0xf20 +0x20/+0x2c/+0x38) on the
+//     engine's refresh / load. We write the record (so the engine's own refresh yields them),
+//     the live block, and register them with the cosmetics refresh detour.
+//   battle: faction_uniform_colours table (FUN_1409216a0(db), db = db_get(model+0x3b38));
+//     list {count +0x14, data +0x18} of rows {vtable, factions record* @+8, RGB f32 x3 @+0x10}.
+//     Read when unit models are built (next battle).
+// Reset restores the values seen at the first write of this game session (the DB is pristine
+// at game start).
+// ------------------------------------------------------------------------------------------
+
+const REC_COLOURS: usize = 0xa8;
+const UNIFORM_COLOURS: usize = 0x10;
+
+static ORIGINALS: Mutex<Option<HashMap<usize, [[f32; 3]; 3]>>> = Mutex::new(None);
+
+struct DbFns {
+    db_get: unsafe extern "C" fn(P) -> P,
+    uniform_table: unsafe extern "C" fn(P) -> P,
+}
+static DB: OnceLock<DbFns> = OnceLock::new();
+
+pub fn init_colours(t: &Table) {
+    let _ = DB.set(unsafe {
+        DbFns {
+            db_get: core::mem::transmute(t.get("db_get")),
+            uniform_table: core::mem::transmute(t.get("faction_uniform_colours_table")),
+        }
+    });
+}
+
+unsafe fn read3(a: usize) -> [[f32; 3]; 3] {
+    let mut o = [[0f32; 3]; 3];
+    for i in 0..3 { o[i] = core::ptr::read_unaligned((a + i * 12) as *const [f32; 3]); }
+    o
+}
+
+fn sane(c: &[[f32; 3]; 3]) -> bool {
+    c.iter().flatten().all(|v| v.is_finite() && (-0.01..=1.01).contains(v))
+}
+
+/// The faction_uniform_colours row of a faction (by its factions record pointer).
+unsafe fn uniform_row(f: usize) -> Result<usize, String> {
+    let d = DB.get().ok_or("db table missing")?;
+    let rec = rq(f + F_RECORD);
+    let model = rq(rq(f + 0x288) + 0x78);
+    if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model behind the faction".into()); }
+    let db = (d.db_get)((model + 0x3b38) as P) as usize;
+    if db == 0 { return Err("no database manager".into()); }
+    let table = (d.uniform_table)(db as P) as usize;
+    if table == 0 || !readable(table, 0x20) { return Err("faction_uniform_colours table not loaded".into()); }
+    let n = rd(table + 0x14) as usize;
+    let data = rq(table + 0x18);
+    if n == 0 || n > 0x10000 || !readable(data, n * 8) { return Err(format!("odd uniform table (count {n})")); }
+    for i in 0..n {
+        let row = rq(data + i * 8);
+        if row != 0 && readable(row, UNIFORM_COLOURS + 36) && rq(row + 8) == rec {
+            return Ok(row + UNIFORM_COLOURS);
+        }
+    }
+    Err("this faction has no faction_uniform_colours row".into())
+}
+
+/// Address of the 3 colour triples of a group.
+unsafe fn colour_slot(f: usize, group: &str) -> Result<usize, String> {
+    let a = match group {
+        "campaign" => rq(f + F_RECORD) + REC_COLOURS,
+        "battle" => uniform_row(f)?,
+        _ => return Err("group must be \"campaign\" or \"battle\"".into()),
+    };
+    if !readable(a, 36) { return Err("colour block not readable".into()); }
+    let c = read3(a);
+    if !sane(&c) { return Err(format!("colour block at {a:#x} does not hold 0..1 floats; refusing")); }
+    Ok(a)
+}
+
+fn remember_original(a: usize, c: [[f32; 3]; 3]) {
+    let mut g = match ORIGINALS.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    g.get_or_insert_with(HashMap::new).entry(a).or_insert(c);
+}
+
+unsafe fn push_triples(l: *mut LuaState, c: &[[f32; 3]; 3]) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    for t in c { for v in t { (api.pushnumber)(l, (v * 255.0).round()); } }
+    9
+}
+
+/// se_faction_colours_get(q_faction, group) -> r1,g1,b1, r2,g2,b2, r3,g3,b3 (0..255) | nil, msg
+unsafe extern "C" fn se_faction_colours_get(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let group = lua::to_str(l, 2);
+    match (|| -> Result<[[f32; 3]; 3], String> {
+        let f = faction(l)?;
+        Ok(read3(colour_slot(f, &group)?))
+    })() {
+        Ok(c) => push_triples(l, &c),
+        Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// se_faction_colours_set(q_faction, group, r1,g1,b1, r2,g2,b2, r3,g3,b3) -> ok, msg
+/// 0..255; a missing or negative triple is kept.
+unsafe extern "C" fn se_faction_colours_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let group = lua::to_str(l, 2);
+    let out = (|| -> Result<String, String> {
+        let f = faction(l)?;
+        let a = colour_slot(f, &group)?;
+        let before = read3(a);
+        remember_original(a, before);
+        let mut c = before;
+        let mut set: [Option<[f32; 3]>; 3] = [None; 3];
+        for i in 0..3 {
+            let base = 3 + i as c_int * 3;
+            if (api.type_)(l, base) != 3 || (api.type_)(l, base + 2) != 3 { continue; }
+            let r = (api.tonumber)(l, base) as f32;
+            if r < 0.0 { continue; }
+            let v = [r, (api.tonumber)(l, base + 1) as f32, (api.tonumber)(l, base + 2) as f32].map(|x| x.clamp(0.0, 255.0) / 255.0);
+            c[i] = v;
+            set[i] = Some(v);
+        }
+        for i in 0..3 { core::ptr::write_unaligned((a + i * 12) as *mut [f32; 3], c[i]); }
+        if group == "campaign" {
+            // live: the FACTION flag block, and keep it through the engine's refresh
+            if let Some(e) = ENGINE.get() { write_flag(e, f, None, &set); }
+            register_custom(rq(f + F_RECORD), |cu| for i in 0..3 { if set[i].is_some() { cu.colours[i] = set[i]; } });
+        }
+        let msg = format!("{group} colours of faction {f:#x} at {a:#x}: {:?} -> {:?}", before, c);
+        log!("se_faction_colours_set: {msg}");
+        Ok(msg)
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_faction_colours_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+/// se_faction_colours_reset(q_faction, group) -> ok, msg : the values before the first change
+/// of this game session (and the campaign registration is dropped)
+unsafe extern "C" fn se_faction_colours_reset(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let group = lua::to_str(l, 2);
+    let out = (|| -> Result<String, String> {
+        let f = faction(l)?;
+        let a = colour_slot(f, &group)?;
+        let orig = { match ORIGINALS.lock() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref().and_then(|m| m.get(&a).copied()) };
+        let Some(o) = orig else { return Ok(format!("{group} colours were not changed this session")) };
+        for i in 0..3 { core::ptr::write_unaligned((a + i * 12) as *mut [f32; 3], o[i]); }
+        if group == "campaign" {
+            if let Some(e) = ENGINE.get() { write_flag(e, f, None, &[Some(o[0]), Some(o[1]), Some(o[2])]); }
+            register_custom(rq(f + F_RECORD), |cu| cu.colours = [None; 3]);
+        }
+        Ok(format!("{group} colours reset to {:?}", o))
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_faction_colours_reset: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
 }

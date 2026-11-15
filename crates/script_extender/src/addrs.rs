@@ -76,6 +76,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // FUN_1419f3df0(faction): faction cosmetics refresh (pending name from cosmetic override /
     // leader name, flag dir reset); creator.rs re-asserts registered custom names / flags after it
     ("faction_cosmetics_refresh", 0x19f3df0, [0x48, 0x8b, 0xc4, 0x55, 0x57, 0x48, 0x8d, 0x68]),
+    // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
+    // Faction Color Editor also anchor-reads it (read only, never patched)
+    ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
     ("string_dtor", 0x2e4930, [0x48, 0x8b, 0x49, 0x08, 0x48, 0x8d, 0x05, 0xb3]),
     // CCQ_DISBAND_UNIT executor: disband_units(&UnitVec, model); unit_is_valid(unit) -> bool
     ("disband_units", 0x149ea70, [0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56]),
@@ -139,6 +142,9 @@ const ENTRIES: &[(&str, usize, [u8; 8])] = &[
     // FUN_1419f3df0(faction): faction cosmetics refresh (pending name from cosmetic override /
     // leader name, flag dir reset); creator.rs re-asserts registered custom names / flags after it
     ("faction_cosmetics_refresh", 0x19f3df0, [0x48, 0x8b, 0xc4, 0x55, 0x57, 0x48, 0x8d, 0x68]),
+    // DATABASE manager lazy getter of faction_uniform_colours_table (FUN_1409216a0); the 190E
+    // Faction Color Editor also anchor-reads it (read only, never patched)
+    ("faction_uniform_colours_table", 0x9216a0, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
     // 0.21 effect bundles: FUN_140911650(db) = effect_bundles table (record +0x3c count, +0x40 entries)
     ("effect_bundles_table", 0x911650, [0x40, 0x53, 0x56, 0x48, 0x81, 0xec, 0xf8, 0x00]),
     // 0.22 diplomacy: FUN_141b965e0(mgr, A, B) standing; FUN_141b7cf60(mgr, A, B, level) attitude event

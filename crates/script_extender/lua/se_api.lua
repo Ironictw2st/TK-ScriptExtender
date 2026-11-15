@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
@@ -1273,6 +1273,51 @@ function se.modify.faction_flag(key, dir, c1, c2, c3)
 		local r2, g2, b2 = t(c2)
 		local r3, g3, b3 = t(c3)
 		return se_faction_flag_set(f, dir or "", r1, g1, b1, r2, g2, b2, r3, g3, b3)
+	end)
+end
+
+-- Faction colours (based on Alex Zhao's Faction Color Editor). group "campaign" = the factions
+-- record's 3 colours (live on the map flag block, kept through the engine's refresh and the next
+-- load); "battle" = the faction_uniform_colours row (unit uniforms, from the next battle).
+-- Colours are {r,g,b} 0..255; nil keeps a triple. Single player only.
+-- se.query.faction_colours(key, group) -> { {r,g,b}, {r,g,b}, {r,g,b} } | nil, msg
+function se.query.faction_colours(key, group)
+	local okn, err = need("se_faction_colours_get")
+	if not okn then return nil, err end
+	local f, e = faction_q(key)
+	if not f then return nil, e end
+	local r = { se_faction_colours_get(f, group) }
+	if r[1] == nil then return nil, r[2] end
+	return { { r[1], r[2], r[3] }, { r[4], r[5], r[6] }, { r[7], r[8], r[9] } }
+end
+
+-- se.modify.faction_colours(key, group, {r,g,b}, {r,g,b} [, {r,g,b}]) -> ok, msg
+function se.modify.faction_colours(key, group, c1, c2, c3)
+	local okn, err = need("se_faction_colours_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_colours: single player only" end
+	if group ~= "campaign" and group ~= "battle" then return false, "group must be \"campaign\" or \"battle\"" end
+	local function t(c) if type(c) == "table" then return c[1], c[2], c[3] end return -1, 0, 0 end
+	return on_model("faction_colours(" .. str(key) .. ", " .. group .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		local r1, g1, b1 = t(c1)
+		local r2, g2, b2 = t(c2)
+		local r3, g3, b3 = t(c3)
+		return se_faction_colours_set(f, group, r1, g1, b1, r2, g2, b2, r3, g3, b3)
+	end)
+end
+
+-- se.modify.faction_colours_reset(key, group) -> ok, msg : back to the values before the first
+-- change of this game session
+function se.modify.faction_colours_reset(key, group)
+	local okn, err = need("se_faction_colours_reset")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_colours_reset: single player only" end
+	return on_model("faction_colours_reset(" .. str(key) .. ", " .. str(group) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_colours_reset(f, group)
 	end)
 end
 
