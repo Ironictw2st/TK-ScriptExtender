@@ -3981,6 +3981,26 @@ function se.diag.siege()
 	return t
 end
 
+-- se.diag.battle_fixes() -> table   (Alex Zhao's battle fixes, cfg battle_elephant_gate /
+--   battle_formation_fix, both default on, both in the sync tag)
+--   { elephant_gate = true/false (installed), formation_fix = true/false, elephant_state = "...",
+--   formation_state = "..." (why a fix is off or inert), and the per-detour counters:
+--   ele_calls, ele_orig_true, ele_passed (gate predicate; passed = elephants let through),
+--   cancel_calls, cancel_suppressed, width_calls, width_set, cq_gated, cq_not_charging,
+--   af_turtle_miss, af_gated, af_blocked (360-degree missile block), morale_flank_neg,
+--   morale_ignored, cu_charge_state, cu_halts }. Counters are per process.
+function se.diag.battle_fixes()
+	local okn, err = need("se_battlefix_info")
+	if not okn then return nil, err end
+	local s = str(se_battlefix_info())
+	local t = {}
+	for k, v in string.gmatch(s, "([%w_]+)=(%d+)") do
+		if k == "elephant_gate" or k == "formation_fix" then t[k] = (v == "1") else t[k] = tonumber(v) end
+	end
+	for k, v in string.gmatch(s, "|([%w_]+)=([^|]*)") do t[k] = v end
+	return t
+end
+
 -- se.diag.sepatches_selftest([n]) -> ok, message
 --   Runs n (default 20000, max 2000000) random instance records through the engine's original
 --   function and the faster one, and compares every output byte; calls the CAI stub with a NULL
