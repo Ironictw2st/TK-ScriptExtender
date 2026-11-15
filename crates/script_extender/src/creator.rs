@@ -75,6 +75,8 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_faction_colours_reset", se_faction_colours_reset);
     lua::set_global_fn(l, "se_char_art_info", se_char_art_info);
     lua::set_global_fn(l, "se_char_art_set", se_char_art_set);
+    lua::set_global_fn(l, "se_char_art2", se_char_art2);
+    lua::set_global_fn(l, "se_char_birth_set", se_char_birth_set);
 }
 
 #[link(name = "kernel32")]
@@ -747,7 +749,7 @@ unsafe extern "C" fn se_char_art_set(l: *mut LuaState) -> c_int {
                 art_key(cur), rq(cur), art_key(g), if g != 0 && readable(g, 0x88) { rd(g + 0x80) & 0xff } else { 255 }, birth.join(" ")));
         }
         if key.len() > 120 || key.bytes().any(|b| !(0x21..0x7f).contains(&b)) { return Err("bad key".into()); }
-        if cur == 0 || !readable(cur, 0x20) { return Err("character has no art set record".into()); }
+        if cur != 0 && !readable(cur, 0x20) { return Err("art set slot unreadable".into()); }
         let model = rq(rq(ch + 0x250) + 0x78);
         if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
         let db = (a.db_get)((model + 0x3b38) as P);
@@ -761,7 +763,7 @@ unsafe extern "C" fn se_char_art_set(l: *mut LuaState) -> c_int {
         let rec = (a.record_base)(table, s.as_ptr() as *const c_void) as usize;
         (a.string_dtor)(s.as_mut_ptr() as P);
         if rec == 0 || !readable(rec, 0x20) { return Err(format!("no art set '{key}'")); }
-        if rq(rec) != rq(cur) { return Err(format!("record type differs (vt {:#x} vs {:#x}); refusing", rq(rec), rq(cur))); }
+        if cur != 0 && rq(rec) != rq(cur) { return Err(format!("record type differs (vt {:#x} vs {:#x}); refusing", rq(rec), rq(cur))); }
         if art_key(rec) != key { return Err(format!("lookup returned '{}'", art_key(rec))); }
         core::ptr::write_unaligned((ch + CH_ART_SET) as *mut usize, rec);
         // CHARACTER_ART_SET_INFO (+0x4f0, saved) holds the keys the pointer is resolved from at
@@ -787,6 +789,103 @@ unsafe extern "C" fn se_char_art_set(l: *mut LuaState) -> c_int {
     match out {
         Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
         Err(er) => { log!("se_char_art_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+// ------------------------------------------------------------------------------------------
+// S3 v2: the art object at CHARACTER+0x548 (= CHARACTER_ART_SET_INFO+0x58). FUN_141a45aa0(info,
+// saved_key, model) resolves it from a String key saved with the character, through the hash map
+// *(model+0x3bc0): buckets {count +0x64 (bucket array has count entries), heads +0x68}, nodes
+// {next +8, key +0x10, object +0x20}; object +0x38 -> record whose key is at +0x18.
+// ------------------------------------------------------------------------------------------
+
+unsafe fn art_obj_key(obj: usize) -> String {
+    if obj == 0 || !readable(obj, 0x40) { return String::new(); }
+    let rec = rq(obj + 0x38);
+    if rec == 0 || !readable(rec, 0x28) { return String::new(); }
+    for (off, wide) in [(0x18usize, true), (0x18, false), (0x8, false), (0x10, false)] {
+        let s = string_at(rec + off, wide);
+        if !s.is_empty() && !s.starts_with('<') && s.chars().all(|c| (' '..='~').contains(&c)) { return s; }
+    }
+    String::new()
+}
+
+/// Walk every node of the art map; returns (key, object) pairs (bounded).
+unsafe fn art_map(model: usize) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let m = rq(model + 0x3bc0);
+    if m == 0 || !readable(m, 0x78) { return out; }
+    let n = rd(m + 0x64) as usize;
+    let heads = rq(m + 0x68);
+    let sentinel = m + 0x50;
+    if n == 0 || n > 0x10000 || !readable(heads, n * 8) { return out; }
+    let mut seen = std::collections::HashSet::new();
+    let mut node = rq(heads);
+    let mut guard = 0;
+    // nodes form one list threaded through the buckets (next at +8), ending at the sentinel
+    while node != 0 && node != sentinel && guard < 20000 && readable(node, 0x28) {
+        if !seen.insert(node) { break; }
+        let obj = rq(node + 0x20);
+        out.push((art_obj_key(obj), obj));
+        node = rq(node + 8);
+        guard += 1;
+    }
+    out
+}
+
+/// se_char_art2(q_char, cqi, key) -> ok, msg ; key "" reports; "?list" lists the first keys;
+/// otherwise sets CHARACTER+0x548 to the art object with that key.
+unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let key = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let ch = character(l, cqi)?;
+        let model = rq(rq(ch + 0x250) + 0x78);
+        if model == 0 || !readable(model + 0x3bc8, 8) { return Err("no model".into()); }
+        let cur = rq(ch + 0x548);
+        let cur_key = art_obj_key(cur);
+        if key.is_empty() {
+            return Ok(format!("character {cqi}: +0x548 art obj {cur:#x} key '{cur_key}' | +0x550 {:#x} '{}'", rq(ch + 0x550), art_key(rq(ch + 0x550))));
+        }
+        let map = art_map(model);
+        if key == "?list" {
+            let v: Vec<String> = map.iter().take(60).map(|(k, _)| k.clone()).collect();
+            return Ok(format!("{} art objects: {}", map.len(), v.join(" ")));
+        }
+        let Some((_, obj)) = map.iter().find(|(k, _)| *k == key) else { return Err(format!("no art object '{key}' ({} known)", map.len())) };
+        if cur != 0 && readable(cur, 8) && readable(*obj, 8) && rq(cur) != rq(*obj) {
+            return Err("art object type differs; refusing".into());
+        }
+        core::ptr::write_unaligned((ch + 0x548) as *mut usize, *obj);
+        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'");
+        log!("se_char_art2: {msg}");
+        Ok(msg)
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_char_art2: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+/// se_char_birth_set(q_char, cqi, birth_year) -> ok, msg  (CHARACTER+0x4e0 i32)
+unsafe extern "C" fn se_char_birth_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let year = (api.tointeger)(l, 3) as i32;
+    let out = (|| -> Result<String, String> {
+        let ch = character(l, cqi)?;
+        let before = rd(ch + 0x4e0) as i32;
+        if !(1..=2000).contains(&before) { return Err(format!("birth field holds {before}; refusing")); }
+        if !(1..=2000).contains(&year) { return Err("birth year out of range".into()); }
+        core::ptr::write_unaligned((ch + 0x4e0) as *mut i32, year);
+        Ok(format!("character {cqi}: birth year {before} -> {year}"))
+    })();
+    match out {
+        Ok(m) => { log!("se_char_birth_set: {m}"); (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
 }
