@@ -12,3 +12,5 @@ crate-type = ["cdylib"]
 # Trampoline hook on lua_gettop to learn the live lua_State*. Same crate/version that was
 # proven in-game on the July build.
 retour = "0.3"
+# creator S6: decode / scale / encode player portrait PNGs (pure Rust, no other deps)
+png = "=0.17.16"

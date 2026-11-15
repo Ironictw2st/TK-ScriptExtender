@@ -81,10 +81,32 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
+end
+
+-- Player portraits (creator S6). Files go in %APPDATA%\The Creative Assembly\ThreeKingdoms\190E_portraits\
+-- (PNG, up to 4096x4096 and 16 MB, names [A-Za-z0-9 _-.]).
+-- se.frontend.list_custom_portraits() -> { "a.png", ... } | nil, msg
+function se.frontend.list_custom_portraits()
+	local f = G("se_custom_portraits_list")
+	if type(f) ~= "function" then return nil, "native se_custom_portraits_list is not available" end
+	local s, err = f()
+	if s == nil then return nil, err end
+	local out = {}
+	for name in string.gmatch(s, "[^|]+") do out[#out + 1] = name end
+	return out
+end
+-- se.frontend.install_custom_portrait(file_name, slot) -> art_key ("190e_custom_portrait_<slot>") | nil, msg
+-- Writes the scaled character art folder as loose files under ...\ThreeKingdoms\maps\ui\characters\.
+-- Use a slot that was not displayed yet this session (the game caches textures by path).
+function se.frontend.install_custom_portrait(file_name, slot)
+	local f = G("se_custom_portrait_install")
+	if type(f) ~= "function" then return nil, "native se_custom_portrait_install is not available" end
+	if type(file_name) ~= "string" then return nil, "file_name must be a string" end
+	return f(file_name, num(slot) or 0)
 end
 
 local function need(...)

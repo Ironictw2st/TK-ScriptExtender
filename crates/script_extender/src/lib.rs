@@ -32,6 +32,7 @@ mod skills;
 mod ainudge;
 mod alliances;
 mod creator;
+mod portraits;
 mod autoresolve;
 mod income;
 mod airecruit;
