@@ -10,6 +10,7 @@ pub type LuaState = c_void;
 pub type CFunction = unsafe extern "C" fn(*mut LuaState) -> c_int;
 
 pub const LUA_GLOBALSINDEX: c_int = -10002;
+pub const LUA_REGISTRYINDEX: c_int = -10000;
 pub const LUA_TLIGHTUSERDATA: c_int = 2;
 pub const LUA_TUSERDATA: c_int = 7;
 

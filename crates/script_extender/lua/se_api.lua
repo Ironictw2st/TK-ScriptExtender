@@ -68,6 +68,25 @@ function se.status()
 	return { state = names[st] or tostring(st), version = v, patches = n }
 end
 
+-- se.frontend: cheap checks that work in any Lua state, including the main menu (no cm needed).
+-- se.frontend.available() -> true when the natives are registered and the DLL accepted this exe.
+se.frontend = {}
+function se.frontend.available()
+	if type(G("se_ping")) ~= "function" then return false end
+	local st = se.status()
+	return st.state ~= "refused" and st.state ~= "not_game"
+end
+-- se.frontend.version() -> "<dll version>", e.g. "0.49.0-creator.1"
+function se.frontend.version()
+	return se.version()
+end
+-- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
+local CREATOR_NATIVES = { character_name = "se_char_name_set" }
+function se.frontend.has(feature)
+	local n = CREATOR_NATIVES[feature]
+	return n ~= nil and type(G(n)) == "function"
+end
+
 local function need(...)
 	for _, n in ipairs({ ... }) do
 		if type(G(n)) ~= "function" then return false, "native " .. n .. " is not available (DLL too old or not injected)" end
@@ -1168,6 +1187,44 @@ function se.modify.alliance_name(cqi, text, mode)
 		local a, e1 = alliance_by_cqi(cqi)
 		if not a then return false, e1 end
 		return se_alliance_name_set(a, num(cqi), text, mode or "inline")
+	end)
+end
+
+----------------------------------------------------------------------------------------------
+-- creator (190E "Create your Character / Faction"): single player only
+----------------------------------------------------------------------------------------------
+
+-- true in a multiplayer campaign, and when the model cannot answer (refuse rather than guess)
+local function creator_mp()
+	local cm = G("cm")
+	if not cm then return false end
+	local ok, mp = pcall(function() return cm:query_model():is_multiplayer() end)
+	if ok and type(mp) == "boolean" then return mp end
+	ok, mp = pcall(function() return cm:is_multiplayer() end)
+	if ok and type(mp) == "boolean" then return mp end
+	return true
+end
+
+-- se.query.character_names(cqi) -> dump string of the 4 name slots and the display cache
+function se.query.character_names(cqi)
+	local okn, err = need("se_char_names")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	return se_char_names(q, num(cqi))
+end
+
+-- se.modify.character_name_part(cqi, part, text) : what the engine's custom-name command does
+-- (CCQ_SET_CHARACTER_CUSTOM_NAME), part 0..3. Single player only.
+function se.modify.character_name_part(cqi, part, text)
+	local okn, err = need("se_char_name_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_name: single player only" end
+	if type(text) ~= "string" then return false, "text must be a string" end
+	return on_model("character_name_part(" .. str(cqi) .. ", " .. str(part) .. ", " .. text .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_char_name_set(q, num(cqi), num(part), text)
 	end)
 end
 

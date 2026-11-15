@@ -31,6 +31,7 @@ mod buildings;
 mod skills;
 mod ainudge;
 mod alliances;
+mod creator;
 mod autoresolve;
 mod income;
 mod airecruit;
@@ -116,6 +117,7 @@ fn bootstrap() {
     buildings::init(&table);
     skills::init(&table);
     alliances::init(&table);
+    creator::init(&table);
     bundles::init(&table);
     diplomacy::init(&table);
     dilemma::init(&table);
