@@ -670,15 +670,15 @@ unsafe extern "C" fn se_char_art_info(l: *mut LuaState) -> c_int {
         let ch = character(l, cqi)?;
         let det = rq(rq(ch + 0x260));
         if det == 0 || !readable(det, 0x600) { return Err("no CHARACTER_DETAILS".into()); }
-        let a = det + 0x4f0;
-        let mut s = format!("character {cqi} ch={ch:#x} details={det:#x} art_set_info:");
+        let a = ch + 0x4f0;
+        let mut s = format!("character {cqi} ch={ch:#x} details={det:#x} CHARACTER+0x4f0 art_set_info:");
         for i in 0..5 { s.push_str(&format!(" s{i}='{}'", string_at(a + i * 0x10, false))); }
         s.push_str(&format!(" flag={}", rd(a + 0x50) & 0xff));
         // all narrow strings inside DETAILS 0..0x800 that look like keys, for orientation
         let mut found = Vec::new();
         let mut o = 0usize;
         while o < 0x800 {
-            let t = string_at(det + o, false);
+            let t = string_at(ch + o, false);
             if t.len() >= 6 && t.len() < 120 && t.bytes().all(|b| (0x20..0x7f).contains(&b)) && t.contains('_') {
                 found.push(format!("+{o:#x}='{t}'"));
             }
@@ -764,7 +764,23 @@ unsafe extern "C" fn se_char_art_set(l: *mut LuaState) -> c_int {
         if rq(rec) != rq(cur) { return Err(format!("record type differs (vt {:#x} vs {:#x}); refusing", rq(rec), rq(cur))); }
         if art_key(rec) != key { return Err(format!("lookup returned '{}'", art_key(rec))); }
         core::ptr::write_unaligned((ch + CH_ART_SET) as *mut usize, rec);
-        let msg = format!("character {cqi}: art set '{}' -> '{}'", art_key(cur), key);
+        // CHARACTER_ART_SET_INFO (+0x4f0, saved) holds the keys the pointer is resolved from at
+        // load: rewrite the slot that carried the old art set key so the change is saved too.
+        let old_key = art_key(cur);
+        let mut info_slot = None;
+        if let Some(e) = ENGINE.get() {
+            for i in 0..5usize {
+                let sp = ch + 0x4f0 + i * 0x10;
+                if !old_key.is_empty() && string_at(sp, false) == old_key {
+                    let tmp: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+                    (e.str_from_cstr)(tmp.as_mut_ptr() as P, c.as_ptr());
+                    (e.str_assign)(sp as P, tmp.as_mut_ptr() as P);
+                    info_slot = Some(i);
+                    break;
+                }
+            }
+        }
+        let msg = format!("character {cqi}: art set '{}' -> '{}' (saved info slot {:?})", old_key, key, info_slot);
         log!("se_char_art_set: {msg}");
         Ok(msg)
     })();
