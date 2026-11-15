@@ -3981,10 +3981,16 @@ function se.diag.siege()
 	return t
 end
 
--- se.diag.battle_fixes() -> table   (Alex Zhao's battle fixes, cfg battle_elephant_gate /
---   battle_formation_fix, both default on, both in the sync tag)
---   { elephant_gate = true/false (installed), formation_fix = true/false, elephant_state = "...",
---   formation_state = "..." (why a fix is off or inert), and the per-detour counters:
+-- Battle fixes (Alex Zhao's DLL mods ported into the SE, with his permission; technical help from Wyccc).
+-- Features (cfg key battle_<name>, default 1 = installed this session, in the sync tag):
+--   elephant_gate, shieldwall_hold, shieldwall_width, charge_hold, turtle_missile_block,
+--   turtle_flank_immunity, cantabrian
+local BATTLE_FIXES = { "elephant_gate", "shieldwall_hold", "shieldwall_width", "charge_hold",
+	"turtle_missile_block", "turtle_flank_immunity", "cantabrian" }
+
+-- se.diag.battle_fixes() -> table
+--   { <name> = true/false (installed this session), <name>_on = true/false (runtime switch),
+--   <name>_state = "installed" / "off (battle_<name>=0)" / "inert: <why>", and the counters:
 --   ele_calls, ele_orig_true, ele_passed (gate predicate; passed = elephants let through),
 --   cancel_calls, cancel_suppressed, width_calls, width_set, cq_gated, cq_not_charging,
 --   af_turtle_miss, af_gated, af_blocked (360-degree missile block), morale_flank_neg,
@@ -3993,12 +3999,43 @@ function se.diag.battle_fixes()
 	local okn, err = need("se_battlefix_info")
 	if not okn then return nil, err end
 	local s = str(se_battlefix_info())
+	local bar = string.find(s, "|")
+	local head = bar and string.sub(s, 1, bar - 1) or s
+	local flags = {}
+	for _, n in ipairs(BATTLE_FIXES) do flags[n] = true; flags[n .. "_on"] = true end
 	local t = {}
-	for k, v in string.gmatch(s, "([%w_]+)=(%d+)") do
-		if k == "elephant_gate" or k == "formation_fix" then t[k] = (v == "1") else t[k] = tonumber(v) end
+	for k, v in string.gmatch(head, "([%w_]+)=(%d+)") do
+		if flags[k] then t[k] = (v == "1") else t[k] = tonumber(v) end
 	end
 	for k, v in string.gmatch(s, "|([%w_]+)=([^|]*)") do t[k] = v end
 	return t
+end
+
+-- se.modify.battle_fixes({ <name> = true/false, ... }) -> results, err
+--   Switches installed battle fixes on or off at run time; results[name] = true | "unchanged" | "<why not>".
+--   A feature whose cfg key is 0 (or that stayed inert) was never installed and cannot be switched on.
+--   Takes effect from the next battle: call it from the campaign or the frontend, never during a battle
+--   (refused when a battle manager is present: the change would desync a multiplayer battle).
+--   Multiplayer: the switches change the battle simulation, so every machine must use the same values;
+--   the 190E consumer applies them at campaign load (host values via the 190E MP settings sync) and
+--   ignores an in-campaign Apply in multiplayer.
+function se.modify.battle_fixes(t)
+	if type(t) ~= "table" then return nil, "expected a table { name = boolean }" end
+	local okn, err = need("se_battlefix_set")
+	if not okn then return nil, err end
+	if type(G("bm")) == "table" then return nil, "refused during a battle (applies from the next battle)" end
+	local res = {}
+	for _, n in ipairs(BATTLE_FIXES) do
+		local v = t[n]
+		if v ~= nil then
+			local ok, msg = se_battlefix_set(n, v == true)
+			if ok then res[n] = (msg == "changed") or "unchanged" else res[n] = str(msg) end
+		end
+	end
+	for k in pairs(t) do
+		if res[k] == nil then res[k] = "unknown battle fix" end
+	end
+	return res
 end
 
 -- se.diag.sepatches_selftest([n]) -> ok, message
