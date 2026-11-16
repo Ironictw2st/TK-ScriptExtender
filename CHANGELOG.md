@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.49.0-batch.1 (unreleased, local trial integration; branch integ/190e-batch-1115 = feat/battle-fixes + feat/creator)
+
+- **Battle fixes** by Alex Zhao, with technical help from Wyccc, rebuilt inside the script extender with his
+  permission. There is one switch per fix (cfg key, default 1, all in the version lock), and the 190E MCT page
+  can turn each one off from the next battle:
+  - `battle_elephant_gate`: elephants attack gates.
+  - `battle_shieldwall_hold`: shield and spear walls no longer drop after melee.
+  - `battle_shieldwall_width`: walls up to 60 men wide.
+  - `battle_charge_hold`: a wall keeps formation through a charge and halts to re-form.
+  - `battle_turtle_missile_block`: circle, hollow square and square block missiles from every side.
+  - `battle_turtle_flank_immunity`: no flank or rear morale penalty in those formations.
+  - `battle_cantabrian`: a wider Cantabrian circle (distance 30, radius 32).
+  - `battle_ranged_melee_targets`: archers on fire-at-will keep shooting enemies in melee with friendlies.
+  - `battle_ranged_spread_targets`: missiles spread across the target unit. Its random state restarts at every
+    battle load, so multiplayer peers stay in step.
+  - Coexistence: if Alex Zhao's own DLLs are already loaded, the SE leaves that fix to them and logs why.
+    Please unsubscribe from the Workshop originals; they are included here.
+  - `se.diag.battle_fixes()` reports each fix's state and counters; `se.modify.battle_fixes{...}` switches the
+    fixes at run time (never during a battle).
+- **190E character / faction creator support** (feat/creator S1-S8):
+  - Frontend natives (`se.frontend.*`) and character names.
+  - Faction names and flags; the faction cosmetics refresh keeps them (cfg `creator_cosmetics`, default 1).
+  - Faction colours (campaign record and battle uniform).
+  - Character art sets and art objects, and the birth year.
+  - Player portraits (SE-owned slots, scaled loose art, PNG placement chunk).
+  - Loc text for `190e_custom_` keys.
+  - Item look probe and skill-tree node-set swap.
+  - Natives register once per Lua VM via a registry marker, replacing the old 16-state pointer list.
+
 ## 0.48.1 (unreleased; branch fix/guards-1112, test builds 0.48.1-test.N)
 
 - **Two more engine crash guards** in `engine_crash_guards`, plus one experimental guard that is off by default; each
