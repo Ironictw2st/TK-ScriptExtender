@@ -1540,20 +1540,15 @@ function se.query.character_art(cqi)
 end
 
 -- se.modify.character_art_set(cqi, art_set_key) -> ok, msg
--- card (optional): unit-card / HUD portrait mode. "auto" (default): women and 190e_custom_portrait
--- sets show the art set's own card; "unique", "composite" (equipped-armour card, like historical
--- men), "keep".
-function se.modify.character_art_set(cqi, key, card)
+function se.modify.character_art_set(cqi, key)
 	local okn, err = need("se_char_art2")
 	if not okn then return false, err end
 	if creator_mp() then return false, "character_art_set: single player only" end
 	if type(key) ~= "string" or key == "" or key:sub(1, 1) == "?" then return false, "key must be an art set key" end
-	card = card or "auto"
-	if card ~= "auto" and card ~= "unique" and card ~= "composite" and card ~= "keep" then return false, "card must be auto, unique, composite or keep" end
 	return on_model("character_art_set(" .. str(cqi) .. ", " .. key .. ")", function()
 		local q, e = se.character(cqi)
 		if not q then return false, e end
-		return se_char_art2(q, num(cqi), key, card)
+		return se_char_art2(q, num(cqi), key)
 	end)
 end
 
