@@ -1548,6 +1548,19 @@ function se.modify.character_art_set(cqi, key)
 	return on_model("character_art_set(" .. str(cqi) .. ", " .. key .. ")", function()
 		local q, e = se.character(cqi)
 		if not q then return false, e end
+		-- the general's own unit carries a copy of the art (army-panel general card)
+		local gu = nil
+		pcall(function()
+			if q:has_military_force() then
+				local ul = q:military_force():unit_list()
+				for i = 0, ul:num_items() - 1 do
+					local u = ul:item_at(i)
+					local ok, c = pcall(function() return u:unit_commander() end)
+					if ok and c and not c:is_null_interface() and c:command_queue_index() == num(cqi) then gu = u break end
+				end
+			end
+		end)
+		if gu then return se_char_art2(q, num(cqi), key, gu) end
 		return se_char_art2(q, num(cqi), key)
 	end)
 end
