@@ -83,6 +83,10 @@ end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
 local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
 function se.frontend.has(feature)
+	-- Lua-side helpers: present when this module defines them (the DLL embeds the module)
+	if feature == "creator_reapply" then
+		return type(se.creator) == "table" and type(se.creator.reapply) == "function" and type(G("se_faction_name_set")) == "function"
+	end
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
 end
@@ -1360,6 +1364,89 @@ function se.modify.faction_colours_reset(key, group)
 		if not f then return false, e end
 		return se_faction_colours_reset(f, group)
 	end)
+end
+
+-- se.creator.reapply(config) -> { applied = n, failed = { "step key: reason", ... } }
+-- ONE call at every first tick (and once at creation): re-applies what the engine does not keep
+-- across loads. Never errors (each step is pcall'd); refused (failed = {"mp: ..."}) in multiplayer.
+-- Not needed (engine-saved): character names, age, skill tree choice, same-gender art, custom tree
+-- definitions (SE manifest), portraits (files on disk).
+--   config = {
+--     faction = { key = ..., name = ..., flag_dir = ..., campaign_colours = {c1, c2, c3},
+--                 battle_colours = {c1, c2, c3} },            -- each field optional except key
+--     characters = { [cqi] = { art_set = "key" } },           -- safety re-apply (cross-gender)
+--     loc = { ["190e_custom_..."] = "text" },
+--     items = { { slot = ..., look = ..., bundle = ..., effects = {{effect=, scope=, value=}} } },
+--   }
+-- failed strings have a stable form: "<step> <key>: <reason>", step one of faction_name,
+-- faction_flag, campaign_colours, battle_colours, art_set, loc, item_look, item_bundle, config, mp.
+se.creator = se.creator or {}
+function se.creator.reapply(config)
+	local report = { applied = 0, failed = {} }
+	local function step(name, key, f)
+		local ok, r1, r2 = pcall(f)
+		if ok and r1 then
+			report.applied = report.applied + 1
+		else
+			local why = ok and str(r2 or "refused") or str(r1)
+			report.failed[#report.failed + 1] = name .. " " .. str(key) .. ": " .. why
+		end
+	end
+	if type(config) ~= "table" then
+		report.failed[1] = "config -: config must be a table"
+		return report
+	end
+	if creator_mp() then
+		report.failed[1] = "mp -: single player only"
+		return report
+	end
+	local fac = config.faction
+	if type(fac) == "table" and type(fac.key) == "string" then
+		local k = fac.key
+		if type(fac.name) == "string" and fac.name ~= "" then
+			step("faction_name", k, function() return se.modify.faction_name(k, fac.name) end)
+		end
+		if type(fac.flag_dir) == "string" and fac.flag_dir ~= "" then
+			step("faction_flag", k, function() return se.modify.faction_flag(k, fac.flag_dir) end)
+		end
+		if type(fac.campaign_colours) == "table" then
+			local c = fac.campaign_colours
+			step("campaign_colours", k, function() return se.modify.faction_colours(k, "campaign", c[1], c[2], c[3]) end)
+		end
+		if type(fac.battle_colours) == "table" then
+			local c = fac.battle_colours
+			step("battle_colours", k, function() return se.modify.faction_colours(k, "battle", c[1], c[2], c[3]) end)
+		end
+	elseif fac ~= nil then
+		report.failed[#report.failed + 1] = "config faction: needs a key"
+	end
+	if type(config.characters) == "table" then
+		for cqi, c in pairs(config.characters) do
+			if type(c) == "table" and type(c.art_set) == "string" and c.art_set ~= "" then
+				step("art_set", cqi, function() return se.modify.character_art_set(cqi, c.art_set) end)
+			end
+		end
+	end
+	if type(config.loc) == "table" then
+		for k, text in pairs(config.loc) do
+			step("loc", k, function() return se.modify.loc_text(k, text) end)
+		end
+	end
+	if type(config.items) == "table" then
+		for _, it in ipairs(config.items) do
+			if type(it) == "table" and type(it.slot) == "string" then
+				if type(it.look) == "string" and it.look ~= "" then
+					step("item_look", it.slot, function() return se.modify.custom_item_look(it.slot, it.look) end)
+				end
+				if type(it.bundle) == "string" and type(it.effects) == "table" and #it.effects > 0 then
+					step("item_bundle", it.bundle, function() return se.modify.effect_bundle_define(it.bundle, it.effects) end)
+				end
+			end
+		end
+	end
+	log("creator reapply: " .. report.applied .. " applied, " .. #report.failed .. " failed")
+	for _, f in ipairs(report.failed) do log("creator reapply failed: " .. f) end
+	return report
 end
 
 -- se.modify.faction_cosmetics_clear(faction_key) : forget the custom name + flag registration; the
