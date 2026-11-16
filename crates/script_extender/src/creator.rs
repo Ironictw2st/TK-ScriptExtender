@@ -1276,16 +1276,21 @@ unsafe extern "C" fn se_custom_item_look(l: *mut LuaState) -> c_int {
         let rows = table_rows((it.variants)(db) as usize);
         let srows: Vec<usize> = rows.iter().copied().filter(|r| readable(*r, VAR_ROW) && string_at(r + 8, false) == src).collect();
         let drows: Vec<usize> = rows.iter().copied().filter(|r| readable(*r, VAR_ROW) && string_at(r + 8, false) == slot).collect();
-        if srows.is_empty() { return Err(format!("no equipment variant rows for '{src}'")); }
-        if drows.is_empty() { return Err(format!("no equipment variant rows for '{slot}'")); }
-        for (i, d) in drows.iter().enumerate() {
-            let s = srows[i.min(srows.len() - 1)];
-            if rq(*d) != rq(s) { return Err("row types differ; refusing".into()); }
-            if has_heap_string(s, VAR_COPY_FROM, VAR_ROW) { return Err(format!("source row of '{src}' holds text fields in the copied range; refusing")); }
-        }
-        for (i, d) in drows.iter().enumerate() {
-            let s = srows[i.min(srows.len() - 1)];
-            core::ptr::copy_nonoverlapping((s + VAR_COPY_FROM) as *const u8, (d + VAR_COPY_FROM) as *mut u8, VAR_ROW - VAR_COPY_FROM);
+        // Items without a 3D look (accessories, followers) have no variant rows: only the icon is
+        // copied then. A slot WITH variant rows needs a source with variant rows.
+        let mut copied_rows = 0usize;
+        if !drows.is_empty() {
+            if srows.is_empty() { return Err(format!("'{src}' has no equipment variant rows to copy into '{slot}'")); }
+            for (i, d) in drows.iter().enumerate() {
+                let s = srows[i.min(srows.len() - 1)];
+                if rq(*d) != rq(s) { return Err("row types differ; refusing".into()); }
+                if has_heap_string(s, VAR_COPY_FROM, VAR_ROW) { return Err(format!("source row of '{src}' holds text fields in the copied range; refusing")); }
+            }
+            for (i, d) in drows.iter().enumerate() {
+                let s = srows[i.min(srows.len() - 1)];
+                core::ptr::copy_nonoverlapping((s + VAR_COPY_FROM) as *const u8, (d + VAR_COPY_FROM) as *mut u8, VAR_ROW - VAR_COPY_FROM);
+            }
+            copied_rows = drows.len();
         }
         // icon rows
         let urows = table_rows((it.ui_display)(db) as usize);
@@ -1300,7 +1305,8 @@ unsafe extern "C" fn se_custom_item_look(l: *mut LuaState) -> c_int {
             (None, _) => "source has no ui_display row (icon unchanged)",
             (_, None) => "slot has no ui_display row (icon unchanged)",
         };
-        let msg = format!("look of '{src}' copied into '{slot}' ({} variant rows; {icon})", drows.len());
+        if copied_rows == 0 && us.is_none() { return Err(format!("nothing to copy: '{src}' has no look or icon rows")); }
+        let msg = format!("look of '{src}' copied into '{slot}' ({copied_rows} variant rows; {icon})");
         log!("se_custom_item_look: {msg}");
         Ok(msg)
     })();
