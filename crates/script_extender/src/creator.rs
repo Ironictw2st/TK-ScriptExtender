@@ -740,7 +740,17 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
             let v: Vec<String> = map.iter().take(60).map(|(k, _)| k.clone()).collect();
             return Ok(format!("{} art objects: {}", map.len(), v.join(" ")));
         }
-        let Some((_, obj)) = map.iter().find(|(k, _)| *k == key) else { return Err(format!("no art object '{key}' ({} known)", map.len())) };
+        // A key can map to several art objects (one per campaign_character_art_sets row, e.g.
+        // Himiko: subculture '' and 3k_ironic_wa). Prefer the one whose record names the
+        // character's own subculture; fall back to the first.
+        let cands: Vec<&usize> = map.iter().filter(|(k, _)| *k == key).map(|(_, o)| o).collect();
+        if cands.is_empty() { return Err(format!("no art object '{key}' ({} known)", map.len())); }
+        let sub = char_subculture(ch);
+        let pick = if cands.len() > 1 && !sub.is_empty() {
+            cands.iter().copied().find(|o| record_mentions(rq(**o + 0x38), &sub)).unwrap_or(cands[0])
+        } else { cands[0] };
+        let obj = pick;
+        let choice = if cands.len() > 1 { format!(" ({} objects for the key, subculture '{sub}' -> {:#x})", cands.len(), *obj) } else { String::new() };
         // The map only holds art objects (keyed by their own record key), so the entry itself is the
         // type check. The old guard compared the first qword of the two objects, which is not a
         // vtable: it refused valid sets (190e_custom_portrait_2_f, 16 Nov).
@@ -748,7 +758,7 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
             return Err(format!("art object for '{key}' does not read back its key; refusing"));
         }
         core::ptr::write_unaligned((ch + 0x548) as *mut usize, *obj);
-        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'");
+        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'{choice}");
         log!("se_char_art2: {msg}");
         Ok(msg)
     })();
@@ -757,6 +767,33 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
         Err(er) => { log!("se_char_art2: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
+}
+
+/// Subculture key of the character's faction: FACTION = **(CHARACTER+0x270), factions record at
+/// FACTION+0xbf0, subculture record at record+0x20, key at +8 (skill tree builder arguments).
+unsafe fn char_subculture(ch: usize) -> String {
+    let fp = rq(ch + 0x270);
+    if fp == 0 || !readable(fp, 8) { return String::new(); }
+    let f = rq(fp);
+    if f == 0 || !readable(f + F_RECORD, 8) { return String::new(); }
+    let rec = rq(f + F_RECORD);
+    if rec == 0 || !readable(rec + 0x20, 8) { return String::new(); }
+    let sr = rq(rec + 0x20);
+    if sr == 0 || !readable(sr, 0x20) { return String::new(); }
+    string_at(sr + 8, false)
+}
+
+/// true when an art-set record holds `want` as a String or as a record pointer whose key (+8) is it
+unsafe fn record_mentions(rec: usize, want: &str) -> bool {
+    if rec == 0 || !readable(rec, 0xc0) { return false; }
+    let mut o = 0x20usize;
+    while o < 0xc0 {
+        if string_at(rec + o, false) == want { return true; }
+        let p = rq(rec + o);
+        if p > 0x10000 && readable(p, 0x20) && string_at(p + 8, false) == want { return true; }
+        o += 8;
+    }
+    false
 }
 
 /// se_char_birth_get(q_char, cqi) -> birth_year | nil, msg  (CHARACTER+0x4e0 i32, read only)
