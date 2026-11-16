@@ -127,14 +127,18 @@ fn fit(src: &Rgba, tw: u32, th: u32) -> Vec<u8> {
                     let px = xx.clamp(0, src.w as i64 - 1) as usize;
                     let py = yy.clamp(0, src.h as i64 - 1) as usize;
                     let i = (py * src.w as usize + px) * 4;
-                    for c in 0..4 { acc[c] += src.px[i + c] as f64; }
+                    let a = src.px[i + 3] as f64;
+                    for c in 0..3 { acc[c] += src.px[i + c] as f64 * a; }
+                    acc[3] += a;
                     cnt += 1.0;
                     xx += 1;
                 }
                 yy += 1;
             }
             let o = ((y * tw + x) * 4) as usize;
-            for c in 0..4 { out[o + c] = (acc[c] / cnt.max(1.0)).round() as u8; }
+            // premultiplied average: colour weighted by alpha, alpha averaged; fully clear -> 0,0,0,0
+            if acc[3] > 0.0 { for c in 0..3 { out[o + c] = (acc[c] / acc[3]).round().min(255.0) as u8; } }
+            out[o + 3] = (acc[3] / cnt.max(1.0)).round() as u8;
         }
     }
     out
@@ -158,6 +162,36 @@ fn write_png_c(path: &PathBuf, w: u32, h: u32, px: &[u8], comment: Option<&str>)
     }
     let mut wr = enc.write_header().map_err(|e| e.to_string())?;
     wr.write_image_data(px).map_err(|e| e.to_string())
+}
+
+const COMP: u32 = 1200;
+
+/// Place the picture's visible part (alpha bbox) on a transparent 1200 x 1200 canvas like a vanilla
+/// composite: width ~480 px (vanilla figures 410-560), top at y 100, centred at x 600.
+fn compose(src: &Rgba) -> Vec<u8> {
+    let (w, h) = (src.w as usize, src.h as usize);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h { for x in 0..w {
+        if src.px[(y * w + x) * 4 + 3] > 16 { x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x + 1); y1 = y1.max(y + 1); }
+    } }
+    if x1 <= x0 || y1 <= y0 { (x0, y0, x1, y1) = (0, 0, w, h); }
+    let (bw, bh) = (x1 - x0, y1 - y0);
+    let mut crop = Vec::with_capacity(bw * bh * 4);
+    for y in y0..y1 { crop.extend_from_slice(&src.px[(y * w + x0) * 4..(y * w + x1) * 4]); }
+    let crop = Rgba { w: bw as u32, h: bh as u32, px: crop };
+    let mut s = 480.0 / bw as f64;
+    if bh as f64 * s > 1080.0 { s = 1080.0 / bh as f64; }
+    let (tw, th) = (((bw as f64 * s).round() as u32).clamp(1, COMP), ((bh as f64 * s).round() as u32).clamp(1, COMP - 100));
+    let pic = fit(&crop, tw, th);
+    let mut out = vec![0u8; (COMP * COMP * 4) as usize];
+    let ox = (COMP - tw) / 2;
+    let oy = 100u32;
+    for y in 0..th {
+        let d = (((oy + y) * COMP + ox) * 4) as usize;
+        let s0 = (y * tw * 4) as usize;
+        out[d..d + (tw * 4) as usize].copy_from_slice(&pic[s0..s0 + (tw * 4) as usize]);
+    }
+    out
 }
 
 /// The 3K character art layout (sizes from the shipped art, e.g. 3k_dlc05_hero_special_metal_lu_ji).
@@ -280,11 +314,19 @@ fn install_into(file: &PathBuf, slot: i64) -> Result<(), String> {
             write_png(&d.join("large").join(&png_name), *lw, *lh, &fit(&img, *lw, *lh))?;
             n += 2;
         }
-        let comp = fit(&img, 1300, 1300);
+        // Composites in the shipped layout (e.g. 3k_main_hero_special_bao_xin_metal): 1200 x 1200
+        // cut-out, figure centred at x 600 with its top near y 100, ONE file noanim.png per mood
+        // folder carrying one Comment that lists all three moods (y:80). The round HUD / advisor
+        // portraits crop the head area of this canvas, so the picture must sit where vanilla heads do.
+        let comp = compose(&img);
+        let comment = "[type:angry;x:0;y:80;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]\
+[type:happy;x:0;y:80;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]\
+[type:norm;x:0;y:80;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]\n";
         for panel in ["large_panel", "small_panel"] {
             for mood in ["norm", "happy", "angry"] {
-                let comment = format!("[type:{mood};x:0;y:0;z-order:0;pivot_x:0.5000;pivot_y:0.5000;]");
-                write_png_c(&base.join("composites").join(panel).join(mood).join(format!("{mood}.png")), 1300, 1300, &comp, Some(&comment))?;
+                let d = base.join("composites").join(panel).join(mood);
+                let _ = std::fs::remove_file(d.join(format!("{mood}.png"))); // pre-creator.18 name
+                write_png_c(&d.join("noanim.png"), COMP, COMP, &comp, Some(comment))?;
                 n += 1;
             }
         }
@@ -309,6 +351,17 @@ mod tests {
         assert!(hay.contains("tEXtComment\u{0}[type:norm;"), "no tEXt Comment chunk");
         let dec = decode(&{ let q = std::env::temp_dir().join("se_portrait_test_rt.png"); std::fs::write(&q, &bytes).unwrap(); q }).unwrap();
         assert_eq!((dec.w, dec.h), (13, 13));
+        // compose: opaque 100x50 block on a clear 200x200 -> 480 wide, top at y 100, centred
+        let mut px = vec![0u8; 200 * 200 * 4];
+        for y in 20..70 { for x in 50..150 { let i = (y * 200 + x) * 4; px[i..i + 4].copy_from_slice(&[10, 20, 30, 255]); } }
+        for i in (0..px.len()).step_by(4) { if px[i + 3] == 0 { px[i..i + 3].copy_from_slice(&[250, 250, 250]); } }
+        let c = compose(&Rgba { w: 200, h: 200, px });
+        let at = |x: u32, y: u32| { let i = ((y * COMP + x) * 4) as usize; [c[i], c[i + 1], c[i + 2], c[i + 3]] };
+        assert_eq!(at(600, 99)[3], 0);
+        assert_eq!(at(600, 101), [10, 20, 30, 255]);
+        assert_eq!(at(361, 200), [10, 20, 30, 255]);
+        assert_eq!(at(355, 200)[3], 0);
+        assert_eq!(at(600, 400)[3], 0); // 50 px * 4.8 = 240 tall -> ends at y 340
         assert!(valid_name("se test portrait.png") && !valid_name("..\\x.png") && !valid_name("a/b.png") && !valid_name("x.dds"));
     }
 }
