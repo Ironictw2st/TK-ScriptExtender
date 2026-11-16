@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", loc_text = "se_loc_set" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
@@ -99,6 +99,24 @@ function se.frontend.list_custom_portraits()
 	for name in string.gmatch(s, "[^|]+") do out[#out + 1] = name end
 	return out
 end
+-- se.frontend.define_custom_skill_tree(cells, class_key) -> "190e_custom_skillset_<nn>", nn | nil, msg
+-- cells = { { layout_index (1..18), skill_key }, ... }. The SE allocates the slot: the same cells
+-- reuse their slot, new cells get a never-used slot, a used slot is never redefined (64 slots).
+-- Apply in the campaign with se.modify.character_skill_tree(cqi, "190e_custom_skillset_<nn>").
+function se.frontend.define_custom_skill_tree(cells, class_key)
+	local f = G("se_custom_skill_tree_define")
+	if type(f) ~= "function" then return nil, "native se_custom_skill_tree_define is not available" end
+	if type(cells) ~= "table" then return nil, "cells must be a table" end
+	local parts = {}
+	for _, c in ipairs(cells) do
+		if type(c) ~= "table" then return nil, "each cell must be { layout_index, skill_key }" end
+		local i, k = num(c[1] or c.layout_index), c[2] or c.skill_key
+		if not i or type(k) ~= "string" then return nil, "each cell must be { layout_index, skill_key }" end
+		parts[#parts + 1] = string.format("%d=%s", i, k)
+	end
+	return f(table.concat(parts, ","), type(class_key) == "string" and class_key or "")
+end
+
 -- se.frontend.install_custom_portrait(file_name) -> art_key ("190e_custom_portrait_<slot>"), slot | nil, msg
 -- Writes the scaled character art folder as loose files under ...\ThreeKingdoms\maps\ui\characters\.
 -- The SE picks the slot: the same picture reuses its slot, a new picture gets a never-used slot, a
@@ -1406,6 +1424,18 @@ function se.modify.character_skill_tree(cqi, key)
 		if not q then return false, e end
 		return se_skill_tree_set(q, num(cqi), key)
 	end)
+end
+
+-- S7 items: se.modify.custom_item_look(slot_ceo_key, source_ceo_key) -> ok, msg
+-- Copies an existing item's look (equipment variant rows + icon) into a 190e_custom_ item slot.
+-- In-process DB rewrite: re-apply every session (first tick), before the item is shown or equipped.
+function se.modify.custom_item_look(slot_key, source_key)
+	local okn, err = need("se_custom_item_look")
+	if not okn then return false, err end
+	if creator_mp() then return false, "custom_item_look: single player only" end
+	local f, e = any_faction_q()
+	if not f then return false, e end
+	return se_custom_item_look(f, slot_key, source_key)
 end
 
 -- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);
