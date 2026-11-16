@@ -726,6 +726,7 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let cqi = (api.tointeger)(l, 2) as u32;
     let key = lua::to_str(l, 3);
+    let mode = if (api.gettop)(l) >= 4 { lua::to_str(l, 4) } else { String::new() };
     let out = (|| -> Result<String, String> {
         let ch = character(l, cqi)?;
         let model = rq(rq(ch + 0x250) + 0x78);
@@ -745,7 +746,8 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
             return Err("art object type differs; refusing".into());
         }
         core::ptr::write_unaligned((ch + 0x548) as *mut usize, *obj);
-        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'");
+        let card = card_mode(ch, &key, &mode);
+        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'; {card}");
         log!("se_char_art2: {msg}");
         Ok(msg)
     })();
@@ -754,6 +756,36 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
         Err(er) => { log!("se_char_art2: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
+}
+
+// Unit-card / HUD portrait mode (live read 16 Nov, notes/creator_spikes.md "HUD card"):
+//   CcoCampaignCharacter.ArtContext.CardImage = FUN_142ea49e0(DETAILS): when the byte
+//   *(*(CHARACTER+0x668)+0xa5) is set the card is composed from the equipped armour's
+//   ceo_to_ui_display still (historical men: 1); when clear the art set's own card is used
+//   (historical women: 0). The +0x668 object is per character (its +0x18 points back to the
+//   CHARACTER). A generic-template spawn has it set, so a unique art set (women's sets, the
+//   creator's custom portraits) shows a body-armour card with an empty face.
+// mode: "" / "auto" = clear for a female character (+0x570 object byte +0x80 == 0) or a
+// 190e_custom_portrait set, else leave as is; "unique" = clear; "composite" = set; "keep".
+const CH_CARD_OBJ: usize = 0x668;
+const CARD_COMPOSITE: usize = 0xa5;
+unsafe fn card_mode(ch: usize, key: &str, mode: &str) -> String {
+    let o = rq(ch + CH_CARD_OBJ);
+    if o == 0 || !readable(o, 0xb0) || rq(o + 0x18) != ch { return "card mode: object not found (unchanged)".into(); }
+    let before = *((o + CARD_COMPOSITE) as *const u8);
+    let g = rq(ch + 0x570);
+    let female = g != 0 && readable(g + 0x80, 1) && *((g + 0x80) as *const u8) == 0;
+    let want: Option<u8> = match mode {
+        "keep" => None,
+        "unique" => Some(0),
+        "composite" => Some(1),
+        _ => if female || key.contains("190e_custom_portrait") { Some(0) } else { None },
+    };
+    match want {
+        Some(v) if v != before => { *((o + CARD_COMPOSITE) as *mut u8) = v; format!("card {}", if v == 0 { "unique (art set card)" } else { "composite (armour)" }) }
+        Some(_) => format!("card {} (unchanged)", if before == 0 { "unique" } else { "composite" }),
+        None => format!("card {} (kept)", if before == 0 { "unique" } else { "composite" }),
+    }
 }
 
 /// se_char_birth_get(q_char, cqi) -> birth_year | nil, msg  (CHARACTER+0x4e0 i32, read only)
