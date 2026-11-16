@@ -36,6 +36,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
 | 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock; beta.2: UI dev loader, `.twui.xml` + Lua from disk with rebuild on save (`se.ui.open`, §3.22; cfg `ui_dev_loader`), refused in multiplayer |
 | 0.49 (pre-release, branch feat/creator) | character and faction creator (§3.23, single player): character names / art / age / skill trees, custom skill trees, player portraits, faction name / flag / colours (Faction Color Editor folded in), item names / looks, `se.creator.reapply`; registration of the natives into every Lua state no longer stops after 16 states |
+| 0.49 (local trial) | battle fixes by Alex Zhao, with technical help from Wyccc (§3.24; nine cfg keys `battle_*`, all in the version lock): elephants attack gates, shield / spear walls hold and go 60 wide, circle / squares block missiles from all sides and ignore flank morale, wider Cantabrian circle, fire-at-will shoots enemies in melee, missiles spread across the target unit; `se.modify.battle_fixes`, `se.diag.battle_fixes` |
 
 ---
 
@@ -1863,8 +1864,6 @@ core:add_listener("test_panel_click", "ComponentLClickUp",
 return function() ModLog("test_panel closing") end
 ```
 
----
-
 ### 3.23 Character and faction creator (DLL 0.49 pre-release, single player)
 
 The building blocks behind 190E's "Create your Character / Faction". Every `se.modify.*` here is
@@ -2004,6 +2003,52 @@ cm:add_first_tick_callback(function()
     local r = se.creator.reapply(cfg)
     for _, f in ipairs(r.failed) do ModLog("creator: " .. f) end
 end)
+```
+
+### 3.24 Battle fixes (DLL 0.49+)
+
+Alex Zhao's battle-fix mods (Elephant Attack Gate Fix, Better Formation Behaviors, Ranged Target Acquisition Fix),
+with technical help from Wyccc, rebuilt inside the script extender with his permission. They change the battle
+simulation, so they apply to the AI as well as the player.
+
+There are nine fixes. Each has a `script_extender.cfg` key, `battle_<name>`, default `1`, and every key is in the
+version lock (§4b). A key decides whether the fix is **installed** for the session; a fix whose key is `0` is never
+patched. An installed fix also has a run-time switch: it starts on and the 190E MCT page drives it.
+
+| name | what it does |
+|---|---|
+| `elephant_gate` | elephants attack gates |
+| `shieldwall_hold` | shield and spear walls do not drop the formation after melee |
+| `shieldwall_width` | shield and spear walls up to 60 men wide (vanilla 22) |
+| `charge_hold` | a wall keeps formation through a charge and halts to re-form after it |
+| `turtle_missile_block` | circle, hollow square and square block missiles from every side |
+| `turtle_flank_immunity` | no flank or rear morale penalty in those formations |
+| `cantabrian` | Cantabrian circle: distance 30 (vanilla 5), radius 32 (vanilla 28) |
+| `ranged_melee_targets` | archers on fire-at-will keep shooting enemies in melee with friendlies |
+| `ranged_spread_targets` | missiles spread across the target unit instead of the nearest men |
+
+`se.modify.battle_fixes(t) -> results | nil, err`
+: `t` is `{ <name> = true | false, ... }`. `results[name]` is `true` (changed), `"unchanged"`, or a reason string,
+  e.g. `"shieldwall_width is not installed this session (off (battle_shieldwall_width=0))"`.
+  - It takes effect from the **next battle**: call it from the campaign or the main menu. It is refused while a
+    battle is loaded (a change mid-battle would desync multiplayer).
+  - In multiplayer every machine must use the same values. The 190E consumer applies them at campaign load from
+    the host's settings.
+
+`se.diag.battle_fixes() -> table`
+: `{ <name> = installed?, <name>_on = switched on?, <name>_state = "installed" | "off (...)" | "inert: <why>" }`,
+  plus counters of how often each fix acted:
+  - `ele_passed`, `cancel_suppressed`, `width_set`, `cq_not_charging`, `cu_halts`, `af_blocked`, `morale_ignored`;
+  - for the spread filter: `sp_calls`, `sp_accepts`, `sp_rejects`, `sp_forced`, `sp_resets`, `sp_k`.
+
+A fix is reported `inert` and left alone when Alex Zhao's own DLL for it is already loaded, or when the game's bytes
+are not the expected ones. Players should unsubscribe from the Workshop originals.
+
+```lua
+-- main menu or campaign: switch two fixes off from the next battle, then check
+local r = se.modify.battle_fixes({ turtle_flank_immunity = false, cantabrian = false })
+local d = se.diag.battle_fixes()
+ModLog("flank immunity: " .. tostring(r.turtle_flank_immunity) .. ", now on = " .. tostring(d.turtle_flank_immunity_on))
 ```
 
 ---
@@ -2369,6 +2414,15 @@ values optionally quoted; an unknown key is logged and ignored.
 | `siege_force_assault` | `1` (DLL 0.46.0-siege.2+) | AI besiegers assault when the odds are good (§4e); single player only; in the version lock; `0` = vanilla |
 | `siege_odds_gate` | `0` (DLL 0.46.0-siege.1+; opt-in since siege.5) | experimental: replaces the AI's flat 50 % "wait" roll with an odds-scaled one; **known crash, leave it off**; in the version lock |
 | `siege_odds_bands` | `1.5:25,3:10,6:2.5` | bands for `siege_odds_gate` (odds:refuse-%); in the version lock |
+| `battle_elephant_gate` | `1` (DLL 0.49+) | elephants attack gates (§3.24); in the version lock; `0` = not installed |
+| `battle_shieldwall_hold` | `1` (DLL 0.49+) | shield / spear walls hold after melee (§3.24); in the version lock; `0` = not installed |
+| `battle_shieldwall_width` | `1` (DLL 0.49+) | shield / spear walls up to 60 wide (§3.24); in the version lock; `0` = not installed |
+| `battle_charge_hold` | `1` (DLL 0.49+) | walls hold through a charge, then halt (§3.24); in the version lock; `0` = not installed |
+| `battle_turtle_missile_block` | `1` (DLL 0.49+) | circle / squares block missiles from every side (§3.24); in the version lock; `0` = not installed |
+| `battle_turtle_flank_immunity` | `1` (DLL 0.49+) | circle / squares: no flank or rear morale penalty (§3.24); in the version lock; `0` = not installed |
+| `battle_cantabrian` | `1` (DLL 0.49+) | wider Cantabrian circle (§3.24); in the version lock; `0` = not installed |
+| `battle_ranged_melee_targets` | `1` (DLL 0.49+) | fire-at-will keeps shooting enemies in melee (§3.24); in the version lock; `0` = not installed |
+| `battle_ranged_spread_targets` | `1` (DLL 0.49+) | missiles spread across the target unit (§3.24); in the version lock; `0` = not installed |
 | `save_chunking` | `1` | saved values larger than 64 KiB are saved in chunks (§3.19); `0` = vanilla behaviour |
 | `marriage_inlaws` | `1` | relatives by marriage may marry (§3.20); `0` = the engine's rule |
 | `marriage_blood_generations` | `0` | with `marriage_inlaws=1`: blood relatives sharing an ancestor within this many generations may not marry (0..6; 0 = only the engine's close-kin rule) |
@@ -2627,6 +2681,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.modify.followup_propose()` | queue the engine's propose for the follow-up negotiation popup on screen |
 | `se.ui.fix_followup_button()` | repair the dead MEDIATE PEACE button (1.7.2.0); automatic from 0.44.0-beta.2, limited to the follow-up popup from 0.45.0 |
 | `se.dilemma.choice_key(context)` | real choice key of a `DilemmaChoiceMadeEvent` click (also `choice_order`, `choice`) |
+| `se.diag.battle_fixes()` | battle-fix state per fix and how often each acted (§3.24) |
 | `se.diag.diplomacy_mark(label)` | time marker inside the diplomacy validation trace |
 | `se.diag.diplomacy_report()` | write dip_trace.txt, log the blocked evaluations |
 | `se.diag.diplomacy_trace(on [, include_ai])` | record the engine's treaty-component validations |
@@ -2651,6 +2706,7 @@ Every function the module defines. Optional arguments in `[ ]`; §3 has the deta
 | `se.modify.building_damage(region, slot, percent)` | damage a building |
 | `se.modify.building_destroy(region, slot)` | destroy a building |
 | `se.modify.building_repair(region, slot [, opts])` | repair a building (opts.free) |
+| `se.modify.battle_fixes(t)` | switch installed battle fixes on / off from the next battle (§3.24) |
 | `se.modify.cai_personality(faction, personality)` | swap an AI faction's CAI personality |
 | `se.modify.character_add_xp(cqi, n [, scaled])` | add exact or engine-scaled experience |
 | `se.modify.disband(cqi, slot)` | empty a retinue slot |
