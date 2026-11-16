@@ -19,15 +19,31 @@
     Please unsubscribe from the Workshop originals; they are included here.
   - `se.diag.battle_fixes()` reports each fix's state and counters; `se.modify.battle_fixes{...}` switches the
     fixes at run time (never during a battle).
-- **190E character / faction creator support** (feat/creator S1-S8):
-  - Frontend natives (`se.frontend.*`) and character names.
-  - Faction names and flags; the faction cosmetics refresh keeps them (cfg `creator_cosmetics`, default 1).
-  - Faction colours (campaign record and battle uniform).
-  - Character art sets and art objects, and the birth year.
-  - Player portraits (SE-owned slots, scaled loose art, PNG placement chunk).
-  - Loc text for `190e_custom_` keys.
-  - Item look probe and skill-tree node-set swap.
-  - Natives register once per Lua VM via a registry marker, replacing the old 16-state pointer list.
+- **Character and faction creator natives**: everything in the feat/creator 0.49.0 entry below.
+
+## 0.49.0 (unreleased; branch feat/creator, test builds 0.49.0-creator.N)
+
+- **Character and faction creator natives** (190E "Create your Character / Faction"; single player only,
+  refused in multiplayer; `docs/SCRIPTING.md` §3.23):
+  - characters: `se.modify.character_name_part` (the engine's own custom-name command, saved),
+    `character_art_set` (art set by key; portrait + campaign model live, saved by key),
+    `character_age` (birth year, saved), `character_skill_tree` (rebuild from any node set with the
+    engine builder, saved by key);
+  - custom skill trees: `se.frontend.define_custom_skill_tree` (64 slots, SE-owned allocation, a slot in
+    use is never redefined); a detour on the skill tree builder writes the chosen skills before any
+    tree is built (cfg `creator_skill_trees`, in the version lock);
+  - player portraits: `se.frontend.list_custom_portraits` / `install_custom_portrait` (one PNG scaled
+    into a full character art folder as loose files in the user maps folder; 64 slots, never overwritten);
+  - factions: `se.modify.faction_name`, `faction_flag`, `faction_colours` (campaign + battle) and
+    `faction_cosmetics_clear`; a detour on the faction cosmetics refresh keeps registered values through
+    the engine's recomputes (cfg `creator_cosmetics`; cosmetic, not in the version lock);
+  - items: `se.modify.loc_text` (only `190e_custom_` keys), `custom_item_look`;
+  - `se.creator.reapply(config)`: one first-tick call for everything that is not saved by the engine;
+  - `se.frontend.available / version / has(feature)` work in the main menu.
+- **Faction colours based on Alex Zhao's Faction Color Editor** (Workshop 3839399323, used with
+  permission): its DLL functions are now SE natives, so 190E ships no separate DLL.
+- Native registration into Lua states is keyed on a registry marker instead of a list that stopped
+  after 16 states (coroutines counted as states; a reused state address skipped a new VM).
 
 ## 0.48.1 (unreleased; branch fix/guards-1112, test builds 0.48.1-test.N)
 

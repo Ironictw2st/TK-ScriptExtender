@@ -35,6 +35,7 @@ compares versions as dotted integers, so **0.40 > 0.37 > 0.4**.
 | **0.45** | the current stable release: everything in 0.44, plus a fix for 0.44.0-beta.2, where the automatic MEDIATE PEACE repair also caught clicks in the ordinary diplomacy screen and sent a deal the moment an item was added ("deal rejected", no room to negotiate) |
 | 0.46 (pre-release) | beta.1: fix for completed missions being issued again after a load (0.42 - 0.45; §3.19); repair of the dead ACCEPT / REJECT of the emperor holder's "Issue Ultimatum" when the player is the recipient (`se.modify.followup_respond`, cfg `followup_respond_hook`); beta.2: the listener recognises the popup through the game's `UIComponent` (a callable table), so it also answers a click reported on a button's label; beta.3: no crash from right-clicking an item card when the character joined or left the faction while their character panel was open (`se.ui.fix_ceo_panel`, cfg `ceo_ui_refresh`) |
 | 0.47 (pre-release) | beta.1: Wwise audio for Lua jukeboxes (`se.audio`, §3.21; cfg `audio`): post events on the extender's own game object, pause / keep paused the game's music, stop on loading screens; local only, not in the version lock; beta.2: UI dev loader, `.twui.xml` + Lua from disk with rebuild on save (`se.ui.open`, §3.22; cfg `ui_dev_loader`), refused in multiplayer |
+| 0.49 (pre-release, branch feat/creator) | character and faction creator (§3.23, single player): character names / art / age / skill trees, custom skill trees, player portraits, faction name / flag / colours (Faction Color Editor folded in), item names / looks, `se.creator.reapply`; registration of the natives into every Lua state no longer stops after 16 states |
 
 ---
 
@@ -1860,6 +1861,149 @@ core:add_listener("test_panel_click", "ComponentLClickUp",
   function(context) return context.string == "round_small_button" end,
   function() ModLog("clicked") end, true)
 return function() ModLog("test_panel closing") end
+```
+
+---
+
+### 3.23 Character and faction creator (DLL 0.49 pre-release, single player)
+
+The building blocks behind 190E's "Create your Character / Faction". Every `se.modify.*` here is
+**single player only**: in multiplayer it returns `false, "...: single player only"`. Check what a
+DLL has with `se.frontend.has(feature)` (feature names in each entry) before you offer a feature.
+
+Which changes the engine keeps by itself, and which must be re-applied at every first tick:
+
+| Change | Kept across save / load by | Re-apply each session? |
+|---|---|---|
+| character name, age, skill tree choice | the engine (saved) | no |
+| art set, same gender | the engine (saved by key) | no (safe to repeat) |
+| art set, other gender than the character's template | — (re-rolled at load) | yes |
+| faction name, flag, campaign colours | the SE (cosmetics refresh, this game session) | yes, once per game session |
+| battle colours, loc text, item looks, item bundle values | nothing (in-process DB data) | yes |
+| custom skill trees, player portraits | the SE's own files in the user folder | no |
+
+`se.creator.reapply(config)` does the "yes" rows in one call.
+
+#### Frontend (main menu; no `cm` needed)
+
+##### `se.frontend.available() -> bool`, `se.frontend.version() -> string`, `se.frontend.has(feature) -> bool`
+
+`available()` is true when the natives are registered and the DLL accepted the game build. Feature
+names: `character_name`, `character_art`, `character_age`, `faction_name`, `faction_flag`,
+`faction_colours`, `custom_portraits`, `skill_trees`, `custom_skill_trees`, `custom_item_look`,
+`loc_text`, `creator_reapply`. Since 0.49.
+
+##### `se.frontend.list_custom_portraits() -> { "name.png", ... } | nil, message`
+
+PNG files in `%APPDATA%\The Creative Assembly\ThreeKingdoms\190E_portraits\` (the folder is created
+when missing). Names of 1-64 characters `[A-Za-z0-9 _-.]` ending in `.png`, up to 16 MB and
+4096 x 4096; subfolders and anything else are ignored. Since 0.49.
+
+##### `se.frontend.install_custom_portrait(file_name) -> art_key, slot | nil, message`
+
+Scales one picture into a complete character art folder (portrait, half-body, mini, unit card,
+bobblehead, the three panel moods) as loose files in the game's user maps folder, and returns
+`"190e_custom_portrait_<n>", n`. The SE owns the 64 slots: the same picture gets its slot back, a
+new picture a never-used slot, a slot already used (an older campaign may show it) is never
+overwritten. Show it at once with
+`SetImagePath("ui/characters/190e_custom_portrait_<n>/stills/halfbody_large/190e_custom_portrait_<n>.png")`.
+In a campaign the character needs an art set whose portrait folder is that key (pack data) and
+`se.modify.character_art_set`. Since 0.49.
+
+##### `se.frontend.define_custom_skill_tree(cells, class_key) -> node_set_key, slot | nil, message`
+
+`cells = { { layout_index, skill_key }, ... }` with layout_index 1..18 of the creator's fixed tree
+layout; nodes you leave out keep the layout's default skill. Returns
+`"190e_custom_skillset_<nn>", nn` (64 slots, same rules as portraits). The SE writes the chosen skills
+into the slot's tree before the game builds any tree (also while a save loads), from its own file
+`190e_custom_skilltrees.txt` in the user folder. Give the slot to a character with
+`se.modify.character_skill_tree`. cfg `creator_skill_trees` (default on, in the version lock).
+Since 0.49.
+
+#### Characters
+
+##### `se.modify.character_name_part(cqi, part, text) -> ok, message`
+
+`part` 0 forename, 1 surname, 2 courtesy name; up to 48 characters. What the game's own rename
+command does; saved by the engine. `get_forename()` / `get_surname()` return `""` for a renamed
+part (they return names-table keys). Since 0.49. `se.query.character_names(cqi)` dumps the parts.
+
+##### `se.modify.character_art_set(cqi, art_set_key) -> ok, message`
+
+Any art set the game has loaded (historical, generic, mod sets). Portrait and campaign model change
+at once. Saved by key; the game re-checks it against the character's gender at load and picks
+another set when it does not fit, so spawn the character from a template of the wanted gender and
+keep the art set in your first-tick re-apply. `se.query.character_art(cqi)` reports the current
+set. Since 0.49.
+
+##### `se.modify.character_age(cqi, years) -> ok, message`
+
+1..120; moves the birth year so `age()` reads `years` now. Saved by the engine. Since 0.49.
+
+##### `se.modify.character_skill_tree(cqi, node_set_key) -> ok, message`
+
+Rebuilds the character's tree from another skill node set (any class tree, a historical hero's,
+a mod's, or a custom slot) with the game's own builder. Saved by key. Use it when the character is
+created: the rebuild resets points spent in the old tree. `se.query.skill_tree_layout(cqi)` lists
+the node set and node skills. Since 0.49.
+
+#### Factions
+
+##### `se.modify.faction_name(faction_key, text [, mode]) -> ok, message`
+
+Free-text display name (header, diplomacy, tooltips, map labels). The game recomputes faction
+names at load and on leader changes; the SE re-asserts a registered name after every recompute
+for the rest of the game session (cfg `creator_cosmetics`). Register it again at first tick after a
+game restart. `text = ""` removes the name. Since 0.49.
+
+##### `se.modify.faction_flag(faction_key, flag_dir [, c1, c2, c3]) -> ok, message`
+
+UI / campaign flag folder, e.g. `"data\\ui\\flags\\3k_main_faction_cao_cao"`, and optionally the
+three flag-block colours `{r, g, b}` (0..255). Same persistence as the name. Battle banners keep the
+faction's own flag. Since 0.49.
+
+##### `se.modify.faction_colours(faction_key, "campaign" | "battle", c1, c2 [, c3]) -> ok, message`
+
+`se.query.faction_colours(key, group) -> { {r,g,b}, {r,g,b}, {r,g,b} }`,
+`se.modify.faction_colours_reset(key, group)`. Campaign colours show at once and stay through a
+reload in the same game session; battle (uniform) colours apply from the next battle. Based on Alex
+Zhao's Faction Color Editor. Since 0.49.
+
+`se.modify.faction_cosmetics_clear(faction_key)` forgets the registered name / flag / colours.
+
+#### Items and text
+
+##### `se.modify.loc_text(key, text) -> ok, message`, `se.query.loc_text(key) -> text`
+
+Writes the game's localised text for keys containing `190e_custom_` only (any key can be read).
+Lasts until the game exits. Since 0.49.
+
+##### `se.modify.custom_item_look(slot_ceo_key, source_ceo_key) -> ok, message`
+
+Gives a `190e_custom_` item slot the look (3D equipment rows, icon) of an existing item. Lasts until
+the game exits; re-apply before the item is shown. Since 0.49.
+
+Item stats use `se.modify.effect_bundle_define` (§3.10) on the slot's bundle; the bundle stays on
+the character through save / load, its values must be redefined every session.
+
+#### `se.creator.reapply(config) -> { applied = n, failed = { "step key: reason", ... } }`
+
+One call at every first tick (and once after creating the character) for everything in the "yes"
+rows above. Never raises an error. Since 0.49.
+
+```lua
+cm:add_first_tick_callback(function()
+    if not (se and se.frontend.has("creator_reapply")) then return end
+    local cfg = { -- read back from cm:get_saved_value by your mod
+        faction = { key = "3k_190e_custom_han_1", name = "Riverland Pact",
+                    flag_dir = "data\\ui\\flags\\3k_main_faction_cao_cao",
+                    campaign_colours = { {200, 20, 20}, {15, 15, 15} } },
+        characters = { [2126] = { art_set = "3k_dlc05_art_set_historical_lady_mi_general" } },
+        loc = { ["ceo_nodes_title_190e_custom_weapon_refined"] = "Starfall Halberd" },
+    }
+    local r = se.creator.reapply(cfg)
+    for _, f in ipairs(r.failed) do ModLog("creator: " .. f) end
+end)
 ```
 
 ---
