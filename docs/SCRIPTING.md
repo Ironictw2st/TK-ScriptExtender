@@ -1943,9 +1943,10 @@ set. Since 0.49.
 
 `card` sets how the unit card and the HUD leader portrait are drawn. The game composes them from
 the equipped armour for characters spawned from a generic template (and for historical men), and
-uses the art set's own card for historical women. `"auto"` (default) switches to the art set's own
-card for women and for `190e_custom_portrait` sets, otherwise leaves the character as it is;
-`"unique"`, `"composite"` and `"keep"` force it.
+uses the art set's own card for historical women. `"auto"` (default): `190e_custom_portrait` sets
+and other unique sets on a woman get the art set's own card; generic sets (`_art_set_generic_`,
+both genders: their card is a face piece for the armour composite) get the composite; historical
+men are left as they are. `"unique"`, `"composite"` and `"keep"` force it.
 
 ##### `se.modify.character_age(cqi, years) -> ok, message`
 
