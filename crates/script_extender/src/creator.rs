@@ -722,9 +722,6 @@ unsafe fn art_map(model: usize) -> Vec<(String, usize)> {
 
 /// se_char_art2(q_char, cqi, key) -> ok, msg ; key "" reports; "?list" lists the first keys;
 /// otherwise sets CHARACTER+0x548 to the art object with that key.
-/// Art object copy in the general's unit (UNIT+0x18 is the display object, its +0x68 the art).
-const GU_ART: usize = 0x80;
-
 unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
     let Some(api) = lua::api() else { return 0 };
     let cqi = (api.tointeger)(l, 2) as u32;
@@ -751,26 +748,7 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
             return Err(format!("art object for '{key}' does not read back its key; refusing"));
         }
         core::ptr::write_unaligned((ch + 0x548) as *mut usize, *obj);
-        // The general's own unit keeps a copy of the art object (army-panel general card,
-        // FUN_142e84e20 -> FUN_141a520d0(unit+0x18) reads +0x68 = unit+0x80). Replace it only when
-        // it holds exactly the old art object.
-        let mut unit_note = String::from("no general unit given");
-        if (api.gettop)(l) >= 4 {
-            match crate::units::unit_from_arg(l, 4) {
-                Ok(u) if readable(u + GU_ART, 8) => {
-                    let ua = rq(u + GU_ART);
-                    if ua == cur && cur != 0 {
-                        core::ptr::write_unaligned((u + GU_ART) as *mut usize, *obj);
-                        unit_note = "general unit art updated".into();
-                    } else {
-                        unit_note = format!("general unit +0x80 holds {ua:#x}, not the old art object (unchanged)");
-                    }
-                }
-                Ok(_) => unit_note = "general unit not readable".into(),
-                Err(e) => unit_note = format!("general unit: {e}"),
-            }
-        }
-        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'; {unit_note}");
+        let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'");
         log!("se_char_art2: {msg}");
         Ok(msg)
     })();

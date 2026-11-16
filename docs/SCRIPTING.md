@@ -1941,6 +1941,13 @@ another set when it does not fit, so spawn the character from a template of the 
 keep the art set in your first-tick re-apply. `se.query.character_art(cqi)` reports the current
 set. Since 0.49.
 
+Set the art **once, when the character is created**, before any panel has drawn them (and re-apply the
+same key at load). That path shows every view correctly. A later swap of a character already on
+screen updates the character panel and the campaign model at once, but other views keep the old
+look for a while: the army general card until the next turn, the HUD leader portrait and the
+settlement card longer. A swap between a historical and a generic set can leave the campaign model
+incomplete (head only) until it is rebuilt, because generic sets take their body from the equipment.
+
 ##### `se.modify.character_age(cqi, years) -> ok, message`
 
 1..120; moves the birth year so `age()` reads `years` now. Saved by the engine. Since 0.49.
