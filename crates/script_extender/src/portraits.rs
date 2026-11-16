@@ -211,6 +211,8 @@ const STILLS: &[(&str, u32, u32, u32, u32)] = &[
 
 fn chars_dir() -> Option<PathBuf> { tw_root().map(|r| r.join("maps").join("ui").join("characters")) }
 fn manifest_path() -> Option<PathBuf> { tw_root().map(|r| r.join("maps").join("190e_custom_portrait_manifest.txt")) }
+/// Copy of the manifest outside the maps folder (190E_portraits\.se_portrait_slots.txt).
+fn mirror_path() -> Option<PathBuf> { drop_folder().map(|d| d.join(".se_portrait_slots.txt")) }
 fn slot_key(slot: i64) -> String { format!("190e_custom_portrait_{slot}") }
 
 fn fnv64(b: &[u8]) -> u64 {
@@ -222,7 +224,9 @@ fn fnv64(b: &[u8]) -> u64 {
 /// slot -> (hash or None when unknown, file name)
 fn load_manifest() -> std::collections::BTreeMap<i64, (Option<u64>, String)> {
     let mut m = std::collections::BTreeMap::new();
-    if let Some(p) = manifest_path() {
+    // the maps copy first, then the mirror in the drop folder: a slot listed in either is used, so
+    // clearing the maps folder by hand does not hand an old campaign's slot to a new picture
+    for p in [manifest_path(), mirror_path()].into_iter().flatten() {
         if let Ok(t) = std::fs::read_to_string(&p) {
             for line in t.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
@@ -231,7 +235,7 @@ fn load_manifest() -> std::collections::BTreeMap<i64, (Option<u64>, String)> {
                 if !(1..=MAX_SLOT).contains(&slot) { continue; }
                 let hash = u64::from_str_radix(f[1].trim(), 16).ok();
                 let name = if valid_name(f[2].trim()) { f[2].trim().to_string() } else { String::new() };
-                m.insert(slot, (hash, name));
+                m.entry(slot).or_insert((hash, name));
             }
         }
     }
@@ -254,8 +258,13 @@ fn save_manifest(m: &std::collections::BTreeMap<i64, (Option<u64>, String)>) -> 
         t.push_str(&format!("{slot}\t{}\t{name}\n", hash.map(|h| format!("{h:016x}")).unwrap_or_else(|| "?".into())));
     }
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, t).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+    std::fs::write(&tmp, &t).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    if let Some(mp) = mirror_path() {
+        if let Some(d) = mp.parent() { let _ = std::fs::create_dir_all(d); }
+        if let Err(e) = std::fs::write(&mp, &t) { log!("custom portrait: slot mirror {}: {e}", mp.display()); }
+    }
+    Ok(())
 }
 
 /// se_custom_portrait_install(file_name) -> art_key, slot | nil, msg
