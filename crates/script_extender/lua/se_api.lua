@@ -68,6 +68,48 @@ function se.status()
 	return { state = names[st] or tostring(st), version = v, patches = n }
 end
 
+-- se.frontend: cheap checks that work in any Lua state, including the main menu (no cm needed).
+-- se.frontend.available() -> true when the natives are registered and the DLL accepted this exe.
+se.frontend = {}
+function se.frontend.available()
+	if type(G("se_ping")) ~= "function" then return false end
+	local st = se.status()
+	return st.state ~= "refused" and st.state ~= "not_game"
+end
+-- se.frontend.version() -> "<dll version>", e.g. "0.49.0-creator.1"
+function se.frontend.version()
+	return se.version()
+end
+-- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set" }
+function se.frontend.has(feature)
+	local n = CREATOR_NATIVES[feature]
+	return n ~= nil and type(G(n)) == "function"
+end
+
+-- Player portraits (creator S6). Files go in %APPDATA%\The Creative Assembly\ThreeKingdoms\190E_portraits\
+-- (PNG, up to 4096x4096 and 16 MB, names [A-Za-z0-9 _-.]).
+-- se.frontend.list_custom_portraits() -> { "a.png", ... } | nil, msg
+function se.frontend.list_custom_portraits()
+	local f = G("se_custom_portraits_list")
+	if type(f) ~= "function" then return nil, "native se_custom_portraits_list is not available" end
+	local s, err = f()
+	if s == nil then return nil, err end
+	local out = {}
+	for name in string.gmatch(s, "[^|]+") do out[#out + 1] = name end
+	return out
+end
+-- se.frontend.install_custom_portrait(file_name) -> art_key ("190e_custom_portrait_<slot>"), slot | nil, msg
+-- Writes the scaled character art folder as loose files under ...\ThreeKingdoms\maps\ui\characters\.
+-- The SE picks the slot: the same picture reuses its slot, a new picture gets a never-used slot, a
+-- used slot (an older campaign may show it) is never overwritten; refused when all 64 are used.
+function se.frontend.install_custom_portrait(file_name)
+	local f = G("se_custom_portrait_install")
+	if type(f) ~= "function" then return nil, "native se_custom_portrait_install is not available" end
+	if type(file_name) ~= "string" then return nil, "file_name must be a string" end
+	return f(file_name)
+end
+
 local function need(...)
 	for _, n in ipairs({ ... }) do
 		if type(G(n)) ~= "function" then return false, "native " .. n .. " is not available (DLL too old or not injected)" end
@@ -100,7 +142,7 @@ local function on_model(what, f, cb)
 		ok_mp, mp = pcall(function() return cm:is_multiplayer() end)
 		if not ok_mp or type(mp) ~= "boolean" then mp = true end
 	end
-	local ok_can, can = pcall(function() return cm:can_modify() end)
+	local ok_can, can = pcall(function() return cm:can_modify(true) end)
 	if mp == true and not (ok_can and can == true) then
 		return false, "refused in multiplayer: " .. what .. " was called outside a model callback (it would only run on this machine and desync)"
 	end
@@ -1168,6 +1210,223 @@ function se.modify.alliance_name(cqi, text, mode)
 		local a, e1 = alliance_by_cqi(cqi)
 		if not a then return false, e1 end
 		return se_alliance_name_set(a, num(cqi), text, mode or "inline")
+	end)
+end
+
+----------------------------------------------------------------------------------------------
+-- creator (190E "Create your Character / Faction"): single player only
+----------------------------------------------------------------------------------------------
+
+-- true in a multiplayer campaign, and when the model cannot answer (refuse rather than guess)
+local function creator_mp()
+	local cm = G("cm")
+	if not cm then return false end
+	local ok, mp = pcall(function() return cm:query_model():is_multiplayer() end)
+	if ok and type(mp) == "boolean" then return mp end
+	ok, mp = pcall(function() return cm:is_multiplayer() end)
+	if ok and type(mp) == "boolean" then return mp end
+	return true
+end
+
+-- se.query.character_names(cqi) -> dump string of the 4 name slots and the display cache
+function se.query.character_names(cqi)
+	local okn, err = need("se_char_names")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	return se_char_names(q, num(cqi))
+end
+
+-- se.modify.character_name_part(cqi, part, text) : what the engine's custom-name command does
+-- (CCQ_SET_CHARACTER_CUSTOM_NAME), part 0..3. Single player only.
+function se.modify.character_name_part(cqi, part, text)
+	local okn, err = need("se_char_name_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_name: single player only" end
+	if type(text) ~= "string" then return false, "text must be a string" end
+	return on_model("character_name_part(" .. str(cqi) .. ", " .. str(part) .. ", " .. text .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_char_name_set(q, num(cqi), num(part), text)
+	end)
+end
+
+local function faction_q(key)
+	local cm = G("cm")
+	if not cm then return nil, "no cm" end
+	local ok, f = pcall(function() return cm:query_faction(key) end)
+	if not ok or is_null(f) then return nil, "no faction " .. str(key) end
+	return f
+end
+
+-- se.query.faction_cosmetics(faction_key) -> dump: name objects, flag dir, colours
+function se.query.faction_cosmetics(key)
+	local okn, err = need("se_faction_cosmetics")
+	if not okn then return nil, err end
+	local f, e = faction_q(key)
+	if not f then return nil, e end
+	return se_faction_cosmetics(f)
+end
+
+-- se.modify.faction_name(faction_key, text [, mode]) : mode "pending" (default, the engine applies it
+-- on the next model tick) or "direct". Single player only.
+function se.modify.faction_name(key, text, mode)
+	local okn, err = need("se_faction_name_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_name: single player only" end
+	if type(text) ~= "string" then return false, "text must be a string" end
+	return on_model("faction_name(" .. str(key) .. ", " .. text .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_name_set(f, text, mode or "pending")
+	end)
+end
+
+-- se.modify.faction_flag(faction_key, flag_dir, {r,g,b}, {r,g,b}, {r,g,b}) : flag_dir like
+-- "ui/flags/3k_main_faction_cao_cao" ("" keeps it); colours 0..255, nil keeps. Single player only.
+function se.modify.faction_flag(key, dir, c1, c2, c3)
+	local okn, err = need("se_faction_flag_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_flag: single player only" end
+	local function t(c) if type(c) == "table" then return c[1], c[2], c[3] end return -1, 0, 0 end
+	return on_model("faction_flag(" .. str(key) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		local r1, g1, b1 = t(c1)
+		local r2, g2, b2 = t(c2)
+		local r3, g3, b3 = t(c3)
+		return se_faction_flag_set(f, dir or "", r1, g1, b1, r2, g2, b2, r3, g3, b3)
+	end)
+end
+
+-- Faction colours (based on Alex Zhao's Faction Color Editor). group "campaign" = the factions
+-- record's 3 colours (live on the map flag block, kept through the engine's refresh and the next
+-- load); "battle" = the faction_uniform_colours row (unit uniforms, from the next battle).
+-- Colours are {r,g,b} 0..255; nil keeps a triple. Single player only.
+-- se.query.faction_colours(key, group) -> { {r,g,b}, {r,g,b}, {r,g,b} } | nil, msg
+function se.query.faction_colours(key, group)
+	local okn, err = need("se_faction_colours_get")
+	if not okn then return nil, err end
+	local f, e = faction_q(key)
+	if not f then return nil, e end
+	local r = { se_faction_colours_get(f, group) }
+	if r[1] == nil then return nil, r[2] end
+	return { { r[1], r[2], r[3] }, { r[4], r[5], r[6] }, { r[7], r[8], r[9] } }
+end
+
+-- se.modify.faction_colours(key, group, {r,g,b}, {r,g,b} [, {r,g,b}]) -> ok, msg
+function se.modify.faction_colours(key, group, c1, c2, c3)
+	local okn, err = need("se_faction_colours_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_colours: single player only" end
+	if group ~= "campaign" and group ~= "battle" then return false, "group must be \"campaign\" or \"battle\"" end
+	local function t(c) if type(c) == "table" then return c[1], c[2], c[3] end return -1, 0, 0 end
+	return on_model("faction_colours(" .. str(key) .. ", " .. group .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		local r1, g1, b1 = t(c1)
+		local r2, g2, b2 = t(c2)
+		local r3, g3, b3 = t(c3)
+		return se_faction_colours_set(f, group, r1, g1, b1, r2, g2, b2, r3, g3, b3)
+	end)
+end
+
+-- se.modify.faction_colours_reset(key, group) -> ok, msg : back to the values before the first
+-- change of this game session
+function se.modify.faction_colours_reset(key, group)
+	local okn, err = need("se_faction_colours_reset")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_colours_reset: single player only" end
+	return on_model("faction_colours_reset(" .. str(key) .. ", " .. str(group) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_colours_reset(f, group)
+	end)
+end
+
+-- se.modify.faction_cosmetics_clear(faction_key) : forget the custom name + flag registration; the
+-- engine's own values return on its next cosmetics refresh (load, leader change ...)
+function se.modify.faction_cosmetics_clear(key)
+	local okn, err = need("se_faction_cosmetics_clear")
+	if not okn then return false, err end
+	if creator_mp() then return false, "faction_cosmetics_clear: single player only" end
+	return on_model("faction_cosmetics_clear(" .. str(key) .. ")", function()
+		local f, e = faction_q(key)
+		if not f then return false, e end
+		return se_faction_cosmetics_clear(f)
+	end)
+end
+
+-- Localised text of the creator's custom slots (S7 item names). Writes only keys that contain
+-- "190e_custom_"; process-wide until the game exits, so re-apply every session. SP only.
+local function any_faction_q()
+	local cm = G("cm")
+	if not cm then return nil, "no cm" end
+	local ok, f = pcall(function() return cm:query_local_faction(true) end)
+	if not ok or is_null(f) then return nil, "no local faction" end
+	return f
+end
+-- se.query.loc_text(key) -> text | nil, msg
+function se.query.loc_text(key)
+	local okn, err = need("se_loc_get")
+	if not okn then return nil, err end
+	local f, e = any_faction_q()
+	if not f then return nil, e end
+	return se_loc_get(f, key)
+end
+-- se.modify.loc_text(key, text) -> ok, msg
+function se.modify.loc_text(key, text)
+	local okn, err = need("se_loc_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "loc_text: single player only" end
+	if type(key) ~= "string" or type(text) ~= "string" then return false, "key and text must be strings" end
+	local f, e = any_faction_q()
+	if not f then return false, e end
+	return se_loc_set(f, key, text)
+end
+
+-- S8 skill trees. se.query.skill_tree(cqi) -> report (node set key, node -> skill keys, points).
+function se.query.skill_tree(cqi)
+	local okn, err = need("se_skill_tree_info")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	return se_skill_tree_info(q, num(cqi))
+end
+-- se.modify.character_skill_tree(cqi, node_set_key) -> ok, msg : rebuild the character's tree from
+-- another existing node set (engine builder; saved by key). Use at creation, before points are spent.
+function se.modify.character_skill_tree(cqi, key)
+	local okn, err = need("se_skill_tree_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_skill_tree: single player only" end
+	if type(key) ~= "string" or key == "" then return false, "key must be a node set key" end
+	return on_model("character_skill_tree(" .. str(cqi) .. ", " .. key .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_skill_tree_set(q, num(cqi), key)
+	end)
+end
+
+-- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);
+-- se.modify.character_art_set(cqi, art_set_key) swaps the campaign_character_art_sets record.
+function se.query.character_art(cqi)
+	local okn, err = need("se_char_art_set")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	local ok, msg = se_char_art_set(q, num(cqi), "")
+	return msg
+end
+
+function se.modify.character_art_set(cqi, key)
+	local okn, err = need("se_char_art_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_art_set: single player only" end
+	if type(key) ~= "string" or key == "" then return false, "key must be an art set key" end
+	return on_model("character_art_set(" .. str(cqi) .. ", " .. key .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_char_art_set(q, num(cqi), key)
 	end)
 end
 

@@ -36,23 +36,53 @@ unsafe extern "C" fn detour(l: *mut LuaState) -> c_int {
     HOOK.get().expect("hook installed").call(l)
 }
 
+/// Registry key marking a VM that already has the natives. The registry is shared by every
+/// coroutine of a VM and has no metatable, so a plain lua_getfield on it runs no script code.
+const MARKER: &[u8] = b"__se_registered\0";
+/// Registrations ever done; a backstop against a runaway state churn.
+static REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+const MAX_REGISTRATIONS: usize = 64;
+
+unsafe fn has_marker(l: *mut LuaState) -> bool {
+    let Some(api) = lua::api() else { return false };
+    (api.getfield)(l, lua::LUA_REGISTRYINDEX, MARKER.as_ptr() as *const _);
+    let set = (api.toboolean)(l, -1) != 0;
+    (api.settop)(l, -2);
+    set
+}
+
 unsafe fn ensure_registered(l: *mut LuaState) {
     let lu = l as usize;
-    let mut reg = match REGISTERED.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    // 0.48.x and older kept a list of state pointers and stopped at 16. Two faults with that
+    // (creator spike S1): a state freed on a frontend <-> campaign cycle can come back at the
+    // same address (the list then skips the new VM), and every coroutine is its own lua_State
+    // (each one counted against the 16). The registry marker answers "does this VM have the
+    // natives" exactly; the pointer list is only a cache of states already checked.
+    let cached = match REGISTERED.lock() { Ok(g) => g.contains(&lu), Err(p) => p.into_inner().contains(&lu) };
+    let remember = || {
+        let mut reg = match REGISTERED.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        if !reg.contains(&lu) {
+            if reg.len() >= 32 { reg.remove(0); }
+            reg.push(lu);
+        }
     };
-    if reg.contains(&lu) {
+    if has_marker(l) {
+        if !cached { remember(); }
         LAST_SEEN.store(lu, Ordering::Relaxed);
         return;
     }
-    if reg.len() >= 16 {
-        // Something is churning states; stop registering rather than grow unbounded.
+    if REGISTRATIONS.fetch_add(1, Ordering::Relaxed) >= MAX_REGISTRATIONS {
         LAST_SEEN.store(lu, Ordering::Relaxed);
         return;
     }
-    reg.push(lu);
-    drop(reg);
+    if cached {
+        log!("lua_State {:p} was seen before but has no natives: a new VM at a reused address", l);
+    }
+    remember();
+    if let Some(api) = lua::api() {
+        (api.pushboolean)(l, 1);
+        (api.setfield)(l, lua::LUA_REGISTRYINDEX, MARKER.as_ptr() as *const _);
+    }
     let _g = crate::crash::enter("lua_gettop_register");
     crate::crash::note_lua_thread();
     crate::pool::register(l);

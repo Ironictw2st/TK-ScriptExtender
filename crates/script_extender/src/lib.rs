@@ -31,6 +31,8 @@ mod buildings;
 mod skills;
 mod ainudge;
 mod alliances;
+mod creator;
+mod portraits;
 mod autoresolve;
 mod income;
 mod airecruit;
@@ -117,6 +119,7 @@ fn bootstrap() {
     buildings::init(&table);
     skills::init(&table);
     alliances::init(&table);
+    creator::init(&table);
     bundles::init(&table);
     diplomacy::init(&table);
     dilemma::init(&table);
@@ -141,6 +144,8 @@ fn bootstrap() {
     marriage::install(&table);
     crash::boot("prebattle");
     prebattle::install(&table);
+    crash::boot("creator");
+    creator::install(&table);
     crash::boot("navalland");
     navalland::install(&table);
     crash::boot("ceoguard");
