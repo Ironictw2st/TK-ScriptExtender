@@ -873,7 +873,10 @@ unsafe extern "C" fn se_loc_set(l: *mut LuaState) -> c_int {
         let us: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
         (e.from_wcstr)(us.as_mut_ptr() as P, w.as_ptr());
         let before = { let r = (lf.get)(t as P, ks.as_mut_ptr() as P) as usize; if r == 0 { "<none>".to_string() } else { string_at(r, true) } };
-        (lf.set)(t as P, ks.as_mut_ptr() as P, us.as_mut_ptr() as P, 1);
+        // last argument: 0 = overwrite an existing entry. STRING_TABLE::set (0x1403a3700) with a
+        // non-zero flag keeps an existing entry's text (it copies the entry onto itself), so 1 only
+        // ever inserted new keys (creator full-test finding, 15 Nov).
+        (lf.set)(t as P, ks.as_mut_ptr() as P, us.as_mut_ptr() as P, 0);
         let after = { let r = (lf.get)(t as P, ks.as_mut_ptr() as P) as usize; if r == 0 { "<none>".to_string() } else { string_at(r, true) } };
         let msg = format!("loc '{key}': '{before}' -> '{after}'");
         log!("se_loc_set: {msg}");
