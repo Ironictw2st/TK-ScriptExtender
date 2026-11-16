@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", loc_text = "se_loc_set" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
@@ -1438,26 +1438,50 @@ function se.modify.custom_item_look(slot_key, source_key)
 	return se_custom_item_look(f, slot_key, source_key)
 end
 
--- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);
--- se.modify.character_art_set(cqi, art_set_key) swaps the campaign_character_art_sets record.
+-- Character art (S3). The art set is CHARACTER+0x548, resolved through the model's art map from a
+-- key the save stores (se_char_art2; verified: portrait + 3D model change live, same-gender swaps
+-- persist through save/load). Cross-gender swaps are re-rolled at load: spawn the leader from a
+-- template of the wanted gender and re-apply at first tick as a safety net.
+-- se.query.character_art(cqi) -> report string
 function se.query.character_art(cqi)
-	local okn, err = need("se_char_art_set")
+	local okn, err = need("se_char_art2")
 	if not okn then return nil, err end
 	local q, e = se.character(cqi)
 	if not q then return nil, e end
-	local ok, msg = se_char_art_set(q, num(cqi), "")
+	local ok, msg = se_char_art2(q, num(cqi), "")
 	return msg
 end
 
+-- se.modify.character_art_set(cqi, art_set_key) -> ok, msg
 function se.modify.character_art_set(cqi, key)
-	local okn, err = need("se_char_art_set")
+	local okn, err = need("se_char_art2")
 	if not okn then return false, err end
 	if creator_mp() then return false, "character_art_set: single player only" end
-	if type(key) ~= "string" or key == "" then return false, "key must be an art set key" end
+	if type(key) ~= "string" or key == "" or key:sub(1, 1) == "?" then return false, "key must be an art set key" end
 	return on_model("character_art_set(" .. str(cqi) .. ", " .. key .. ")", function()
 		local q, e = se.character(cqi)
 		if not q then return false, e end
-		return se_char_art_set(q, num(cqi), key)
+		return se_char_art2(q, num(cqi), key)
+	end)
+end
+
+-- se.modify.character_age(cqi, years) -> ok, msg : sets the birth year so the character is `years`
+-- old now (CHARACTER+0x4e0, saved by the engine). 1..120.
+function se.modify.character_age(cqi, years)
+	local okn, err = need("se_char_birth_get", "se_char_birth_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_age: single player only" end
+	years = num(years)
+	if not years or years < 1 or years > 120 then return false, "years must be 1..120" end
+	years = math.floor(years + 0.5)
+	return on_model("character_age(" .. str(cqi) .. ", " .. years .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		local okb, birth = pcall(function() return se_char_birth_get(q, num(cqi)) end)
+		local oka, age = pcall(function() return q:age() end)
+		if not okb or type(birth) ~= "number" then return false, "cannot read the birth year: " .. str(birth) end
+		if not oka or type(age) ~= "number" then return false, "cannot read the age" end
+		return se_char_birth_set(q, num(cqi), birth + (age - years))
 	end)
 end
 

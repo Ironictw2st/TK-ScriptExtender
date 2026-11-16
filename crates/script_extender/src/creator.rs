@@ -80,6 +80,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_char_art_set", se_char_art_set);
     lua::set_global_fn(l, "se_char_art2", se_char_art2);
     lua::set_global_fn(l, "se_char_birth_set", se_char_birth_set);
+    lua::set_global_fn(l, "se_char_birth_get", se_char_birth_get);
     lua::set_global_fn(l, "se_loc_get", se_loc_get);
     lua::set_global_fn(l, "se_loc_set", se_loc_set);
     lua::set_global_fn(l, "se_item_rows", se_item_rows);
@@ -877,6 +878,19 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
         Err(er) => { log!("se_char_art2: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
+}
+
+/// se_char_birth_get(q_char, cqi) -> birth_year | nil, msg  (CHARACTER+0x4e0 i32, read only)
+unsafe extern "C" fn se_char_birth_get(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    match character(l, cqi) {
+        Ok(ch) => {
+            let y = rd(ch + 0x4e0) as i32;
+            if (1..=2000).contains(&y) { (api.pushinteger)(l, y as _); 1 } else { (api.pushnil)(l); lua::push_str(l, &format!("birth field holds {y}")); 2 }
+        }
+        Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
 }
 
 /// se_char_birth_set(q_char, cqi, birth_year) -> ok, msg  (CHARACTER+0x4e0 i32)
