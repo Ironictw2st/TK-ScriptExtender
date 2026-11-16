@@ -765,8 +765,10 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
 //   (historical women: 0). The +0x668 object is per character (its +0x18 points back to the
 //   CHARACTER). A generic-template spawn has it set, so a unique art set (women's sets, the
 //   creator's custom portraits) shows a body-armour card with an empty face.
-// mode: "" / "auto" = clear for a female character (+0x570 object byte +0x80 == 0) or a
-// 190e_custom_portrait set, else leave as is; "unique" = clear; "composite" = set; "keep".
+// mode: "" / "auto" = 190e_custom_portrait set -> clear; generic set (`_art_set_generic_`, card =
+// face piece, both genders) -> set; any other set on a woman (+0x570 object byte +0x80 == 0) ->
+// clear; else leave as is (historical men stay composite as in vanilla). "unique" = clear;
+// "composite" = set; "keep".
 const CH_CARD_OBJ: usize = 0x668;
 const CARD_COMPOSITE: usize = 0xa5;
 unsafe fn card_mode(ch: usize, key: &str, mode: &str) -> String {
@@ -779,7 +781,11 @@ unsafe fn card_mode(ch: usize, key: &str, mode: &str) -> String {
         "keep" => None,
         "unique" => Some(0),
         "composite" => Some(1),
-        _ => if female || key.contains("190e_custom_portrait") { Some(0) } else { None },
+        // generic sets (both genders) ship a FACE piece as their card, meant for the armour
+        // composite; custom portraits and historical women's sets ship a full card.
+        _ => if key.contains("190e_custom_portrait") { Some(0) }
+             else if key.contains("_art_set_generic_") { Some(1) }
+             else if female { Some(0) } else { None },
     };
     match want {
         Some(v) if v != before => { *((o + CARD_COMPOSITE) as *mut u8) = v; format!("card {}", if v == 0 { "unique (art set card)" } else { "composite (armour)" }) }
