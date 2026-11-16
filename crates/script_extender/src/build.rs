@@ -204,6 +204,12 @@ pub fn sync_tag() -> String {
         feed(key);
         feed(if ai_policy_enabled(key) { "1" } else { "0" });
     }
+    // battle fixes (Alex Zhao's ports, battlefix.rs): battle simulation, read once per session
+    // (the cfg decides what is installed; the MCT runtime switches are synced by the 190E MP settings sync)
+    for (key, on) in crate::battlefix::KEYS.iter().zip(crate::battlefix::cfg_enabled()) {
+        feed(key);
+        feed(if on { "1" } else { "0" });
+    }
     feed("marriage_blood_generations");
     feed(&crate::marriage::generations().to_string());
     format!("{:04x}", (h ^ (h >> 16)) & 0xffff)
@@ -219,6 +225,9 @@ pub const KNOWN_KEYS: &[&str] = &[
     "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "audio", "ui_dev_loader", "engine_crash_guards",
     "cai_null_guard", "battle_xform_fast", "siege_odds_gate", "siege_odds_bands", "siege_force_assault",
     "ai_skills", "ai_ceos", "ai_court", "ai_build", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder",
+    "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
+    "battle_turtle_missile_block", "battle_turtle_flank_immunity", "battle_cantabrian",
+    "battle_ranged_melee_targets", "battle_ranged_spread_targets",
 ];
 
 /// Campaign-AI nudge switches: install the detours unless the key is "0" (default on; the nudges stay inert at strength 1.0 until the MCT values reach them). In the sync tag.

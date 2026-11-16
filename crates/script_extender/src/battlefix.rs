@@ -1,0 +1,1090 @@
+//! Battle fixes ported from Alex Zhao's DLL mods (with technical help from Wyccc; ported with his
+//! permission). Spec: 190Expanded Beta\Output\Batch1115\Fold\SE_PORT_SPEC.md; notes/battle_fixes.md.
+//!
+//! 1. **Elephant Attack Gate Fix** (cfg `battle_elephant_gate`, default 1). The gate-attack order
+//!    path calls the per-entity predicate FUN_1422964c0 at exe+0x221c4a4; elephant entities (vtable
+//!    exe+0x34fb728) fail it. The 5-byte call is redirected to `elephant_pred`, which returns the
+//!    original answer, or true for an elephant whose +0x358 state is 0 and whose linked object at
+//!    +0x348 has its +0x5f6 slot set (Alex's test, field meanings inferred).
+//! 2. **Better Formation Behaviors** (cfg `battle_formation_fix`, default 1): 6 detours + 3 code
+//!    patches + 2 .data floats, all or nothing (20 signatures, vtable slots, globals and the
+//!    floats are checked first; one mismatch = nothing is written):
+//!    - shield / spear wall max columns 22 -> 60 (imm32 at exe+0x2198af5 / exe+0x2198bb2);
+//!    - the timed "cancel N s after melee" branch at exe+0x23c4f38 NOPed;
+//!    - Cantabrian circle distance 5 -> 30 and radius 28 -> 32 (.data exe+0x41a6d80 / exe+0x41a6a70,
+//!      set by the exe's static initialisers at exe+0x208731 / exe+0x208891 only);
+//!    - D1 formation_cancel_callback: never cancels a shield-wall behaviour (both wall classes);
+//!    - D2 maximum_width: drag width matching 60 columns;
+//!    - D3 charge_query: "not charging" for a shield-wall unit when asked from the interrupt
+//!      timer (return address exe+0x23c4ec7);
+//!    - D4 active_formation: at the two missile-block angle checks (return addresses
+//!      exe+0x22ef827 / exe+0x22fc21d) formations 5 / 9 / 10 count as turtle (11): 360-degree block;
+//!    - D5 morale_contribution: flank / rear (0x1b / 0x1c) negative morale ignored in 5 / 9 / 10;
+//!    - D6 charge_update: after the native charge state resolves, a Halt re-forms the wall.
+//!
+//! D3 and D4 depend on the caller's return address, so they are hand-written stubs (global_asm
+//! below) entered by the detour's `jmp`: on entry [rsp] is the engine caller's return address,
+//! and the stubs return straight to it. D3 jumps on to the original; D4 calls it.
+//!
+//! Coexistence with Alex's own DLLs (elephant_gate_fix_<sha>.dll / z_shieldwall_rebuilt.dll, loaded
+//! by his Lua from the game folder): if one is loaded, or the bytes at our sites are not vanilla,
+//! that fix stays inert and the log says why. If the SE patched first, his own pre-checks fail on
+//! our bytes and he applies nothing ("signature conflict, no changes applied"), so nothing is ever
+//! patched twice.
+//!
+//! MP: every fix changes the battle simulation; both keys are in build::sync_tag, read once.
+
+use crate::addrs::Table;
+use crate::log;
+use crate::lua::{self, LuaState};
+use core::ffi::{c_int, c_void};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use retour::RawDetour;
+use std::sync::OnceLock;
+
+type P = *mut c_void;
+
+// --------------------------------------------------------------------------------------------
+// cfg, read once (install and the sync tag see the same value for the whole session)
+// --------------------------------------------------------------------------------------------
+
+// One switch per feature (user decision 15 Nov 2026). The cfg key decides whether the feature is
+// INSTALLED this session (default 1; 0 = never patched; in the sync tag). Installed features also
+// have a runtime on/off flag, which starts at "on" and is what the 190E MCT consumer sets through
+// se.modify.battle_fixes (from the next battle on; see notes/battle_fixes.md for MP).
+pub const F_ELEPHANT: usize = 0; // elephant gate predicate
+pub const F_HOLD: usize = 1; // D1 cancel callback + interrupt-timer NOP (sword + spear wall)
+pub const F_WIDTH: usize = 2; // column caps 60 + D2 max width
+pub const F_CHARGE: usize = 3; // D3 "not charging" from the interrupt timer + D6 Halt after the charge
+pub const F_MISSILE: usize = 4; // D4 360-degree missile block for 5/9/10
+pub const F_FLANK: usize = 5; // D5 flank/rear morale immunity for 5/9/10
+pub const F_CANTABRIAN: usize = 6; // the two .data floats
+pub const F_MELEE: usize = 7; // 3a auto-fire may target enemies in melee with friendlies (1 byte)
+pub const F_SPREAD: usize = 8; // 3b spread the picked entity across the target unit (call-site detour)
+pub const N_FEATURES: usize = 9;
+pub const KEYS: [&str; N_FEATURES] = [
+    "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
+    "battle_turtle_missile_block", "battle_turtle_flank_immunity", "battle_cantabrian",
+    "battle_ranged_melee_targets", "battle_ranged_spread_targets",
+];
+/// Short names used by se.modify.battle_fixes / se.diag.battle_fixes.
+pub const NAMES: [&str; N_FEATURES] = [
+    "elephant_gate", "shieldwall_hold", "shieldwall_width", "charge_hold", "turtle_missile_block",
+    "turtle_flank_immunity", "cantabrian", "ranged_melee_targets", "ranged_spread_targets",
+];
+static CFG: OnceLock<[bool; N_FEATURES]> = OnceLock::new();
+/// The cfg value of every feature, read once (install and the sync tag agree for the session).
+pub fn cfg_enabled() -> [bool; N_FEATURES] {
+    *CFG.get_or_init(|| core::array::from_fn(|i| crate::build::hook_enabled(KEYS[i])))
+}
+static INSTALLED: [AtomicBool; N_FEATURES] = [const { AtomicBool::new(false) }; N_FEATURES];
+static ON: [AtomicBool; N_FEATURES] = [const { AtomicBool::new(false) }; N_FEATURES];
+#[inline]
+fn on(f: usize) -> bool { ON[f].load(Ordering::Relaxed) }
+const KEY_FORMATION: &str = "battle_formation"; // inventory / crash label for the shared detours
+
+// --------------------------------------------------------------------------------------------
+// RVAs (1.7.2.0 Steam + Epic share them; anchors verify every one)
+// --------------------------------------------------------------------------------------------
+
+const ELE_ANCHOR_RVA: usize = 0x221c498;
+const ELE_ANCHOR: [u8; 39] = [
+    0x45, 0x38, 0xae, 0x98, 0x00, 0x00, 0x00, 0x75, 0x5d, 0x49, 0x8b, 0xcf, 0xe8, 0x17, 0xa0, 0x07, 0x00, 0x3c, 0x01, 0x75,
+    0x51, 0x49, 0x8b, 0x8e, 0x90, 0x00, 0x00, 0x00, 0x33, 0xd2, 0xe8, 0xd5, 0xef, 0x06, 0x00, 0x3c, 0x01, 0x75, 0x3f,
+];
+const ELE_SITE_RVA: usize = 0x221c4a4; // the `call FUN_1422964c0` inside the anchor (offset 12)
+const ELE_PRED_RVA: usize = 0x22964c0;
+const ELE_VT_RVA: usize = 0x34fb728;
+
+const RVA_CANCEL: usize = 0x23b3930;
+const RVA_MAX_WIDTH: usize = 0x23ae110;
+const RVA_CHARGE_QUERY: usize = 0x21ac920;
+const RVA_ACTIVE_FORMATION: usize = 0x21ad6d0;
+const RVA_MORALE: usize = 0x239a400;
+const RVA_CHARGE_UPDATE: usize = 0x25eb5f0;
+const RVA_ISSUE_HALT: usize = 0x23abfe0;
+const RET_INTERRUPT_TIMER: usize = 0x23c4ec7; // after `call charge_query` at 0x23c4ec2
+const RET_MISSILE_A: usize = 0x22ef827; // after `call active_formation` at 0x22ef822
+const RET_MISSILE_B: usize = 0x22fc21d; // after `call active_formation` at 0x22fc218
+const VT_WALL_A: usize = 0x3550058; // the two shield-wall formation-behaviour classes
+const VT_WALL_B: usize = 0x35503e8;
+const VT_WIDTH_A: usize = 0x350c6c0; // formation shapes maximum_width accepts
+const VT_WIDTH_B: usize = 0x350c560;
+const CHARGE_STATE_RVA: usize = 0x3c1a6e0; // the state object charge_update returns after a charge
+const FLOAT_CANT_DIST: usize = 0x41a6d80;
+const FLOAT_CANT_RADIUS: usize = 0x41a6a70;
+
+/// Alex's 20 pre-check signatures {name, rva, bytes} (DLL table at 0x35480; each hits exactly once
+/// in .text, at this RVA, on the installed exe: tools/battlefix/dump_sigs.py).
+const SIGS: [(&str, usize, &str); 20] = [
+    ("issue_halt", 0x23abfe0, "48895c24084889742410574883ec30488bd98bf24881c1803b0000e8902dfeff"),
+    ("charge_update", 0x25eb5f0, "40534883ec2033c0488d5ad04885d2480f44d8488b4308488b8b80000000488b90100a0000e8b6"),
+    ("resolve_stance", 0x22bab60, "48895c241848896c2420574883ec20488b018bda488bf9ff90c0030000bdffff"),
+    ("entity_attack_order", 0x22ae8a0, "48895c2408488974241048897c241841564883ec3080b94806000001488bfa488bd9751a4881c130050000740a488b01ba01000000ff10c68348060000004c8db330050000c68349060000004d85f60f841a"),
+    ("stance_order", 0x22afae0, "48895c2408488974241048897c241841564883ec3080b94806000001488bfa488bd9751a4881c130050000740a488b01ba01000000ff10c68348060000004c8db330050000c68349060000004d85f60f84dd"),
+    ("formation_melee_policy", 0x2611460, "48895c24084889742410574883ec20488b4108488bf1488b98100a0000488bcb"),
+    ("entity_mobility_policy", 0x23b8a80, "4883ec28488b89703c0000ba02000000e83b4cdfff84c00f94c04883c428c3"),
+    ("charge_state_selection", 0x2603e70, "488d0561686101c3cccccccccccccccc"),
+    ("cantabrian_distance_load", 0x23901ce, "f30f1035aa6be101"),
+    ("cantabrian_radius_load", 0x23900d5, "f30f100d9369e101"),
+    ("formation_cancel_callback", 0x23b3930, "48895c2408574883ec40488b7918488bd9488b91c0000000488b8f703c0000e80c9ddfff"),
+    ("maximum_width", 0x23ae110, "40574883ec20488bf9e84294ffff84c0488b8708330000488b88300b0000488b"),
+    ("charge_query", 0x21ac920, "4883ec2883b9c808000000750732c04883c428c34883c130e813624600488bc8488b10ff52604885"),
+    ("shield_shape_columns", 0x2198af2, "c7433016000000488d05c03b3701488903"),
+    ("spear_shape_columns", 0x2198ba8, "488d05b1393701c7473016000000488907"),
+    ("active_formation", 0x21ad6d0, "48895c24084889742410574883ec20488b5920488d79188bf2483bdf74216690488b4320488d4b10"),
+    ("missile_a", 0x22ef816, "ba0b000000488b88703c0000e8a9deebff84c07412"),
+    ("missile_b", 0x22fc20c, "ba0b000000488b88703c0000e8b314ebff84c07412"),
+    ("morale_contribution", 0x239a400, "4889742418574883ec408379583c488d7958418bf04c8bc9448bc20f83040100"),
+    ("interrupt_timer", 0x23c4f2d, "0f2fc1f30f1187e40000000f835201000048895c2450488d4f0848"),
+];
+
+/// Code patches: (name, rva, vanilla bytes, new bytes, feature). Each lies inside one of the SIGS above.
+const CODE_PATCHES: [(&str, usize, &[u8], &[u8], usize); 3] = [
+    ("shield_shape_columns", 0x2198af5, &[0x16, 0, 0, 0], &[0x3c, 0, 0, 0], F_WIDTH),
+    ("spear_shape_columns", 0x2198bb2, &[0x16, 0, 0, 0], &[0x3c, 0, 0, 0], F_WIDTH),
+    ("interrupt_timer", 0x23c4f38, &[0x0f, 0x83, 0x52, 0x01, 0x00, 0x00], &[0x90; 6], F_HOLD),
+];
+/// .data floats: (name, rva, vanilla, new)
+const FLOAT_PATCHES: [(&str, usize, f32, f32); 2] = [
+    ("cantabrian_distance", FLOAT_CANT_DIST, 5.0, 30.0),
+    ("cantabrian_radius", FLOAT_CANT_RADIUS, 28.0, 32.0),
+];
+const WALL_VT_SLOTS: [usize; 5] = [0x70, 0xd8, 0xe0, 0xf0, 0x100];
+
+const FORMATION_CIRCLE_ETC: [u32; 3] = [5, 9, 10];
+const FORMATION_TURTLE: u32 = 11;
+const MORALE_FLANK: u32 = 0x1b;
+const MORALE_REAR: u32 = 0x1c;
+const WALL_MAX_COLUMNS: u32 = 60;
+
+// --------------------------------------------------------------------------------------------
+// state shared with the stubs (the asm reads these as plain usize)
+// --------------------------------------------------------------------------------------------
+
+static BASE: AtomicUsize = AtomicUsize::new(0);
+static SE_BF_CQ_RET: AtomicUsize = AtomicUsize::new(usize::MAX); // live exe+RET_INTERRUPT_TIMER
+static SE_BF_CQ_ORIG: AtomicUsize = AtomicUsize::new(0); // charge_query trampoline
+static SE_BF_AF_ORIG: AtomicUsize = AtomicUsize::new(0); // active_formation trampoline
+static ORIG_ELE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_CANCEL: AtomicUsize = AtomicUsize::new(0);
+static ORIG_WIDTH: AtomicUsize = AtomicUsize::new(0);
+static ORIG_MORALE: AtomicUsize = AtomicUsize::new(0);
+static ORIG_CHARGE_UPDATE: AtomicUsize = AtomicUsize::new(0);
+static DETOURS: OnceLock<Vec<(&'static str, usize, RawDetour)>> = OnceLock::new();
+
+/// Install outcome per feature, for the log and se.diag.battle_fixes().
+static STATES: OnceLock<[String; N_FEATURES]> = OnceLock::new();
+/// Serialises runtime switches (byte rewrites) against each other.
+static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+macro_rules! counters {
+    ($($name:ident),*) => { $(static $name: AtomicU64 = AtomicU64::new(0);)* };
+}
+counters!(
+    ELE_CALLS, ELE_ORIG_TRUE, ELE_PASSED, CANCEL_CALLS, CANCEL_SUPPRESSED, WIDTH_CALLS, WIDTH_SET,
+    CQ_GATED, CQ_NOT_CHARGING, AF_TURTLE_MISS, AF_GATED, AF_BLOCKED, MORALE_FLANK_NEG, MORALE_IGNORED,
+    CU_CHARGE_STATE, CU_HALTS
+);
+#[inline]
+fn bump(c: &AtomicU64) { c.fetch_add(1, Ordering::Relaxed); }
+
+// --------------------------------------------------------------------------------------------
+// small readers (engine pointers are trusted once non-null, exactly as Alex's code does)
+// --------------------------------------------------------------------------------------------
+
+#[inline]
+unsafe fn rq(p: usize) -> usize { core::ptr::read_unaligned(p as *const usize) }
+#[inline]
+unsafe fn rd(p: usize) -> u32 { core::ptr::read_unaligned(p as *const u32) }
+#[inline]
+unsafe fn rf(p: usize) -> f32 { core::ptr::read_unaligned(p as *const f32) }
+#[inline]
+fn base() -> usize { BASE.load(Ordering::Relaxed) }
+
+/// Alex's IsShieldForm(unit): formation state +0x3320 in {1,2} and the behaviour object at +0x3310
+/// (checked in both states) or, in state 2, at +0x3318 is one of the two shield-wall classes.
+unsafe fn is_shield_form(unit: usize) -> bool {
+    if unit == 0 { return false; }
+    let st = rd(unit + 0x3320);
+    if st.wrapping_sub(1) > 1 { return false; }
+    let (a, b) = (base() + VT_WALL_A, base() + VT_WALL_B);
+    let o = rq(unit + 0x3310);
+    if o != 0 { let vt = rq(o); if vt == a || vt == b { return true; } }
+    if st != 2 { return false; }
+    let o = rq(unit + 0x3318);
+    if o == 0 { return false; }
+    let vt = rq(o);
+    vt == a || vt == b
+}
+
+// --------------------------------------------------------------------------------------------
+// 1. elephant gate
+// --------------------------------------------------------------------------------------------
+
+unsafe extern "C" fn elephant_pred(e: P) -> u8 {
+    bump(&ELE_CALLS);
+    let orig: unsafe extern "C" fn(P) -> u8 = core::mem::transmute(ORIG_ELE.load(Ordering::Relaxed));
+    if orig(e) != 0 { bump(&ELE_ORIG_TRUE); return 1; }
+    if !on(F_ELEPHANT) { return 0; }
+    let e = e as usize;
+    if e == 0 || rq(e) != base() + ELE_VT_RVA || rd(e + 0x358) != 0 { return 0; }
+    let linked = rq(e + 0x348);
+    if linked == 0 { return 0; }
+    let ok = core::ptr::read_unaligned((linked + 0x5f6) as *const u16) != 0xffff;
+    if ok { bump(&ELE_PASSED); }
+    ok as u8
+}
+
+unsafe fn install_elephant(b: usize) -> Result<(), String> {
+    use crate::engineguard::{alloc_near, bytes_at, make_executable, write_code_for};
+    let anchor = b + ELE_ANCHOR_RVA;
+    match bytes_at::<39>(anchor) {
+        Some(x) if x == ELE_ANCHOR => {}
+        Some(x) => {
+            let site = &x[12..17];
+            return Err(if site[0] == 0xe8 && site != &ELE_ANCHOR[12..17] {
+                format!("the predicate call at exe+{ELE_SITE_RVA:#x} is already redirected ({}): another native mod (Alex Zhao's elephant_gate_fix DLL?) patched it", hex(site))
+            } else {
+                format!("anchor bytes at exe+{ELE_ANCHOR_RVA:#x} differ ({})", hex(&x))
+            });
+        }
+        None => return Err(format!("exe+{ELE_ANCHOR_RVA:#x} not readable")),
+    }
+    let site = b + ELE_SITE_RVA;
+    ORIG_ELE.store(b + ELE_PRED_RVA, Ordering::Relaxed);
+    let page = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    // mov rax, imm64 ; jmp rax   (rax is free at a call target)
+    let mut code = vec![0x48, 0xb8];
+    code.extend_from_slice(&(elephant_pred as *const () as u64).to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xe0]);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+    make_executable(page, code.len());
+    let rel = page as i64 - (site as i64 + 5);
+    if rel < i32::MIN as i64 || rel > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = [0xe8u8, 0, 0, 0, 0];
+    patch[1..].copy_from_slice(&(rel as i32).to_le_bytes());
+    write_code_for("battle_elephant_gate", KEYS[F_ELEPHANT], site, &patch)
+}
+
+// --------------------------------------------------------------------------------------------
+// 2. formation detours
+// --------------------------------------------------------------------------------------------
+
+/// D1: a shield-wall behaviour never cancels itself after melee.
+unsafe extern "C" fn cancel_detour(this: P) -> u8 {
+    bump(&CANCEL_CALLS);
+    if on(F_HOLD) && !this.is_null() {
+        let vt = rq(this as usize);
+        if vt == base() + VT_WALL_A || vt == base() + VT_WALL_B { bump(&CANCEL_SUPPRESSED); return 0; }
+    }
+    let orig: unsafe extern "C" fn(P) -> u8 = core::mem::transmute(ORIG_CANCEL.load(Ordering::Relaxed));
+    orig(this)
+}
+
+/// D2: a wall may be dragged as wide as 60 columns. Same arithmetic as Alex's binary:
+/// w = (min(men,60)-1) * spacing + base, used when w is finite, spacing > 0 and base > 0.
+unsafe extern "C" fn width_detour(unit: P) -> f32 {
+    let orig: unsafe extern "C" fn(P) -> f32 = core::mem::transmute(ORIG_WIDTH.load(Ordering::Relaxed));
+    let w0 = orig(unit);
+    bump(&WIDTH_CALLS);
+    let u = unit as usize;
+    if !on(F_WIDTH) || u == 0 || !is_shield_form(u) { return w0; }
+    let a = rq(u + 0x3308);
+    if a == 0 { return w0; }
+    let shape = rq(a + 0xb30);
+    if shape == 0 { return w0; }
+    let vt = rq(shape);
+    if vt != base() + VT_WIDTH_A && vt != base() + VT_WIDTH_B { return w0; }
+    let men = rd(u + 0x194);
+    if men == 0 { return w0; }
+    let (spacing, base_w) = (rf(shape + 0x18), rf(shape + 0x10));
+    let w = (men.min(WALL_MAX_COLUMNS) - 1) as i32 as f32 * spacing + base_w;
+    if !(w.abs() <= f32::MAX) || !(spacing > 0.0) { return w0; }
+    if 0.0 < base_w { bump(&WIDTH_SET); w } else { w0 }
+}
+
+/// D3 decision, called by the stub only when the caller is the interrupt timer: true = report
+/// "not charging" for this shield-wall unit.
+unsafe extern "C" fn se_bf_cq_decide(q: P) -> u8 {
+    bump(&CQ_GATED);
+    if !on(F_CHARGE) { return 0; }
+    let unit = rq(q as usize + 0xa10);
+    let r = is_shield_form(unit);
+    if r { bump(&CQ_NOT_CHARGING); }
+    r as u8
+}
+
+/// D4 extra, called by the stub after the original said "not turtle" for id 11: true when the
+/// caller is one of the two missile-block angle checks and the unit is in formation 5, 9 or 10.
+unsafe extern "C" fn se_bf_af_extra(formations: P, ret: usize) -> u8 {
+    bump(&AF_TURTLE_MISS);
+    if !on(F_MISSILE) { return 0; }
+    let b = base();
+    if ret != b + RET_MISSILE_A && ret != b + RET_MISSILE_B { return 0; }
+    bump(&AF_GATED);
+    let orig: unsafe extern "C" fn(P, u32) -> u8 = core::mem::transmute(SE_BF_AF_ORIG.load(Ordering::Relaxed));
+    let hit = FORMATION_CIRCLE_ETC.iter().any(|&id| orig(formations, id) != 0);
+    if hit { bump(&AF_BLOCKED); }
+    hit as u8
+}
+
+/// D5: no negative flank / rear morale while in formation 5, 9 or 10.
+unsafe extern "C" fn morale_detour(this: P, kind: u32, value: i32) -> usize {
+    let orig: unsafe extern "C" fn(P, u32, i32) -> usize = core::mem::transmute(ORIG_MORALE.load(Ordering::Relaxed));
+    if on(F_FLANK) && (kind == MORALE_FLANK || kind == MORALE_REAR) && value < 0 && !this.is_null() {
+        bump(&MORALE_FLANK_NEG);
+        let owner = rq(this as usize + 0x10);
+        if owner != 0 {
+            let formations = rq(owner + 0x3c70);
+            if formations != 0 {
+                let af: unsafe extern "C" fn(P, u32) -> u8 = core::mem::transmute(SE_BF_AF_ORIG.load(Ordering::Relaxed));
+                if FORMATION_CIRCLE_ETC.iter().any(|&id| af(formations as P, id) != 0) {
+                    bump(&MORALE_IGNORED);
+                    return 1;
+                }
+            }
+        }
+    }
+    orig(this, kind, value)
+}
+
+/// D6: once the native charge has resolved into the charge state, a Halt re-forms the wall.
+unsafe extern "C" fn charge_update_detour(a: P, b: P) -> P {
+    let orig: unsafe extern "C" fn(P, P) -> P = core::mem::transmute(ORIG_CHARGE_UPDATE.load(Ordering::Relaxed));
+    let r = orig(a, b);
+    if !on(F_CHARGE) || r as usize != base() + CHARGE_STATE_RVA || b.is_null() { return r; }
+    bump(&CU_CHARGE_STATE);
+    let e = rq(b as usize - 0x28);
+    if e == 0 { return r; }
+    let unit = rq(e + 0xa10);
+    if unit != 0 && is_shield_form(unit) {
+        bump(&CU_HALTS);
+        let halt: unsafe extern "C" fn(P, u32) = core::mem::transmute(base() + RVA_ISSUE_HALT);
+        halt(unit as P, 0);
+    }
+    r
+}
+
+extern "C" {
+    fn se_bf_cq_entry();
+    fn se_bf_af_entry();
+}
+
+// D3 stub (charge_query). Entered by the detour jmp, so [rsp] on entry is the engine caller's
+// return address. Saves the argument registers (rcx rdx r8 r9 xmm0-3) around the decision call,
+// then either returns 0 to the caller or jumps on to the original with everything unchanged.
+// Frame: 4 pushes + 0x68 -> ret addr at [rsp+0x88]; rsp is 16-aligned at the call.
+core::arch::global_asm!(
+    ".globl se_bf_cq_entry",
+    ".seh_proc se_bf_cq_entry",
+    "se_bf_cq_entry:",
+    "push rcx",
+    ".seh_pushreg rcx",
+    "push rdx",
+    ".seh_pushreg rdx",
+    "push r8",
+    ".seh_pushreg r8",
+    "push r9",
+    ".seh_pushreg r9",
+    "sub rsp, 0x68",
+    ".seh_stackalloc 0x68",
+    ".seh_endprologue",
+    "mov rax, qword ptr [rip + {cq_ret}]",
+    "cmp qword ptr [rsp + 0x88], rax",
+    "jne 3f",
+    "test rcx, rcx",
+    "jz 3f",
+    "movdqu xmmword ptr [rsp + 0x20], xmm0",
+    "movdqu xmmword ptr [rsp + 0x30], xmm1",
+    "movdqu xmmword ptr [rsp + 0x40], xmm2",
+    "movdqu xmmword ptr [rsp + 0x50], xmm3",
+    "call {cq_decide}",
+    "movdqu xmm0, xmmword ptr [rsp + 0x20]",
+    "movdqu xmm1, xmmword ptr [rsp + 0x30]",
+    "movdqu xmm2, xmmword ptr [rsp + 0x40]",
+    "movdqu xmm3, xmmword ptr [rsp + 0x50]",
+    "test al, al",
+    "jz 3f",
+    "xor eax, eax",
+    "add rsp, 0x68",
+    "pop r9",
+    "pop r8",
+    "pop rdx",
+    "pop rcx",
+    "ret",
+    "3:",
+    "add rsp, 0x68",
+    "pop r9",
+    "pop r8",
+    "pop rdx",
+    "pop rcx",
+    "jmp qword ptr [rip + {cq_orig}]",
+    ".seh_endproc",
+    cq_ret = sym SE_BF_CQ_RET,
+    cq_orig = sym SE_BF_CQ_ORIG,
+    cq_decide = sym se_bf_cq_decide,
+);
+
+// D4 stub (active_formation(formations, id) -> bool). Captures the caller's return address
+// ([rsp] on entry = [rsp+0x38] after the frame), calls the original with every argument register
+// untouched, and only for a false answer to id 11 asks se_bf_af_extra. Returns to the caller.
+core::arch::global_asm!(
+    ".globl se_bf_af_entry",
+    ".seh_proc se_bf_af_entry",
+    "se_bf_af_entry:",
+    "push rdi",
+    ".seh_pushreg rdi",
+    "push rsi",
+    ".seh_pushreg rsi",
+    "push rbx",
+    ".seh_pushreg rbx",
+    "sub rsp, 0x20",
+    ".seh_stackalloc 0x20",
+    ".seh_endprologue",
+    "mov rdi, qword ptr [rsp + 0x38]",
+    "mov rsi, rcx",
+    "mov ebx, edx",
+    "call qword ptr [rip + {af_orig}]",
+    "test al, al",
+    "jnz 4f",
+    "cmp ebx, {turtle}",
+    "jne 4f",
+    "mov rcx, rsi",
+    "mov rdx, rdi",
+    "call {af_extra}",
+    "4:",
+    "add rsp, 0x20",
+    "pop rbx",
+    "pop rsi",
+    "pop rdi",
+    "ret",
+    ".seh_endproc",
+    af_orig = sym SE_BF_AF_ORIG,
+    af_extra = sym se_bf_af_extra,
+    turtle = const FORMATION_TURTLE,
+);
+
+// --------------------------------------------------------------------------------------------
+// formation install: all or nothing
+// --------------------------------------------------------------------------------------------
+
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+fn unhex(s: &str) -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() }
+
+unsafe fn bytes(addr: usize, n: usize) -> Option<Vec<u8>> {
+    extern "system" { fn IsBadReadPtr(p: *const c_void, n: usize) -> i32; }
+    if IsBadReadPtr(addr as *const c_void, n) != 0 { return None; }
+    Some(core::slice::from_raw_parts(addr as *const u8, n).to_vec())
+}
+
+/// Every pre-check of Alex's DLL; Err lists every failure (nothing has been written yet).
+unsafe fn formation_prechecks(b: usize) -> Result<(), String> {
+    let mut bad = Vec::new();
+    let mut hooked = Vec::new();
+    for (name, rva, pat) in SIGS {
+        let want = unhex(pat);
+        match bytes(b + rva, want.len()) {
+            Some(got) if got == want => {}
+            Some(got) => {
+                if matches!(got[0], 0xe9 | 0xe8 | 0xff) && rva_is_hook_target(rva) { hooked.push(name); }
+                bad.push(format!("{name}@{rva:#x}"));
+            }
+            None => bad.push(format!("{name}@{rva:#x} unreadable")),
+        }
+    }
+    for vt in [VT_WALL_A, VT_WALL_B] {
+        for s in WALL_VT_SLOTS {
+            if bytes(b + vt + s, 8).map(|_| rq(b + vt + s)) != Some(b + RVA_CANCEL) { bad.push(format!("vtable {vt:#x}+{s:#x}")); }
+        }
+    }
+    for (at, want) in [(0x3585700usize, 0x2603e70usize), (0x3585708, 0x2603dd0), (CHARGE_STATE_RVA, 0x3581640)] {
+        if bytes(b + at, 8).map(|_| rq(b + at)) != Some(b + want) { bad.push(format!("[exe+{at:#x}] != exe+{want:#x}")); }
+    }
+    for (name, rva, vanilla, _) in FLOAT_PATCHES {
+        let v = rf(b + rva);
+        if v != vanilla { bad.push(format!("{name} float = {v} (want {vanilla})")); }
+    }
+    if bad.is_empty() { return Ok(()); }
+    let why = if !hooked.is_empty() {
+        format!("{} already hooked by another native mod (Alex Zhao's z_shieldwall_rebuilt DLL?); ", hooked.join(", "))
+    } else { String::new() };
+    Err(format!("{why}{} pre-check(s) failed: {}", bad.len(), bad.join(", ")))
+}
+
+fn rva_is_hook_target(rva: usize) -> bool {
+    [RVA_CANCEL, RVA_MAX_WIDTH, RVA_CHARGE_QUERY, RVA_ACTIVE_FORMATION, RVA_MORALE, RVA_CHARGE_UPDATE].contains(&rva)
+}
+
+unsafe fn enable_raw(name: &'static str, target: usize, d: &RawDetour) -> Result<(), String> {
+    let before: [u8; 16] = crate::engineguard::bytes_at(target).unwrap_or([0; 16]);
+    crate::freeze::with_threads_frozen(target, 16, || d.enable())?.map_err(|e| e.to_string())?;
+    crate::status::record_patch(name, KEY_FORMATION, target, before, crate::engineguard::bytes_at(target).unwrap_or([0; 16]));
+    crate::crash::hook_installed(name, KEY_FORMATION, target);
+    Ok(())
+}
+
+/// Detours: (name, rva, detour, trampoline cell, feature that needs it)
+fn detour_specs() -> [(&'static str, usize, usize, &'static AtomicUsize, usize); 6] {
+    [
+        ("formation_cancel_callback", RVA_CANCEL, cancel_detour as *const () as usize, &ORIG_CANCEL, F_HOLD),
+        ("formation_maximum_width", RVA_MAX_WIDTH, width_detour as *const () as usize, &ORIG_WIDTH, F_WIDTH),
+        ("formation_charge_query", RVA_CHARGE_QUERY, se_bf_cq_entry as *const () as usize, &SE_BF_CQ_ORIG, F_CHARGE),
+        ("formation_active_formation", RVA_ACTIVE_FORMATION, se_bf_af_entry as *const () as usize, &SE_BF_AF_ORIG, F_MISSILE),
+        ("formation_morale_contribution", RVA_MORALE, morale_detour as *const () as usize, &ORIG_MORALE, F_FLANK),
+        ("formation_charge_update", RVA_CHARGE_UPDATE, charge_update_detour as *const () as usize, &ORIG_CHARGE_UPDATE, F_CHARGE),
+    ]
+}
+
+/// Write a feature's byte patches (`on`) or the vanilla bytes back (`!on`).
+unsafe fn write_feature_bytes(b: usize, f: usize, on: bool) -> Result<(), String> {
+    for (name, rva, old, new, feat) in CODE_PATCHES {
+        if feat != f { continue; }
+        let want = if on { new } else { old };
+        if bytes(b + rva, want.len()).as_deref() == Some(want) { continue; }
+        crate::engineguard::write_code_for(name, KEYS[f], b + rva, want)?;
+    }
+    if f == F_MELEE {
+        let want: &[u8] = if on { &[0x00] } else { &[MELEE_ANCHOR[15]] };
+        if bytes(b + MELEE_PATCH_RVA, 1).as_deref() != Some(want) {
+            crate::engineguard::write_code_for("ranged_melee_targets", KEYS[f], b + MELEE_PATCH_RVA, want)?;
+        }
+    }
+    if f == F_CANTABRIAN {
+        for (name, rva, vanilla, new) in FLOAT_PATCHES {
+            let at = b + rva;
+            let before: [u8; 16] = crate::engineguard::bytes_at(at).unwrap_or([0; 16]);
+            core::ptr::write_unaligned(at as *mut f32, if on { new } else { vanilla });
+            crate::status::record_patch(name, KEYS[f], at, before, crate::engineguard::bytes_at(at).unwrap_or([0; 16]));
+        }
+    }
+    Ok(())
+}
+
+/// Install the formation features enabled in `want` (indices F_HOLD..). The pre-checks cover
+/// all of Alex's sites whatever is wanted: one mismatch = nothing is written. A failure while
+/// enabling or patching rolls back everything applied so far.
+unsafe fn install_formation(b: usize, want: &[bool; N_FEATURES]) -> Result<(), String> {
+    formation_prechecks(b)?;
+    let mut made = Vec::new();
+    for (name, rva, det, orig, f) in detour_specs() {
+        if !want[f] { continue; }
+        let d = RawDetour::new((b + rva) as *const (), det as *const ()).map_err(|e| format!("{name}: {e}"))?;
+        // publish the trampoline before the jump lands
+        orig.store(d.trampoline() as *const () as usize, Ordering::SeqCst);
+        made.push((name, b + rva, d));
+    }
+    // D5 asks active_formation directly when D4 is not installed
+    if !want[F_MISSILE] { SE_BF_AF_ORIG.store(b + RVA_ACTIVE_FORMATION, Ordering::SeqCst); }
+    SE_BF_CQ_RET.store(b + RET_INTERRUPT_TIMER, Ordering::SeqCst);
+    let detours = DETOURS.get_or_init(|| made);
+    let mut enabled: Vec<(usize, &RawDetour)> = Vec::new();
+    let rollback = |enabled: &[(usize, &RawDetour)]| {
+        for (t, d) in enabled {
+            let _ = crate::freeze::with_threads_frozen(*t, 16, || d.disable());
+        }
+        for f in [F_HOLD, F_WIDTH, F_CANTABRIAN] { let _ = write_feature_bytes(b, f, false); }
+    };
+    for (name, t, d) in detours.iter() {
+        if let Err(e) = enable_raw(name, *t, d) {
+            rollback(&enabled);
+            return Err(format!("enabling {name}: {e}; rolled back"));
+        }
+        enabled.push((*t, d));
+    }
+    for f in [F_HOLD, F_WIDTH, F_CANTABRIAN] {
+        if !want[f] { continue; }
+        if let Err(e) = write_feature_bytes(b, f, true) {
+            rollback(&enabled);
+            return Err(format!("patching {}: {e}; rolled back", NAMES[f]));
+        }
+    }
+    Ok(())
+}
+
+/// Runtime switch for an installed feature (the MCT consumer; from the next battle on).
+/// Err when the feature is not installed this session (cfg 0, inert, or failed).
+pub fn set_feature(f: usize, want: bool) -> Result<bool, String> {
+    if f >= N_FEATURES { return Err("unknown feature".into()); }
+    if !INSTALLED[f].load(Ordering::SeqCst) {
+        let st = STATES.get().map(|s| s[f].clone()).unwrap_or_default();
+        return Err(format!("{} is not installed this session ({st})", NAMES[f]));
+    }
+    let _g = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    if on(f) == want { return Ok(false); }
+    if want {
+        // bytes first, then the flag: a detour never sees "on" with vanilla bytes
+        unsafe { write_feature_bytes(base(), f, true)? };
+        ON[f].store(true, Ordering::SeqCst);
+    } else {
+        ON[f].store(false, Ordering::SeqCst);
+        unsafe { write_feature_bytes(base(), f, false)? };
+    }
+    log!("battle fix {}: {}", NAMES[f], if want { "on" } else { "off" });
+    Ok(true)
+}
+
+// --------------------------------------------------------------------------------------------
+// 3. ranged target acquisition (Alex Zhao's z_fresh_ranged, Workshop 3830576592; spec §3)
+// --------------------------------------------------------------------------------------------
+
+/// 3a: `test al,al ; jne +0x45` after "candidate is in melee with a friendly" in auto-fire target
+/// selection; the jne becomes `jne +0` so engaged enemies stay candidates.
+/// 16 bytes from 0x23a8f60 (unique in .text): `.. call FUN_1421ac9d0 ; mov rbx,[rsp+0x30] ; test al,al ; jne +0x45`
+const MELEE_ANCHOR_RVA: usize = 0x23a8f60;
+const MELEE_ANCHOR: [u8; 16] = [0x00, 0x00, 0xe8, 0x69, 0x3a, 0xe0, 0xff, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x84, 0xc0, 0x75, 0x45];
+const MELEE_PATCH_RVA: usize = 0x23a8f6f;
+/// 3b: the candidate test `call FUN_1422e3370(ctx, shooter, cand)` inside the nearest-candidate loop
+/// of FUN_142385143 (the loop keeps the nearest candidate the test accepts).
+const SPREAD_SITE_RVA: usize = 0x23854b7;
+/// 21 bytes from 0x23854a7 (unique in .text): `mov rdx,r14 ; mov ecx,ebx ; mov rdi,[rax+rcx*8] ; lea rcx,[rbp-0x40] ; mov r8,rdi ; call`
+const SPREAD_ANCHOR_RVA: usize = 0x23854a7;
+const SPREAD_ANCHOR: [u8; 21] = [0x49, 0x8b, 0xd6, 0x8b, 0xcb, 0x48, 0x8b, 0x3c, 0xc8, 0x48, 0x8d, 0x4d, 0xc0, 0x4c, 0x8b, 0xc7, 0xe8, 0xb4, 0xde, 0xf5, 0xff];
+const SPREAD_CALLEE_RVA: usize = 0x22e3370;
+const SPREAD_CALLEE_ANCHOR: [u8; 5] = [0x48, 0x89, 0x5c, 0x24, 0x08];
+/// lua_newstate(alloc, ud): calls alloc(ud, NULL, 0, sizeof(LG) = 0x268). Every VM (frontend,
+/// campaign, battle) is made here, on every peer, before that VM's simulation runs.
+const NEWSTATE_RVA: usize = 0x75c490;
+/// 37 bytes (unique in .text; the 16-byte prologue alone is not): up to `mov r9d,0x268 ; xor r8d,r8d ; xor edx,edx ; call rsi`
+const NEWSTATE_ANCHOR: [u8; 37] = [
+    0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xfa, 0x48,
+    0x8b, 0xf1, 0x48, 0x8b, 0xcf, 0x41, 0xb9, 0x68, 0x02, 0x00, 0x00, 0x45, 0x33, 0xc0, 0x33, 0xd2, 0xff, 0xd6,
+];
+
+const SPREAD_K0: i32 = 120;
+const SPREAD_P: i32 = 3;
+const SPREAD_SEED: u32 = 0x9e37_79b9;
+
+/// Alex's filter state, reset whenever a new Lua VM is made (GEN changes) so every battle starts
+/// from the same state on every machine (his DLL seeds it once per process: MP desync).
+struct Spread {
+    gen: u64,
+    k: i32,
+    rng: u32,
+    q_ctx: usize,
+    q_shooter: usize,
+    count: i32,
+    accepted: i32,
+    forced: i32,
+    thr: i32,
+    thread: u32,
+}
+static SPREAD: std::sync::Mutex<Spread> = std::sync::Mutex::new(Spread {
+    gen: u64::MAX, k: SPREAD_K0, rng: SPREAD_SEED, q_ctx: 0, q_shooter: 0, count: 0, accepted: 0, forced: 0, thr: 0, thread: 0,
+});
+static VM_GEN: AtomicU64 = AtomicU64::new(0);
+static ORIG_SPREAD: AtomicUsize = AtomicUsize::new(0);
+static NEWSTATE: OnceLock<retour::GenericDetour<NewState>> = OnceLock::new();
+type NewState = unsafe extern "C" fn(P, P) -> P;
+counters!(SP_CALLS, SP_QUERIES, SP_QUERIES_NONE, SP_ACCEPTS, SP_REJECTS, SP_FORCED, SP_RESETS, SP_OTHER_THREAD, VM_CREATED);
+
+extern "system" { fn GetCurrentThreadId() -> u32; }
+
+unsafe extern "C" fn newstate_detour(alloc: P, ud: P) -> P {
+    let Some(h) = NEWSTATE.get() else { return core::ptr::null_mut() };
+    let l = h.call(alloc, ud);
+    VM_GEN.fetch_add(1, Ordering::SeqCst);
+    bump(&VM_CREATED);
+    l
+}
+
+/// Alex's xorshift32 (13/17/5): returns the raw output; a zero output stores 0x1234567 instead.
+fn xs(s: &mut u32) -> u32 {
+    let mut x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    let y = x ^ (x << 5);
+    *s = if y == 0 { 0x0123_4567 } else { y };
+    y
+}
+
+impl Spread {
+    fn reset(&mut self, gen: u64) {
+        self.gen = gen;
+        self.k = SPREAD_K0;
+        self.rng = SPREAD_SEED;
+        self.q_ctx = 0;
+        self.q_shooter = 0;
+        self.count = 0;
+        self.accepted = 0;
+        self.forced = 0;
+        self.thr = 0;
+    }
+    /// Alex's filter for a candidate the engine already accepted; true = keep it.
+    fn accept(&mut self, ctx: usize, shooter: usize) -> bool {
+        if ctx == self.q_ctx && shooter == self.q_shooter {
+            self.count += 1;
+        } else {
+            // new query: adapt K from the previous query's candidate count n
+            let mut k = self.k.max(1);
+            let n = self.count;
+            let m;
+            if n > 0 {
+                let s = 3 * k + n;
+                if s > 0x8003 {
+                    m = 0x1000;
+                    k = 0x2000;
+                } else {
+                    k = s >> 2;
+                    m = (s >> 3).max(1);
+                }
+                self.k = k;
+            } else {
+                m = (k >> 1).max(1);
+            }
+            if self.accepted == 0 { bump(&SP_QUERIES_NONE); }
+            bump(&SP_QUERIES);
+            self.q_ctx = ctx;
+            self.q_shooter = shooter;
+            self.accepted = 0;
+            let y = xs(&mut self.rng);
+            self.forced = (y % m as u32) as i32 + m + 1;
+            self.thr = if SPREAD_P >= k { 1_000_000 } else { (SPREAD_P * 1_000_000 / k).max(1000) };
+            self.count = 1;
+        }
+        let x = (xs(&mut self.rng) % 1_000_000) as i32;
+        let ok = if x < self.thr {
+            true
+        } else if self.accepted == 0 && self.forced <= self.count {
+            bump(&SP_FORCED);
+            true
+        } else {
+            false
+        };
+        if ok { self.accepted += 1; bump(&SP_ACCEPTS); } else { bump(&SP_REJECTS); }
+        ok
+    }
+}
+
+unsafe extern "C" fn spread_detour(ctx: P, shooter: P, cand: P) -> u8 {
+    let orig: unsafe extern "C" fn(P, P, P) -> u8 = core::mem::transmute(ORIG_SPREAD.load(Ordering::Relaxed));
+    let r = orig(ctx, shooter, cand);
+    if r == 0 || !on(F_SPREAD) { return r; }
+    bump(&SP_CALLS);
+    let mut st = SPREAD.lock().unwrap_or_else(|e| e.into_inner());
+    let gen = VM_GEN.load(Ordering::SeqCst);
+    if st.gen != gen {
+        st.reset(gen);
+        st.thread = GetCurrentThreadId();
+        bump(&SP_RESETS);
+    } else if st.thread != GetCurrentThreadId() {
+        bump(&SP_OTHER_THREAD); // the test checks this stays 0 (sim thread only)
+    }
+    if st.accept(ctx as usize, shooter as usize) { r } else { 0 }
+}
+
+unsafe fn install_melee(b: usize) -> Result<(), String> {
+    let mut patched = MELEE_ANCHOR;
+    patched[15] = 0x00;
+    match crate::engineguard::bytes_at::<16>(b + MELEE_ANCHOR_RVA) {
+        Some(x) if x == MELEE_ANCHOR => Ok(()),
+        Some(x) if x == patched => Err(format!("exe+{MELEE_PATCH_RVA:#x} is already 00: another native mod (Alex Zhao's z_fresh_ranged DLL?) patched it")),
+        Some(x) => Err(format!("anchor bytes at exe+{MELEE_ANCHOR_RVA:#x} differ ({})", hex(&x))),
+        None => Err(format!("exe+{MELEE_ANCHOR_RVA:#x} not readable")),
+    }
+    // the byte itself is written by write_feature_bytes (runtime switch)
+}
+
+unsafe fn install_spread(b: usize) -> Result<(), String> {
+    use crate::engineguard::{alloc_near, bytes_at, make_executable, write_code_for};
+    let site = b + SPREAD_SITE_RVA;
+    match bytes_at::<21>(b + SPREAD_ANCHOR_RVA) {
+        Some(x) if x == SPREAD_ANCHOR => {}
+        Some(x) if x[..16] == SPREAD_ANCHOR[..16] && x[16] == 0xe8 => return Err(format!("the candidate call at exe+{SPREAD_SITE_RVA:#x} is already redirected ({}): another native mod (Alex Zhao's z_fresh_ranged DLL?) patched it", hex(&x[16..]))),
+        Some(x) => return Err(format!("anchor bytes at exe+{SPREAD_ANCHOR_RVA:#x} differ ({})", hex(&x))),
+        None => return Err(format!("exe+{SPREAD_SITE_RVA:#x} not readable")),
+    }
+    if bytes_at::<5>(b + SPREAD_CALLEE_RVA) != Some(SPREAD_CALLEE_ANCHOR) { return Err(format!("callee exe+{SPREAD_CALLEE_RVA:#x} differs")); }
+    // battle-start signal first: without it the filter would not be deterministic between peers
+    let ns = b + NEWSTATE_RVA;
+    if bytes_at::<37>(ns) != Some(NEWSTATE_ANCHOR) { return Err(format!("lua_newstate exe+{NEWSTATE_RVA:#x} differs (needed for the per-battle reset)")); }
+    if NEWSTATE.get().is_none() {
+        let f: NewState = core::mem::transmute(ns);
+        let d = retour::GenericDetour::new(f, newstate_detour as NewState).map_err(|e| format!("lua_newstate: {e}"))?;
+        let _ = NEWSTATE.set(d);
+        crate::freeze::enable_detour("battle_vm_created", KEYS[F_SPREAD], ns, NEWSTATE.get().ok_or("detour not stored")?)?;
+    }
+    ORIG_SPREAD.store(b + SPREAD_CALLEE_RVA, Ordering::SeqCst);
+    let page = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let mut code = vec![0x48, 0xb8];
+    code.extend_from_slice(&(spread_detour as *const () as u64).to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xe0]);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+    make_executable(page, code.len());
+    let rel = page as i64 - (site as i64 + 5);
+    if rel < i32::MIN as i64 || rel > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = [0xe8u8, 0, 0, 0, 0];
+    patch[1..].copy_from_slice(&(rel as i32).to_le_bytes());
+    write_code_for("battle_ranged_spread", KEYS[F_SPREAD], site, &patch)
+}
+
+// --------------------------------------------------------------------------------------------
+// Alex's own DLLs: present?
+// --------------------------------------------------------------------------------------------
+
+#[repr(C)]
+struct ModuleEntry32W {
+    dw_size: u32,
+    th32_module_id: u32,
+    th32_process_id: u32,
+    glblcnt_usage: u32,
+    proccnt_usage: u32,
+    mod_base_addr: *mut u8,
+    mod_base_size: u32,
+    h_module: P,
+    sz_module: [u16; 256],
+    sz_exe_path: [u16; 260],
+}
+
+extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> P;
+    fn Module32FirstW(snap: P, e: *mut ModuleEntry32W) -> i32;
+    fn Module32NextW(snap: P, e: *mut ModuleEntry32W) -> i32;
+    fn CloseHandle(h: P) -> i32;
+}
+
+/// Lower-case names of loaded modules that look like Alex Zhao's battle-fix DLLs.
+fn alex_modules() -> Vec<String> {
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(0x8 | 0x10, 0); // TH32CS_SNAPMODULE | SNAPMODULE32
+        if snap.is_null() || snap as usize == usize::MAX { return out; }
+        let mut e: ModuleEntry32W = core::mem::zeroed();
+        e.dw_size = core::mem::size_of::<ModuleEntry32W>() as u32;
+        let mut ok = Module32FirstW(snap, &mut e) != 0;
+        while ok {
+            let n = e.sz_module.iter().position(|&c| c == 0).unwrap_or(256);
+            let name = String::from_utf16_lossy(&e.sz_module[..n]).to_ascii_lowercase();
+            if name.starts_with("elephant_gate_fix") || name.starts_with("z_shieldwall_rebuilt") || name.starts_with("z_fresh_ranged") { out.push(name); }
+            ok = Module32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+pub fn install(t: &Table) {
+    let b = t.base();
+    BASE.store(b, Ordering::SeqCst);
+    let cfg = cfg_enabled();
+    let alex = alex_modules();
+    if !alex.is_empty() { log!("battle fixes: Alex Zhao's DLL(s) already loaded: {}", alex.join(", ")); }
+    let mut states: [String; N_FEATURES] = core::array::from_fn(|f| if cfg[f] { String::new() } else { format!("off ({}=0)", KEYS[f]) });
+
+    if cfg[F_ELEPHANT] {
+        states[F_ELEPHANT] = if let Some(m) = alex.iter().find(|m| m.starts_with("elephant_gate_fix")) {
+            format!("inert: {m} is loaded and provides the same fix")
+        } else {
+            // SAFETY: anchor verified first; written with the other threads frozen.
+            match unsafe { install_elephant(b) } {
+                Ok(()) => { INSTALLED[F_ELEPHANT].store(true, Ordering::SeqCst); format!("installed at exe+{ELE_SITE_RVA:#x}") }
+                Err(e) => format!("inert: {e}"),
+            }
+        };
+    }
+
+    let formation: Vec<usize> = (F_HOLD..=F_CANTABRIAN).filter(|&f| cfg[f]).collect();
+    if !formation.is_empty() {
+        let outcome = if let Some(m) = alex.iter().find(|m| m.starts_with("z_shieldwall_rebuilt")) {
+            Err(format!("inert: {m} is loaded and provides the same fixes"))
+        } else {
+            // SAFETY: every pre-check passes before anything is written; partial failures roll back.
+            unsafe { install_formation(b, &cfg) }.map_err(|e| format!("inert: {e}"))
+        };
+        for &f in &formation {
+            states[f] = match &outcome {
+                Ok(()) => { INSTALLED[f].store(true, Ordering::SeqCst); "installed".to_string() }
+                Err(e) => e.clone(),
+            };
+        }
+    }
+    let fresh = alex.iter().find(|m| m.starts_with("z_fresh_ranged")).cloned();
+    for (f, inst) in [(F_MELEE, install_melee as unsafe fn(usize) -> Result<(), String>), (F_SPREAD, install_spread)] {
+        if !cfg[f] { continue; }
+        states[f] = if let Some(m) = &fresh {
+            format!("inert: {m} is loaded and provides the same fix")
+        } else {
+            // SAFETY: anchors verified first; written with the other threads frozen.
+            match unsafe { inst(b) } {
+                Ok(()) => { INSTALLED[f].store(true, Ordering::SeqCst); "installed".to_string() }
+                Err(e) => format!("inert: {e}"),
+            }
+        };
+    }
+    for f in 0..N_FEATURES {
+        if INSTALLED[f].load(Ordering::SeqCst) {
+            if f == F_MELEE {
+                // SAFETY: anchor verified in install_melee
+                if let Err(e) = unsafe { write_feature_bytes(b, f, true) } {
+                    INSTALLED[f].store(false, Ordering::SeqCst);
+                    states[f] = format!("inert: patch failed: {e}");
+                    continue;
+                }
+            }
+            ON[f].store(true, Ordering::SeqCst);
+        }
+        log!("battle fix {} ({}): {}", NAMES[f], KEYS[f], states[f]);
+    }
+    let _ = STATES.set(states);
+}
+
+fn info() -> String {
+    let c = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let mut s = String::new();
+    for f in 0..N_FEATURES {
+        s.push_str(&format!("{}={};{}_on={};", NAMES[f], INSTALLED[f].load(Ordering::Relaxed) as u8, NAMES[f], on(f) as u8));
+    }
+    s.push_str(&format!(
+        "ele_calls={};ele_orig_true={};ele_passed={};cancel_calls={};cancel_suppressed={};\
+         width_calls={};width_set={};cq_gated={};cq_not_charging={};af_turtle_miss={};af_gated={};af_blocked={};\
+         morale_flank_neg={};morale_ignored={};cu_charge_state={};cu_halts={};\
+         sp_calls={};sp_queries={};sp_queries_none={};sp_accepts={};sp_rejects={};sp_forced={};sp_resets={};sp_other_thread={};vm_created={};sp_k={}",
+        c(&ELE_CALLS), c(&ELE_ORIG_TRUE), c(&ELE_PASSED), c(&CANCEL_CALLS), c(&CANCEL_SUPPRESSED),
+        c(&WIDTH_CALLS), c(&WIDTH_SET), c(&CQ_GATED), c(&CQ_NOT_CHARGING), c(&AF_TURTLE_MISS), c(&AF_GATED), c(&AF_BLOCKED),
+        c(&MORALE_FLANK_NEG), c(&MORALE_IGNORED), c(&CU_CHARGE_STATE), c(&CU_HALTS),
+        c(&SP_CALLS), c(&SP_QUERIES), c(&SP_QUERIES_NONE), c(&SP_ACCEPTS), c(&SP_REJECTS), c(&SP_FORCED), c(&SP_RESETS),
+        c(&SP_OTHER_THREAD), c(&VM_CREATED), SPREAD.lock().map(|s| s.k).unwrap_or(-1),
+    ));
+    if let Some(st) = STATES.get() {
+        for f in 0..N_FEATURES { s.push_str(&format!("|{}_state={}", NAMES[f], st[f].replace('|', "/"))); }
+    }
+    s
+}
+
+/// se_battlefix_info() -> "elephant_gate=1;elephant_gate_on=1;...;ele_calls=N;...|elephant_gate_state=..."
+unsafe extern "C" fn se_battlefix_info(l: *mut LuaState) -> c_int {
+    lua::push_str(l, &info());
+    1
+}
+
+/// se_battlefix_set(name, on) -> true, "changed"/"unchanged" | false, reason
+unsafe extern "C" fn se_battlefix_set(l: *mut LuaState) -> c_int {
+    let Some(api) = crate::hook::lua_api() else { return 0 };
+    let name = lua::to_str(l, 1);
+    let want = (api.toboolean)(l, 2) != 0;
+    let r = match NAMES.iter().position(|n| *n == name) {
+        Some(f) => set_feature(f, want),
+        None => Err(format!("unknown battle fix '{name}'")),
+    };
+    match r {
+        Ok(changed) => { (api.pushboolean)(l, 1); lua::push_str(l, if changed { "changed" } else { "unchanged" }); }
+        Err(e) => { (api.pushboolean)(l, 0); lua::push_str(l, &e); }
+    }
+    2
+}
+
+pub unsafe fn register(l: *mut LuaState) {
+    lua::set_global_fn(l, "se_battlefix_info", se_battlefix_info);
+    lua::set_global_fn(l, "se_battlefix_set", se_battlefix_set);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sig_table_covers_patches() {
+        for (name, rva, old, _, _) in CODE_PATCHES {
+            let (_, srva, pat) = SIGS.iter().find(|s| s.0 == name).unwrap();
+            let p = unhex(pat);
+            let off = rva - srva;
+            assert_eq!(&p[off..off + old.len()], old, "{name}");
+        }
+        assert_eq!(&ELE_ANCHOR[12..17], &[0xe8, 0x17, 0xa0, 0x07, 0x00]);
+        // the call at the elephant site targets the predicate
+        let rel = i32::from_le_bytes(ELE_ANCHOR[13..17].try_into().unwrap()) as i64;
+        assert_eq!((ELE_SITE_RVA as i64 + 5 + rel) as usize, ELE_PRED_RVA);
+        // the gated return addresses follow the calls inside the missile signatures
+        for (sig, ret) in [("missile_a", RET_MISSILE_A), ("missile_b", RET_MISSILE_B)] {
+            let (_, srva, pat) = SIGS.iter().find(|s| s.0 == sig).unwrap();
+            let p = unhex(pat);
+            assert_eq!(p[12], 0xe8);
+            let rel = i32::from_le_bytes(p[13..17].try_into().unwrap()) as i64;
+            assert_eq!(srva + 17, ret);
+            assert_eq!((ret as i64 + rel) as usize, RVA_ACTIVE_FORMATION);
+        }
+    }
+
+    #[test]
+    fn ranged_anchors_cover_sites() {
+        assert_eq!(MELEE_ANCHOR_RVA + 15, MELEE_PATCH_RVA);
+        assert_eq!(&MELEE_ANCHOR[12..], &[0x84, 0xc0, 0x75, 0x45]);
+        // the call in the melee anchor is FUN_1421ac9d0 (not charge_query 0x21ac920)
+        let rel = i32::from_le_bytes(MELEE_ANCHOR[3..7].try_into().unwrap()) as i64;
+        assert_eq!((MELEE_ANCHOR_RVA as i64 + 7 + rel) as usize, 0x21ac9d0);
+        assert_eq!(SPREAD_ANCHOR_RVA + 16, SPREAD_SITE_RVA);
+        let rel = i32::from_le_bytes(SPREAD_ANCHOR[17..21].try_into().unwrap()) as i64;
+        assert_eq!((SPREAD_SITE_RVA as i64 + 5 + rel) as usize, SPREAD_CALLEE_RVA);
+        assert_eq!(&NEWSTATE_ANCHOR[24..30], &[0x41, 0xb9, 0x68, 0x02, 0x00, 0x00]);
+    }
+
+    fn fresh() -> Spread {
+        let mut s = Spread { gen: 0, k: 0, rng: 0, q_ctx: 0, q_shooter: 0, count: 0, accepted: 0, forced: 0, thr: 0, thread: 0 };
+        s.reset(1);
+        s
+    }
+
+    /// queries of `n` candidates each for shooter ids 1.., returns the accept pattern
+    fn run(s: &mut Spread, queries: &[usize]) -> Vec<bool> {
+        let mut out = Vec::new();
+        for (q, &n) in queries.iter().enumerate() {
+            for _ in 0..n { out.push(s.accept(0x1000, q + 1)); }
+        }
+        out
+    }
+
+    #[test]
+    fn xorshift_matches_alex() {
+        // Alex: state 0x9e3779b9 -> first output (13/17/5)
+        let mut st = SPREAD_SEED;
+        let mut x = SPREAD_SEED;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        assert_eq!(xs(&mut st), x);
+        assert_eq!(st, x);
+        // a zero output stores 0x1234567 (and returns 0)
+        let mut z = 0u32;
+        assert_eq!(xs(&mut z), 0);
+        assert_eq!(z, 0x0123_4567);
+    }
+
+    #[test]
+    fn spread_is_deterministic_after_reset() {
+        let qs = [40usize, 40, 3, 120, 7, 60, 1, 200];
+        let (mut a, mut b) = (fresh(), fresh());
+        let ra = run(&mut a, &qs);
+        // b first runs another history, then resets as at battle start
+        run(&mut b, &[500, 2, 77]);
+        b.reset(2);
+        assert_eq!(run(&mut b, &qs), ra);
+        assert_eq!(a.k, b.k);
+    }
+
+    #[test]
+    fn spread_accepts_something_in_every_long_query() {
+        let mut s = fresh();
+        for q in 0..200usize {
+            let n = 5 + (q * 37) % 150;
+            let acc = (0..n).filter(|_| s.accept(0x1000, q + 1)).count();
+            // forced accept fires by candidate 2m <= ~K: long queries always keep one
+            if n >= 2 * (s.k.max(1) as usize) { assert!(acc > 0, "query {q} n={n} k={}", s.k); }
+        }
+    }
+
+    #[test]
+    fn spread_small_units_always_shot() {
+        // once K has adapted to tiny targets (K <= P), every candidate passes
+        let mut s = fresh();
+        run(&mut s, &[3; 60]);
+        assert!(s.k <= SPREAD_P, "k={}", s.k);
+        assert!(run(&mut s, &[3; 5]).iter().all(|&x| x));
+    }
+
+    #[test]
+    fn spread_k_clamp() {
+        let mut s = fresh();
+        s.k = 0x2000;
+        s.count = 0x2100; // 3K + n = 0x8100 > 0x8003
+        s.q_shooter = 99;
+        s.accept(0x1000, 1);
+        assert_eq!(s.k, 0x2000);
+    }
+}

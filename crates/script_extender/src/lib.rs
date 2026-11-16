@@ -53,6 +53,7 @@ mod ceoguard;
 mod engineguard;
 mod sepatches;
 mod siege;
+mod battlefix;
 mod status;
 
 static SELF_HMODULE: AtomicUsize = AtomicUsize::new(0);
@@ -153,6 +154,7 @@ fn bootstrap() {
     sepatches::install(&table);
     crash::boot("siege");
     siege::install(&table);
+    battlefix::install(&table);
     ainudge::install(&table);
     ainudge::install_equipment(&table);
     ainudge::install_court(&table);
