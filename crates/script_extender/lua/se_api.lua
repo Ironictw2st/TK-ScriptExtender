@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set" }
 function se.frontend.has(feature)
 	local n = CREATOR_NATIVES[feature]
 	return n ~= nil and type(G(n)) == "function"
@@ -1383,6 +1383,28 @@ function se.modify.loc_text(key, text)
 	local f, e = any_faction_q()
 	if not f then return false, e end
 	return se_loc_set(f, key, text)
+end
+
+-- S8 skill trees. se.query.skill_tree(cqi) -> report (node set key, node -> skill keys, points).
+function se.query.skill_tree(cqi)
+	local okn, err = need("se_skill_tree_info")
+	if not okn then return nil, err end
+	local q, e = se.character(cqi)
+	if not q then return nil, e end
+	return se_skill_tree_info(q, num(cqi))
+end
+-- se.modify.character_skill_tree(cqi, node_set_key) -> ok, msg : rebuild the character's tree from
+-- another existing node set (engine builder; saved by key). Use at creation, before points are spent.
+function se.modify.character_skill_tree(cqi, key)
+	local okn, err = need("se_skill_tree_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "character_skill_tree: single player only" end
+	if type(key) ~= "string" or key == "" then return false, "key must be a node set key" end
+	return on_model("character_skill_tree(" .. str(cqi) .. ", " .. key .. ")", function()
+		local q, e = se.character(cqi)
+		if not q then return false, e end
+		return se_skill_tree_set(q, num(cqi), key)
+	end)
 end
 
 -- S3 spike: se.query.character_art(cqi) -> report (art set key, gender record, birth bytes);

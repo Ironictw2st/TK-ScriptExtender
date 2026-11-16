@@ -63,6 +63,7 @@ pub fn init(t: &Table) {
     init_art(t);
     init_loc(t);
     init_items(t);
+    init_tree(t);
 }
 
 pub unsafe fn register(l: *mut LuaState) {
@@ -82,6 +83,8 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_loc_get", se_loc_get);
     lua::set_global_fn(l, "se_loc_set", se_loc_set);
     lua::set_global_fn(l, "se_item_rows", se_item_rows);
+    lua::set_global_fn(l, "se_skill_tree_info", se_skill_tree_info);
+    lua::set_global_fn(l, "se_skill_tree_set", se_skill_tree_set);
 }
 
 #[link(name = "kernel32")]
@@ -1081,4 +1084,130 @@ unsafe extern "C" fn se_item_rows(l: *mut LuaState) -> c_int {
         Ok(s) => { log!("se_item_rows: {s}"); lua::push_str(l, &s); 1 }
         Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// S8: skill trees (notes/skill_trees.md). Tree T = DETAILS + 0x98, DETAILS = **(CHARACTER+0x260).
+//   T+0x38 String node-set key (saved; the load rebuilds the tree from it).
+//   rows: T+4 count, T+8 data (0x10 each: +4 node count, +8 nodes); node 0x40: +0 node record.
+//   node record (character_skill_nodes): key String @+8 (to confirm), skill record @+0x78 (skills.rs
+//   reads level details at (*node+0x78)+0xa0).
+//   Builder FUN_141a65390(T, FACTION, nodeset_rec, &faction_key, &subculture_key, obj+0x88,
+//   *(obj+0x38), u8 a, u8 b, &String) with obj = *(*(FACTION+0x288)+0xd0), faction record =
+//   FACTION+0xbf0 (key +8; subculture record *(rec+0x20), key +8). Same call FUN_141a65ff0 (new
+//   character) and FUN_141a66230 (respec, on an existing tree) make.
+// ------------------------------------------------------------------------------------------
+
+const DET_TREE: usize = 0x98;
+const TREE_KEY: usize = 0x38;
+
+struct TreeFns {
+    db_get: unsafe extern "C" fn(P) -> P,
+    nodesets: unsafe extern "C" fn(P) -> P,
+    record_base: unsafe extern "C" fn(P, *const c_void) -> P,
+    build: unsafe extern "C" fn(P, P, P, P, P, P, usize, u8, u8, P),
+}
+static TREE: OnceLock<TreeFns> = OnceLock::new();
+
+pub fn init_tree(t: &Table) {
+    let _ = TREE.set(unsafe {
+        TreeFns {
+            db_get: core::mem::transmute(t.get("db_get")),
+            nodesets: core::mem::transmute(t.get("skill_node_sets_table")),
+            record_base: core::mem::transmute(t.get("record_base")),
+            build: core::mem::transmute(t.get("skill_tree_build")),
+        }
+    });
+}
+
+unsafe fn tree_of(ch: usize) -> Result<usize, String> {
+    let det = rq(rq(ch + 0x260));
+    if det == 0 || !readable(det + DET_TREE, 0x60) { return Err("character has no details / tree".into()); }
+    Ok(det + DET_TREE)
+}
+
+unsafe fn rec_key(rec: usize) -> String {
+    if rec == 0 || !readable(rec, 0x20) { return String::new(); }
+    let k = string_at(rec + 8, false);
+    if !k.is_empty() && !k.starts_with('<') { k } else { string_at(rq(rec + 8), false) }
+}
+
+/// se_skill_tree_info(q_char, cqi) -> string  (read-only: node set key + node -> skill keys)
+unsafe extern "C" fn se_skill_tree_info(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let out = (|| -> Result<String, String> {
+        let ch = character(l, cqi)?;
+        let t = tree_of(ch)?;
+        let mut s = format!("character {cqi}: node set '{}'", string_at(t + TREE_KEY, false));
+        let rows = rd(t + 4) as usize;
+        let rdata = rq(t + 8);
+        if rows > 64 || (rows > 0 && !readable(rdata, rows * 0x10)) { return Err("odd tree rows".into()); }
+        let mut n = 0;
+        for r in 0..rows {
+            let row = rdata + r * 0x10;
+            let cnt = rd(row + 4) as usize;
+            let nodes = rq(row + 8);
+            if cnt > 64 || (cnt > 0 && !readable(nodes, cnt * 0x40)) { continue; }
+            for c in 0..cnt {
+                let nd = nodes + c * 0x40;
+                let rec = rq(nd);
+                let skill = if rec != 0 && readable(rec + 0x78, 8) { rq(rec + 0x78) } else { 0 };
+                s.push_str(&format!(" | r{r}c{c} node '{}' skill '{}' pts {}", rec_key(rec), rec_key(skill), rd(nd + 0x10) & 0xff));
+                n += 1;
+                if n >= 60 { break; }
+            }
+        }
+        Ok(s)
+    })();
+    match out {
+        Ok(m) => { log!("se_skill_tree_info: {m}"); lua::push_str(l, &m); 1 }
+        Err(e) => { (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// se_skill_tree_set(q_char, cqi, node_set_key) -> ok, msg   (rebuild the tree; creation-time use)
+unsafe extern "C" fn se_skill_tree_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let cqi = (api.tointeger)(l, 2) as u32;
+    let key = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let tf = TREE.get().ok_or("tree table missing")?;
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        if key.is_empty() || key.len() > 120 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return Err("bad node set key".into()); }
+        let ch = character(l, cqi)?;
+        let t = tree_of(ch)?;
+        let fac = rq(rq(ch + 0x270));
+        if fac == 0 || !readable(fac + 0xbf8, 8) { return Err("character has no faction".into()); }
+        let frec = rq(fac + 0xbf0);
+        if frec == 0 || !readable(frec + 0x28, 8) { return Err("faction has no DB record".into()); }
+        let sub = rq(frec + 0x20);
+        if sub == 0 || !readable(sub + 0x18, 8) { return Err("faction record has no subculture".into()); }
+        let obj = rq(rq(fac + 0x288) + 0xd0);
+        if obj == 0 || !readable(obj + 0x98, 8) { return Err("no campaign object".into()); }
+        let model = rq(rq(ch + 0x250) + 0x78);
+        if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
+        let db = (tf.db_get)((model + 0x3b38) as P);
+        if db.is_null() { return Err("no db".into()); }
+        let table = (tf.nodesets)(db);
+        if table.is_null() { return Err("node set table not loaded".into()); }
+        let mut c = key.as_bytes().to_vec(); c.push(0);
+        let ks: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+        (e.str_from_cstr)(ks.as_mut_ptr() as P, c.as_ptr());
+        let rec = (tf.record_base)(table, ks.as_ptr() as *const c_void) as usize;
+        if rec == 0 || rec_key(rec) != key { return Err(format!("no node set '{key}'")); }
+        let before = string_at(t + TREE_KEY, false);
+        (e.str_assign)((t + TREE_KEY) as P, ks.as_mut_ptr() as P);
+        let empty: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
+        (e.str_from_cstr)(empty.as_mut_ptr() as P, b"\0".as_ptr());
+        (tf.build)(t as P, fac as P, rec as P, (frec + 8) as P, (sub + 8) as P, (obj + 0x88) as P, rq(obj + 0x38), 1, 0, empty.as_mut_ptr() as P);
+        let msg = format!("character {cqi}: skill tree '{before}' -> '{}'", string_at(t + TREE_KEY, false));
+        log!("se_skill_tree_set: {msg}");
+        Ok(msg)
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_skill_tree_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
 }
