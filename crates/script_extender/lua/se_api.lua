@@ -1540,10 +1540,9 @@ function se.query.character_art(cqi)
 end
 
 -- se.modify.character_art_set(cqi, art_set_key) -> ok, msg
--- card (optional): unit-card / HUD portrait mode. "auto" (default): 190e_custom_portrait sets and
--- women's unique sets show the art set's own card, generic sets (both genders) the equipped-armour
--- composite with their face piece, historical men are left as they are; or "unique", "composite",
--- "keep".
+-- card (optional): unit-card / HUD portrait mode. "auto" (default): women and 190e_custom_portrait
+-- sets show the art set's own card; "unique", "composite" (equipped-armour card, like historical
+-- men), "keep".
 function se.modify.character_art_set(cqi, key, card)
 	local okn, err = need("se_char_art2")
 	if not okn then return false, err end
