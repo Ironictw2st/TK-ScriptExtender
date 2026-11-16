@@ -83,6 +83,7 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_loc_get", se_loc_get);
     lua::set_global_fn(l, "se_loc_set", se_loc_set);
     lua::set_global_fn(l, "se_item_rows", se_item_rows);
+    lua::set_global_fn(l, "se_custom_item_look", se_custom_item_look);
     lua::set_global_fn(l, "se_skill_tree_info", se_skill_tree_info);
     lua::set_global_fn(l, "se_skill_tree_set", se_skill_tree_set);
 }
@@ -1213,4 +1214,103 @@ unsafe extern "C" fn se_skill_tree_set(l: *mut LuaState) -> c_int {
         Err(er) => { log!("se_skill_tree_set: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
     }
     2
+}
+
+// ------------------------------------------------------------------------------------------
+// S7: copy an existing item's look into a custom item slot (notes/custom_items.md).
+//   ceos_to_equipment_variants rows: 0x90 bytes {vtable, String ceo key @+8, look fields @+0x18..+0x90
+//   (record pointers to meshes / weapons / mounts / animations, one row per game mode)}.
+//   ceo_to_ui_display rows: 0x38 bytes {vtable, key @+8, String female image @+0x18, male @+0x28}.
+// Only slot keys containing "190e_custom_" are written. Rows are matched in table order (game modes
+// appear in the same order for every CEO); if the source has fewer rows, its first row is used.
+// A source row holding a heap String inside the copied range is refused (a raw copy would share it).
+// ------------------------------------------------------------------------------------------
+
+const VAR_ROW: usize = 0x90;
+const VAR_COPY_FROM: usize = 0x18;
+
+unsafe fn table_rows(table: usize) -> Vec<usize> {
+    let mut v = Vec::new();
+    if table == 0 || !readable(table, 0x20) { return v; }
+    let n = rd(table + 0x14) as usize;
+    let data = rq(table + 0x18);
+    if n == 0 || n > 200000 || !readable(data, n * 8) { return v; }
+    for i in 0..n {
+        let r = rq(data + i * 8);
+        if r != 0 { v.push(r); }
+    }
+    v
+}
+
+/// true when [from, to) of `rec` contains something that looks like a heap String with text
+unsafe fn has_heap_string(rec: usize, from: usize, to: usize) -> bool {
+    let mut o = from;
+    while o + 16 <= to {
+        let len = rd(rec + o) as usize;
+        let ptr = rq(rec + o + 8);
+        if len > 0 && len < 512 && (ptr >> 60) != 8 && ptr > 0x10000 && readable(ptr, len) {
+            let b = core::slice::from_raw_parts(ptr as *const u8, len);
+            if b.iter().all(|c| (0x20..0x7f).contains(c)) { return true; }
+        }
+        o += 8;
+    }
+    false
+}
+
+/// se_custom_item_look(q_faction, slot_ceo_key, source_ceo_key) -> ok, msg
+unsafe extern "C" fn se_custom_item_look(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let slot = lua::to_str(l, 2);
+    let src = lua::to_str(l, 3);
+    let out = (|| -> Result<String, String> {
+        let it = ITEMS.get().ok_or("items table missing")?;
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        if !slot.contains("190e_custom_") || !valid_ceo(&slot) { return Err("slot key must contain 190e_custom_".into()); }
+        if !valid_ceo(&src) || src == slot { return Err("bad source key".into()); }
+        let f = crate::progression::faction_from_arg(l, 1)?;
+        let model = rq(rq(f + 0x288) + 0x78);
+        if model == 0 || !readable(model + 0x3b38, 8) { return Err("no model".into()); }
+        let db = (it.db_get)((model + 0x3b38) as P);
+        if db.is_null() { return Err("no db".into()); }
+        // look rows
+        let rows = table_rows((it.variants)(db) as usize);
+        let srows: Vec<usize> = rows.iter().copied().filter(|r| readable(*r, VAR_ROW) && string_at(r + 8, false) == src).collect();
+        let drows: Vec<usize> = rows.iter().copied().filter(|r| readable(*r, VAR_ROW) && string_at(r + 8, false) == slot).collect();
+        if srows.is_empty() { return Err(format!("no equipment variant rows for '{src}'")); }
+        if drows.is_empty() { return Err(format!("no equipment variant rows for '{slot}'")); }
+        for (i, d) in drows.iter().enumerate() {
+            let s = srows[i.min(srows.len() - 1)];
+            if rq(*d) != rq(s) { return Err("row types differ; refusing".into()); }
+            if has_heap_string(s, VAR_COPY_FROM, VAR_ROW) { return Err(format!("source row of '{src}' holds text fields in the copied range; refusing")); }
+        }
+        for (i, d) in drows.iter().enumerate() {
+            let s = srows[i.min(srows.len() - 1)];
+            core::ptr::copy_nonoverlapping((s + VAR_COPY_FROM) as *const u8, (d + VAR_COPY_FROM) as *mut u8, VAR_ROW - VAR_COPY_FROM);
+        }
+        // icon rows
+        let urows = table_rows((it.ui_display)(db) as usize);
+        let us = urows.iter().copied().find(|r| readable(*r, 0x38) && string_at(r + 8, false) == src);
+        let ud = urows.iter().copied().find(|r| readable(*r, 0x38) && string_at(r + 8, false) == slot);
+        let icon = match (us, ud) {
+            (Some(s), Some(d)) => {
+                (e.str_assign)((d + 0x18) as P, (s + 0x18) as P);
+                (e.str_assign)((d + 0x28) as P, (s + 0x28) as P);
+                "icons copied"
+            }
+            (None, _) => "source has no ui_display row (icon unchanged)",
+            (_, None) => "slot has no ui_display row (icon unchanged)",
+        };
+        let msg = format!("look of '{src}' copied into '{slot}' ({} variant rows; {icon})", drows.len());
+        log!("se_custom_item_look: {msg}");
+        Ok(msg)
+    })();
+    match out {
+        Ok(m) => { (api.pushboolean)(l, 1); lua::push_str(l, &m); }
+        Err(er) => { log!("se_custom_item_look: {er}"); (api.pushboolean)(l, 0); lua::push_str(l, &er); }
+    }
+    2
+}
+
+fn valid_ceo(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 160 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }

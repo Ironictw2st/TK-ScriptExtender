@@ -33,6 +33,7 @@ mod ainudge;
 mod alliances;
 mod creator;
 mod portraits;
+mod customtrees;
 mod autoresolve;
 mod income;
 mod airecruit;
@@ -120,6 +121,7 @@ fn bootstrap() {
     skills::init(&table);
     alliances::init(&table);
     creator::init(&table);
+    customtrees::init(&table);
     bundles::init(&table);
     diplomacy::init(&table);
     dilemma::init(&table);
@@ -146,6 +148,8 @@ fn bootstrap() {
     prebattle::install(&table);
     crash::boot("creator");
     creator::install(&table);
+    crash::boot("customtrees");
+    customtrees::install(&table);
     crash::boot("navalland");
     navalland::install(&table);
     crash::boot("ceoguard");
