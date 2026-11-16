@@ -1385,8 +1385,9 @@ function se.modify.loc_text(key, text)
 	return se_loc_set(f, key, text)
 end
 
--- S8 skill trees. se.query.skill_tree(cqi) -> report (node set key, node -> skill keys, points).
-function se.query.skill_tree(cqi)
+-- S8 skill trees. se.query.skill_tree_layout(cqi) -> report (node set key, node -> skill keys, points).
+-- (se.query.skill_tree above is the 0.48 API: {points, rows, nodes}; this does not replace it.)
+function se.query.skill_tree_layout(cqi)
 	local okn, err = need("se_skill_tree_info")
 	if not okn then return nil, err end
 	local q, e = se.character(cqi)

@@ -1195,7 +1195,10 @@ unsafe extern "C" fn se_skill_tree_set(l: *mut LuaState) -> c_int {
         let ks: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
         (e.str_from_cstr)(ks.as_mut_ptr() as P, c.as_ptr());
         let rec = (tf.record_base)(table, ks.as_ptr() as *const c_void) as usize;
-        if rec == 0 || rec_key(rec) != key { return Err(format!("no node set '{key}'")); }
+        // record_base returns null for an unknown key; node-set records keep their key elsewhere
+        // than +8, so check the vtable lies in the exe instead of comparing the key text
+        let (mb, ms) = crate::process::main_module();
+        if rec == 0 || !readable(rec, 0x40) || rq(rec) < mb || rq(rec) >= mb + ms { return Err(format!("no node set '{key}'")); }
         let before = string_at(t + TREE_KEY, false);
         (e.str_assign)((t + TREE_KEY) as P, ks.as_mut_ptr() as P);
         let empty: &'static mut [u8; 16] = Box::leak(Box::new([0u8; 16]));
