@@ -1933,20 +1933,13 @@ Since 0.49.
 command does; saved by the engine. `get_forename()` / `get_surname()` return `""` for a renamed
 part (they return names-table keys). Since 0.49. `se.query.character_names(cqi)` dumps the parts.
 
-##### `se.modify.character_art_set(cqi, art_set_key [, card]) -> ok, message`
+##### `se.modify.character_art_set(cqi, art_set_key) -> ok, message`
 
 Any art set the game has loaded (historical, generic, mod sets). Portrait and campaign model change
 at once. Saved by key; the game re-checks it against the character's gender at load and picks
 another set when it does not fit, so spawn the character from a template of the wanted gender and
 keep the art set in your first-tick re-apply. `se.query.character_art(cqi)` reports the current
 set. Since 0.49.
-
-`card` sets how the unit card and the HUD leader portrait are drawn. The game composes them from
-the equipped armour for characters spawned from a generic template (and for historical men), and
-uses the art set's own card for historical women. `"auto"` (default): `190e_custom_portrait` sets
-and other unique sets on a woman get the art set's own card; generic sets (`_art_set_generic_`,
-both genders: their card is a face piece for the armour composite) get the composite; historical
-men are left as they are. `"unique"`, `"composite"` and `"keep"` force it.
 
 ##### `se.modify.character_age(cqi, years) -> ok, message`
 
