@@ -456,6 +456,12 @@ Refusals you will see: `unit_key must be a non-empty string`, `opts.hp must be 0
 `<key> is locked (reasons 0x...); use opts.source = 'locked' or 'any'`.
 
 Natives: `se_recruit_unit`, `se_slot_items` (since 0.4/0.5); `hp` / `experience` need 0.8.
+
+New units arrive mustering (about 20% of their men) and `opts.hp` raises them a second later. The
+soldier counts on the army panel's unit cards follow the unit's hit points, but an open panel only
+rebuilds its cards when the army is selected again (or the turn changes): if the army was selected
+during the recruit, its cards keep the arrival numbers until you click away and back. The model
+(`percentage_proportion_of_full_strength`) is right at once.
 Status: verified live, including a locked unit (`reasons 0x402`) forced through, cost deducted,
 unit instantly in the slot.
 
