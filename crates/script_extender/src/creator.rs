@@ -741,8 +741,11 @@ unsafe extern "C" fn se_char_art2(l: *mut LuaState) -> c_int {
             return Ok(format!("{} art objects: {}", map.len(), v.join(" ")));
         }
         let Some((_, obj)) = map.iter().find(|(k, _)| *k == key) else { return Err(format!("no art object '{key}' ({} known)", map.len())) };
-        if cur != 0 && readable(cur, 8) && readable(*obj, 8) && rq(cur) != rq(*obj) {
-            return Err("art object type differs; refusing".into());
+        // The map only holds art objects (keyed by their own record key), so the entry itself is the
+        // type check. The old guard compared the first qword of the two objects, which is not a
+        // vtable: it refused valid sets (190e_custom_portrait_2_f, 16 Nov).
+        if !readable(*obj, 0x40) || art_obj_key(*obj) != key {
+            return Err(format!("art object for '{key}' does not read back its key; refusing"));
         }
         core::ptr::write_unaligned((ch + 0x548) as *mut usize, *obj);
         let msg = format!("character {cqi}: art obj '{cur_key}' -> '{key}'");
