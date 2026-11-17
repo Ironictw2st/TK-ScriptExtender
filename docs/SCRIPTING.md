@@ -1998,6 +1998,16 @@ the game exits; re-apply before the item is shown. Since 0.49.
 Item stats use `se.modify.effect_bundle_define` (§3.10) on the slot's bundle; the bundle stays on
 the character through save / load, its values must be redefined every session.
 
+##### `se.modify.ceo_effects(cqi, ceo_key, effects) -> ok, message`
+
+Replaces the effect list of a `190e_custom_` item the character holds, so the stats belong to the item
+itself: its tooltip lists them and they move with it (no effect bundle). `effects` = `{ {effect=, scope=,
+value=}, ... }` as for `effect_bundle_define`. The list belongs to the CEO key: every holder of that
+key shares it. Lasts until the game exits: set it again at every first tick. The engine applies the
+new values at its next recompute; unequip and equip the item once to apply them at once. Single
+player only. Since 0.49 (creator.26). Natives: `se_ceo_fx_set(q_faction, q_ceo, spec)`,
+`se_ceo_fx_info(q_faction, q_ceo)` (dump), `se_ceo_fx_restore(q_faction, q_ceo)`.
+
 #### `se.creator.reapply(config) -> { applied = n, failed = { "step key: reason", ... } }`
 
 One call at every first tick (and once after creating the character) for everything in the "yes"
