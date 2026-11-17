@@ -1631,14 +1631,18 @@ function se.modify.ceo_effects(cqi, ceo_key, effects)
 	if not spec then return false, e0 end
 	local q, e = se.character(cqi)
 	if not q then return false, e end
+	-- the item may be held by the character (character-located CEOs) or by its faction (faction-located items the
+	-- character has equipped): look in both (lane test 17 Nov: a custom weapon is faction-held)
 	local ceo = nil
 	pcall(function()
-		local l = q:ceo_management():all_ceos()
-		for i = 0, l:num_items() - 1 do
-			if l:item_at(i):ceo_data_key() == ceo_key then ceo = l:item_at(i); return end
+		for _, holder in ipairs({ q:ceo_management(), q:faction():ceo_management() }) do
+			local l = holder:all_ceos()
+			for i = 0, l:num_items() - 1 do
+				if l:item_at(i):ceo_data_key() == ceo_key then ceo = l:item_at(i); return end
+			end
 		end
 	end)
-	if not ceo then return false, "ceo_effects: character " .. str(cqi) .. " does not hold " .. ceo_key end
+	if not ceo then return false, "ceo_effects: neither character " .. str(cqi) .. " nor its faction holds " .. ceo_key end
 	return se_ceo_fx_set(q:faction(), ceo, spec)
 end
 
