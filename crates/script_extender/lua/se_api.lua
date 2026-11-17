@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", ceo_effects = "se_ceo_fx_set", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
 function se.frontend.has(feature)
 	-- Lua-side helpers: present when this module defines them (the DLL embeds the module)
 	if feature == "creator_reapply" then
@@ -1615,6 +1615,31 @@ local function bundle_call(tag, native, faction_key, f)
 		if not fac then return false, e1 end
 		return f(fac)
 	end)
+end
+
+-- S7 items (creator.26): se.modify.ceo_effects(cqi, ceo_key, effects) -> ok, msg
+-- Replaces the effect list of a 190e_custom_ CEO the character holds (the item's OWN stats: its tooltip shows
+-- them, they move with the item). effects = { {effect=, scope=, value=}, ... }. The list belongs to the CEO KEY
+-- (every holder of that key shares it). In-process: set again every session (first tick). The engine applies
+-- the new values at its next recompute (an unequip + equip of the item, or the turn).
+function se.modify.ceo_effects(cqi, ceo_key, effects)
+	local okn, err = need("se_ceo_fx_set")
+	if not okn then return false, err end
+	if creator_mp() then return false, "ceo_effects: single player only" end
+	if type(ceo_key) ~= "string" or not string.match(ceo_key, "190e_custom_") then return false, "ceo_effects: not a 190e_custom_ CEO" end
+	local spec, e0 = effect_spec(effects)
+	if not spec then return false, e0 end
+	local q, e = se.character(cqi)
+	if not q then return false, e end
+	local ceo = nil
+	pcall(function()
+		local l = q:ceo_management():all_ceos()
+		for i = 0, l:num_items() - 1 do
+			if l:item_at(i):ceo_data_key() == ceo_key then ceo = l:item_at(i); return end
+		end
+	end)
+	if not ceo then return false, "ceo_effects: character " .. str(cqi) .. " does not hold " .. ceo_key end
+	return se_ceo_fx_set(q:faction(), ceo, spec)
 end
 
 -- se.modify.effect_bundle_define(bundle_key, effects [, faction_key])
