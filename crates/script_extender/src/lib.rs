@@ -123,6 +123,8 @@ fn bootstrap() {
     creator::init(&table);
     customtrees::init(&table);
     bundles::init(&table);
+    crash::boot("ceofx");
+    bundles::install_ceofx(&table);
     diplomacy::init(&table);
     dilemma::init(&table);
     build::apply_config();
