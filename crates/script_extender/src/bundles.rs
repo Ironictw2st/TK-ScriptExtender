@@ -83,6 +83,9 @@ pub unsafe fn register(l: *mut LuaState) {
     lua::set_global_fn(l, "se_effect_bundle_define", se_effect_bundle_define);
     lua::set_global_fn(l, "se_effect_bundle_restore", se_effect_bundle_restore);
     lua::set_global_fn(l, "se_effect_bundle_apply_custom", se_effect_bundle_apply_custom);
+    lua::set_global_fn(l, "se_ceo_fx_info", se_ceo_fx_info);
+    lua::set_global_fn(l, "se_ceo_fx_set", se_ceo_fx_set);
+    lua::set_global_fn(l, "se_ceo_fx_restore", se_ceo_fx_restore);
 }
 
 extern "system" {
@@ -345,4 +348,197 @@ unsafe extern "C" fn se_effect_bundle_apply_custom(l: *mut LuaState) -> c_int {
         Ok(format!("'{key}' applied to faction {:#x} for {turns} turns with {} custom effects ({active} active after rebuild; faction bundles {before} -> {after})", faction, list.len()))
     })();
     bool_result(l, r, "se_effect_bundle_apply_custom")
+}
+
+// ------------------------------------------------------------------------------------------
+// CEO effect lists (creator, 17 Nov 2026): item stats ON the CEO instead of a separate bundle.
+//   CcoCampaignCeo.EffectList = FUN_142f582c0(cco, out): instance = *(cco+0x20);
+//   list = FUN_1418afe20(instance) = instance->vfunc[1]() (active node) ->vfunc[2]() (effect list).
+//   CEO instance +0x20 = the CEO record, whose key CA::String sits at record+0 (ainudge, live 9 Nov).
+//   Effect list = {u32 cap +0, u32 count +4, entries* +8}; entry = 0x28 bytes, presumably the bundle
+//   entry without its stage: +0 effect record, +8 scope record, +0x10 f32 value, +0x18 vector{cap,count,
+//   data} of resolved values (FUN_142d73450 copies / frees exactly that). TO CONFIRM LIVE with
+//   se_ceo_fx_info before se_ceo_fx_set is trusted.
+//   Writes only lists of CEOs whose key contains "190e_custom_". The stock array is kept (never freed).
+// ------------------------------------------------------------------------------------------
+
+type CeoFxGetter = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type CeoFxListOf = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+static CEOFX_GETTER: OnceLock<retour::GenericDetour<CeoFxGetter>> = OnceLock::new();
+static CEOFX_LIST_OF: OnceLock<CeoFxListOf> = OnceLock::new();
+/// CEO key -> last CEO instance a tooltip / panel asked EffectList for (probe aid only)
+static CEOFX_SEEN: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+/// effect list -> stock (cap, count, data), for se_ceo_fx_restore
+static CEOFX_ORIG: Mutex<Option<HashMap<usize, (u32, u32, usize)>>> = Mutex::new(None);
+const CEOFX_ENTRY: usize = 0x28;
+
+pub fn install_ceofx(t: &Table) {
+    unsafe {
+        let _ = CEOFX_LIST_OF.set(core::mem::transmute(t.get("ceo_effect_list_of")));
+        let target: CeoFxGetter = core::mem::transmute(t.get("ceo_cco_effect_list"));
+        let Ok(d) = retour::GenericDetour::new(target, ceofx_getter_detour) else {
+            log!("ceo fx: could not create the EffectList detour (natives still work with a CEO script object)");
+            return;
+        };
+        let _ = CEOFX_GETTER.set(d);
+        let Some(d) = CEOFX_GETTER.get() else { return };
+        match crate::freeze::enable_detour("ceo_cco_effect_list", "ceo_fx_probe", target as usize, d) {
+            Ok(()) => log!("ceo fx: EffectList probe detour installed (UI only, records the CEO instance per key)"),
+            Err(e) => log!("ceo fx: EffectList detour not enabled: {e}"),
+        }
+    }
+}
+
+unsafe fn ceo_key_of(inst: usize) -> String {
+    if inst == 0 || !readable(inst, 0x28) { return String::new(); }
+    let rec = rq(inst + 0x20);
+    if rec == 0 || !readable(rec, 0x20) { return String::new(); }
+    ca_string(rec)
+}
+
+unsafe extern "C" fn ceofx_getter_detour(cco: *mut c_void, out: *mut c_void) -> *mut c_void {
+    let Some(h) = CEOFX_GETTER.get() else { return out };
+    let c = cco as usize;
+    if readable(c, 0x28) {
+        let inst = rq(c + 0x20);
+        let key = ceo_key_of(inst);
+        if !key.is_empty() {
+            if let Ok(mut g) = CEOFX_SEEN.lock() {
+                let m = g.get_or_insert_with(HashMap::new);
+                if m.insert(key.clone(), inst) != Some(inst) && key.contains("190e_custom_") {
+                    log!("ceo fx: tooltip saw {key} instance {inst:#x}");
+                }
+            }
+        }
+    }
+    h.call(cco, out)
+}
+
+/// The CEO instance behind a QUERY_CEO script object (arg idx), or the last tooltip instance of `key`.
+/// Candidates are accepted only when their record key reads back (and equals `key` when one is given).
+unsafe fn ceo_instance(l: *mut LuaState, idx: c_int, key: &str, probe: &mut String) -> Result<usize, String> {
+    let api = lua::api().ok_or("lua api missing")?;
+    let ty = (api.type_)(l, idx);
+    if ty == 2 || ty == 7 {
+        let p = (api.touserdata)(l, idx) as usize;
+        let cands = [rq(rq(rq(p) + 8) + 0x18), rq(rq(p + 8) + 0x18), rq(p + 0x18), rq(rq(p) + 0x18), rq(rq(p) + 8), rq(p + 8), rq(p), p];
+        for (i, c) in cands.iter().enumerate() {
+            let k = ceo_key_of(*c);
+            probe.push_str(&format!("cand{i}={c:#x}('{k}') "));
+        }
+        for c in cands {
+            let k = ceo_key_of(c);
+            if !k.is_empty() && (key.is_empty() || k == key) && readable(rq(c), 0x18) { return Ok(c); }
+        }
+        let want = if key.is_empty() { String::new() } else { format!(" '{key}'") };
+        return Err(format!("no candidate of the script object is a CEO{want} ({probe})"));
+    }
+    if key.is_empty() { return Err("give a CEO script object or a key a tooltip has shown".into()); }
+    let seen = CEOFX_SEEN.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(key).copied()));
+    let inst = seen.ok_or_else(|| format!("no instance of '{key}' seen yet (hover its tooltip once)"))?;
+    if ceo_key_of(inst) != key { return Err(format!("the remembered instance of '{key}' no longer reads back")); }
+    Ok(inst)
+}
+
+unsafe fn ceo_list(inst: usize) -> Result<usize, String> {
+    let f = CEOFX_LIST_OF.get().ok_or("ceo_effect_list_of missing")?;
+    let vt = rq(inst);
+    if vt == 0 || !readable(vt, 0x18) || rq(vt + 8) == 0 { return Err("CEO instance has no node accessor".into()); }
+    let list = f(inst as *mut c_void) as usize;
+    if list == 0 || !readable(list, 0x10) { return Err("the CEO has no readable effect list".into()); }
+    let (cap, count, data) = (rd(list), rd(list + 4), rq(list + 8));
+    if count > cap || cap > 256 || (count > 0 && !readable(data, count as usize * CEOFX_ENTRY)) {
+        return Err(format!("effect list {list:#x} is not sane (cap {cap}, count {count}, data {data:#x})"));
+    }
+    Ok(list)
+}
+
+unsafe fn ceo_list_dump(list: usize) -> String {
+    let (cap, count, data) = (rd(list), rd(list + 4), rq(list + 8));
+    let mut s = format!("list={list:#x} cap={cap} count={count} data={data:#x}\n");
+    for i in 0..(count as usize).min(32) {
+        let en = data + i * CEOFX_ENTRY;
+        let words: Vec<String> = (0..5).map(|k| format!("{:016x}", rq(en + k * 8))).collect();
+        s.push_str(&format!("  [{i}] effect='{}' scope='{}' value={} vec={}/{} {:#x}\n      {}\n",
+            record_key(rq(en)), record_key(rq(en + 8)), rf(en + 0x10), rd(en + 0x1c), rd(en + 0x18), rq(en + 0x20), words.join(" ")));
+    }
+    s
+}
+
+/// se_ceo_fx_info(q_faction, q_ceo|nil, key|nil) -> dump | nil, msg
+unsafe extern "C" fn se_ceo_fx_info(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let key = lua::to_str(l, 3);
+    let mut probe = String::new();
+    let r: Result<String, String> = (|| {
+        let inst = ceo_instance(l, 2, &key, &mut probe)?;
+        let vt = rq(inst);
+        let g: CeoFxListOf = core::mem::transmute(rq(vt + 8));
+        let node = g(inst as *mut c_void) as usize;
+        let list = ceo_list(inst)?;
+        Ok(format!("ceo='{}' instance={inst:#x} vtable={vt:#x} record={:#x} node={node:#x} node_vtable={:#x}\n{}probe: {probe}\n",
+            ceo_key_of(inst), rq(inst + 0x20), rq(node), ceo_list_dump(list)))
+    })();
+    match r {
+        Ok(s) => { log!("se_ceo_fx_info:\n{s}"); lua::push_str(l, &s); 1 }
+        Err(e) => { log!("se_ceo_fx_info: {e}"); (api.pushnil)(l); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// se_ceo_fx_set(q_faction, q_ceo, "effect|scope|value;...") -> ok, msg
+unsafe extern "C" fn se_ceo_fx_set(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let spec = lua::to_str(l, 3);
+    let mut probe = String::new();
+    let r: Result<String, String> = (|| {
+        let e = ENGINE.get().ok_or("engine table missing")?;
+        let (_, db) = db_of(e, l, 1)?;
+        let inst = ceo_instance(l, 2, "", &mut probe)?;
+        let key = ceo_key_of(inst);
+        if !key.contains("190e_custom_") { return Err(format!("'{key}' is not a 190e_custom_ CEO; refusing")); }
+        let list = ceo_list(inst)?;
+        let fx = parse_spec(e, db, &spec)?;
+        // entries built by the engine's own bundle-entry constructor (0x30), first 0x28 bytes kept;
+        // the resolved-values vector it allocates moves into the new entry (temp is not destroyed)
+        let bytes = fx.len() * CEOFX_ENTRY;
+        let data = (e.alloc)(bytes, 0) as usize;
+        if data == 0 { return Err("engine allocator returned null".into()); }
+        core::ptr::write_bytes(data as *mut u8, 0, bytes);
+        for (i, (er, sr, v)) in fx.iter().enumerate() {
+            let mut tmp = [0u8; 0x30];
+            (e.entry_ctor)(tmp.as_mut_ptr() as *mut c_void, *er as *mut c_void, *sr as *mut c_void, *v);
+            core::ptr::copy_nonoverlapping(tmp.as_ptr(), (data + i * CEOFX_ENTRY) as *mut u8, CEOFX_ENTRY);
+        }
+        if let Ok(mut g) = CEOFX_ORIG.lock() {
+            g.get_or_insert_with(HashMap::new).entry(list).or_insert((rd(list), rd(list + 4), rq(list + 8)));
+        }
+        core::ptr::write_unaligned((list + 8) as *mut usize, data);
+        core::ptr::write_unaligned(list as *mut u32, fx.len() as u32);
+        core::ptr::write_unaligned((list + 4) as *mut u32, fx.len() as u32);
+        Ok(format!("'{key}': {} effects set\n{}", fx.len(), ceo_list_dump(list)))
+    })();
+    match r {
+        Ok(s) => { log!("se_ceo_fx_set: {s}"); (api.pushboolean)(l, 1); lua::push_str(l, &s); 2 }
+        Err(e) => { log!("se_ceo_fx_set: {e}"); (api.pushboolean)(l, 0); lua::push_str(l, &e); 2 }
+    }
+}
+
+/// se_ceo_fx_restore(q_faction, q_ceo) -> ok, msg   (stock array back; ours is leaked)
+unsafe extern "C" fn se_ceo_fx_restore(l: *mut LuaState) -> c_int {
+    let Some(api) = lua::api() else { return 0 };
+    let mut probe = String::new();
+    let r: Result<String, String> = (|| {
+        let inst = ceo_instance(l, 2, "", &mut probe)?;
+        let list = ceo_list(inst)?;
+        let orig = CEOFX_ORIG.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&list).copied()));
+        let (cap, count, data) = orig.ok_or("this CEO's list was never rewritten")?;
+        core::ptr::write_unaligned((list + 8) as *mut usize, data);
+        core::ptr::write_unaligned(list as *mut u32, cap);
+        core::ptr::write_unaligned((list + 4) as *mut u32, count);
+        Ok(format!("'{}' stock list back ({count} effects)", ceo_key_of(inst)))
+    })();
+    match r {
+        Ok(s) => { log!("se_ceo_fx_restore: {s}"); (api.pushboolean)(l, 1); lua::push_str(l, &s); 2 }
+        Err(e) => { log!("se_ceo_fx_restore: {e}"); (api.pushboolean)(l, 0); lua::push_str(l, &e); 2 }
+    }
 }
