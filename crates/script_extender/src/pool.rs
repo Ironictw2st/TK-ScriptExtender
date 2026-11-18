@@ -63,6 +63,7 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::alliances::register(l);
     crate::creator::register(l);
     crate::portraits::register(l);
+    crate::library::register(l);
     crate::customtrees::register(l);
     crate::bundles::register(l);
     crate::autoresolve::register(l);

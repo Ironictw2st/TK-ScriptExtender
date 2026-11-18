@@ -33,6 +33,7 @@ mod ainudge;
 mod alliances;
 mod creator;
 mod portraits;
+mod library;
 mod customtrees;
 mod autoresolve;
 mod income;

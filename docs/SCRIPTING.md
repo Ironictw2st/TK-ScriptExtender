@@ -1897,7 +1897,19 @@ Which changes the engine keeps by itself, and which must be re-applied at every 
 `available()` is true when the natives are registered and the DLL accepted the game build. Feature
 names: `character_name`, `character_art`, `character_age`, `faction_name`, `faction_flag`,
 `faction_colours`, `custom_portraits`, `skill_trees`, `custom_skill_trees`, `custom_item_look`,
-`loc_text`, `creator_reapply`. Since 0.49.
+`loc_text`, `creator_reapply`, `library`. Since 0.49.
+
+##### `se.frontend.library_save(kind, id, text)`, `library_list(kind)`, `library_read(kind, id)`, `library_delete(kind, id)`
+
+The creator's Characters and Factions libraries (Creator v2 / CreatorUI phase US). One UTF-8 text file
+per entry in `%APPDATA%\The Creative Assembly\ThreeKingdoms90E_characters\` or `90E_factions\`
+(created when missing). `kind` is `"characters"` or `"factions"`; `id` is 1-64 characters `[A-Za-z0-9_-]`
+(never a path); `text` is up to 256 KB; the library holds up to 2,000 entries per kind.
+- `library_save` writes atomically (a temp file, then a rename) and overwrites the same id; returns `true`.
+- `library_list` returns the ids, sorted.
+- `library_read` returns the text.
+- `library_delete` moves the file into `<folder>\.deleted\` (the newest 50 are kept, for undo); returns `true`.
+Every call returns `nil, message` on failure. `se.frontend.has("library")` reports the natives.
 
 ##### `se.frontend.list_custom_portraits() -> { "name.png", ... } | nil, message`
 
