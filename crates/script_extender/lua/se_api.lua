@@ -81,7 +81,7 @@ function se.frontend.version()
 	return se.version()
 end
 -- se.frontend.has(feature) -> true when a creator native is present ("character_name", ...)
-local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", ceo_effects = "se_ceo_fx_set", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
+local CREATOR_NATIVES = { character_name = "se_char_name_set", faction_name = "se_faction_name_set", faction_flag = "se_faction_flag_set", faction_colours = "se_faction_colours_set", custom_portraits = "se_custom_portrait_install", library = "se_library_save", skill_trees = "se_skill_tree_set", custom_skill_trees = "se_custom_skill_tree_define", custom_item_look = "se_custom_item_look", ceo_effects = "se_ceo_fx_set", loc_text = "se_loc_set", character_art = "se_char_art2", character_age = "se_char_birth_get" }
 function se.frontend.has(feature)
 	-- Lua-side helpers: present when this module defines them (the DLL embeds the module)
 	if feature == "creator_reapply" then
@@ -102,6 +102,39 @@ function se.frontend.list_custom_portraits()
 	local out = {}
 	for name in string.gmatch(s, "[^|]+") do out[#out + 1] = name end
 	return out
+end
+-- Creator v2 / CreatorUI US: the Characters + Factions libraries (one text file per entry under
+-- %APPDATA%\The Creative Assembly\ThreeKingdoms90E_characters\ and 90E_factions\).
+-- kind = "characters" | "factions"; id = 1-64 chars [A-Za-z0-9_-]; text <= 256 KB (the creator owns the format).
+-- se.frontend.library_save(kind, id, text) -> true | nil, msg
+-- se.frontend.library_list(kind) -> { id, ... } | nil, msg
+-- se.frontend.library_read(kind, id) -> text | nil, msg
+-- se.frontend.library_delete(kind, id) -> true | nil, msg   (kept in <folder>\.deleted\, newest 50)
+local function libnative(n)
+	local f = G(n)
+	if type(f) ~= "function" then return nil, "native " .. n .. " is not available" end
+	return f
+end
+function se.frontend.library_save(kind, id, text)
+	local f, e = libnative("se_library_save"); if not f then return nil, e end
+	if type(kind) ~= "string" or type(id) ~= "string" or type(text) ~= "string" then return nil, "kind, id and text must be strings" end
+	return f(kind, id, text)
+end
+function se.frontend.library_list(kind)
+	local f, e = libnative("se_library_list"); if not f then return nil, e end
+	local s, err = f(type(kind) == "string" and kind or "")
+	if s == nil then return nil, err end
+	local out = {}
+	for id in string.gmatch(s, "[^|]+") do out[#out + 1] = id end
+	return out
+end
+function se.frontend.library_read(kind, id)
+	local f, e = libnative("se_library_read"); if not f then return nil, e end
+	return f(type(kind) == "string" and kind or "", type(id) == "string" and id or "")
+end
+function se.frontend.library_delete(kind, id)
+	local f, e = libnative("se_library_delete"); if not f then return nil, e end
+	return f(type(kind) == "string" and kind or "", type(id) == "string" and id or "")
 end
 -- se.frontend.define_custom_skill_tree(cells, class_key) -> "190e_custom_skillset_<nn>", nn | nil, msg
 -- cells = { { layout_index (1..18), skill_key }, ... }. The SE allocates the slot: the same cells
