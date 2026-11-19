@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (branch guard/mods-line, local only)
+
+- **Long mod lists no longer crash 16 s after launch** (engine guard `mods_line`, cfg `guard_mods_line`, default 1):
+  - The game's crash-report line (`CRASH_REPORT::set_mods`, exe+0x3a7320) is copied into a 1024-byte buffer with no
+    length check. At 1856 characters or more of regular mod pack names it overwrites the root Lua state pointer, and
+    the game crashes at exe+0x75d0d6.
+  - First thing at injection, and after any later `set_mods` call, the SE resets that slot to 0 when it holds text,
+    so the game builds its Lua state itself. It also cuts the report line at 1023 characters.
+  - Both addresses are read back from the code that uses them; any other build or layout is left alone.
+  - Engine flags the text also overwrote are not restored, so dropping some mod packs is still the real fix. TK Mod
+    Manager warns from 1824 characters.
+  - `se_mods_line_info()` reports it.
+
 ## 0.49.0-batch.1 (unreleased, local trial integration; branch integ/190e-batch-1115 = feat/battle-fixes + feat/creator)
 
 - **Battle fixes** by Alex Zhao, with technical help from Wyccc, rebuilt inside the script extender with his

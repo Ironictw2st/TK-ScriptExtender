@@ -54,6 +54,7 @@ mod navalland;
 mod dilemma;
 mod ceoguard;
 mod engineguard;
+mod modsline;
 mod sepatches;
 mod siege;
 mod battlefix;
@@ -107,6 +108,9 @@ fn bootstrap() {
     // first, so a fault while a detour is being written is already reported
     crash::install();
     crash::boot("init");
+    // before everything slow: the root Lua state is created ~16 s after launch (modsline.rs)
+    crash::boot("modsline");
+    modsline::install(&table);
     lua::init(&table);
     pool::init(&table);
     recruit::init(&table);

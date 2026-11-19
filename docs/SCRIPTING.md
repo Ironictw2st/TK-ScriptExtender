@@ -1384,6 +1384,7 @@ missing elsewhere:
 | `move_faction` (0.48.1) | a script moves a character who is in a recruitment pool to a faction key that is not in the campaign with `move_to_faction_and_make_recruited` (exe+0x17C60D0, often on End Turn) | the move does nothing; a known key moves as before. Own switch `guard_move_faction=0` |
 | `cco_list_walk` (0.48.1) | a UI panel reading an engine list that was unlinked while it refreshed, early end turns (exe+0x1C254D4) | the walk stops at a NULL or impossible list entry and the panel gets the entries read so far. A freed entry that still looks like a valid pointer is not caught. Own switch `guard_cco_list_walk=0` |
 | `garrison_holder` (0.48.1) | applying a battle result (Delegate, or the end of a fought battle) abandons a region with no owner or a dead owner, and removing its garrison reaches a force whose holder is already gone (exe+0x1A70740) | **opt-in, off by default**: the unit is removed without the holder notifications (force stat refresh, "force changed" / "unit removed"). In testing the force left without a holder crashed later at a different place, so this guard is not a fix yet. On with `guard_garrison_holder=1` |
+| `mods_line` (branch guard/mods-line) | a mod list whose crash-report line ("mods: a.pack, b.pack, ...", regular mod packs only) is 1856 characters or longer: the game overwrites its own root Lua state pointer and crashes about 16 s after launch (exe+0x75D0D6) | at injection, and after any later `set_mods` call, the root Lua slot is reset to 0 when it holds text, so the game creates its Lua state normally, and the crash-report line is cut at 1023 characters. Engine flags the text also covered are not restored, so the real fix is fewer mod packs (TK Mod Manager warns from 1824). `se_mods_line_info()` reports it. Own switch `guard_mods_line=0` |
 
 ```lua
 local g = se.diag.engine_guards()
@@ -2430,6 +2431,7 @@ values optionally quoted; an unknown key is logged and ignored.
 | `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
 | `guard_move_faction` | `1` (DLL 0.48.1+) | `0` leaves out the `move_faction` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `guard_cco_list_walk` | `1` (DLL 0.48.1+) | `0` leaves out the `cco_list_walk` engine guard (needs `engine_crash_guards=1`); in the version lock |
+| `guard_mods_line` | `1` (branch guard/mods-line) | `0` leaves out the `mods_line` repair (also off with `engine_crash_guards=0`). Runs before the game has a Lua state and changes no simulation, so it is not in the version lock |
 | `guard_garrison_holder` | `0` (DLL 0.48.1+) | `1` installs the experimental `garrison_holder` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `cai_null_guard` | `1` (DLL 0.46.0-sepatches.1+) | null guard on three AI call sites (`se.diag.sepatches`); in the version lock; `0` = off |
 | `battle_xform_fast` | `1` (DLL 0.46.0-sepatches.1+) | faster, bit-identical battle instance-record routine (`se.diag.sepatches`); not in the version lock; `0` = off |
