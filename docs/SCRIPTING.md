@@ -2442,6 +2442,8 @@ values optionally quoted; an unknown key is logged and ignored.
 | `engine_crash_guards` | `1` (DLL 0.46.0-guards.1+) | four null guards for engine crashes (`se.diag.engine_guards`); in the version lock; `0` = none installed |
 | `guard_move_faction` | `1` (DLL 0.48.1+) | `0` leaves out the `move_faction` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `guard_cco_list_walk` | `1` (DLL 0.48.1+) | `0` leaves out the `cco_list_walk` engine guard (needs `engine_crash_guards=1`); in the version lock |
+| `guard_ui_expr` | `1` (DLL 0.49.0-bsw.1+) | `0` leaves out the `ui_expr` engine guard (UI expression evaluator on a freed context, exe+0x577ca0 / 0x577c3f; needs `engine_crash_guards=1`); in the version lock |
+| `guard_battle_building` | `1` (DLL 0.49.0-bsw.1+) | `0` leaves out the `battle_building` engine guard (battle-map building loader race, exe+0xaca803 / 0xaca808; needs `engine_crash_guards=1`); in the version lock |
 | `guard_garrison_holder` | `0` (DLL 0.48.1+) | `1` installs the experimental `garrison_holder` engine guard (needs `engine_crash_guards=1`); in the version lock |
 | `cai_null_guard` | `1` (DLL 0.46.0-sepatches.1+) | null guard on three AI call sites (`se.diag.sepatches`); in the version lock; `0` = off |
 | `battle_xform_fast` | `1` (DLL 0.46.0-sepatches.1+) | faster, bit-identical battle instance-record routine (`se.diag.sepatches`); not in the version lock; `0` = off |

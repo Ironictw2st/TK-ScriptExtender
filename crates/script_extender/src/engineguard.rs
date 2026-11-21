@@ -389,6 +389,125 @@ unsafe fn install_weak(base: usize) -> Result<(), String> {
     if n == 0 { Err("no weak_ptr site matched".into()) } else { Ok(()) }
 }
 
+// ---- UI expression evaluator on a freed context (exe+0x577ca0, exe+0x577c3f) -----------------
+// FUN_140577bb0 = one step of the CCO expression evaluator (behind context_function_id, sort_func,
+// condition_func*). Two pointers it gets from virtual getters can be freed objects:
+//   site A (frontend NC CTD exe+0x577ca0, 19 Nov 2026): the global/root context returned by
+//     provider->vfunc[0x40] for a global function (StoredContext, GetIfElse, ...); `call [rdx+28h]`
+//     reads a garbage vtable.
+//   site B (campaign CTD exe+0x577c3f, 18 Nov 2026): the function node returned by top->vfunc[0xd8];
+//     its vtable slot +8 pointed into the heap.
+// The engine already handles NULL at both points (site A: the default global; site B: the
+// name-lookup fallback). The stubs turn "vtable outside the exe image" into NULL. A freed block
+// re-used by another exe object still passes (vtable in the image). Own switch guard_ui_expr.
+// Notes: 190Expanded Beta/Output/Batch1119/BugSweep/crash-577ca0/CRASH_577CA0.md.
+struct VtSite {
+    name: &'static str,
+    rva: usize,
+    /// the original bytes at rva (replaced by jmp rel32 + nops); the first 6 are `mov reg,rax ; test rax,rax`
+    bytes: &'static [u8],
+    /// where the original's conditional jump went on rax == 0
+    null_target_rva: usize,
+}
+const VT_SITES: [VtSite; 2] = [
+    // A: mov rbx,rax ; test rax,rax ; je +1b (-> 0x577cb5)          next: 0x577c9a mov rdx,[rax]
+    VtSite { name: "guard_uiexpr_root", rva: 0x577c92, bytes: &[0x48, 0x8b, 0xd8, 0x48, 0x85, 0xc0, 0x74, 0x1b], null_target_rva: 0x577cb5 },
+    // B: mov rdi,rax ; test rax,rax ; je rel32 (-> 0x577ce1)        next: 0x577c0d mov rax,[rax]
+    VtSite { name: "guard_uiexpr_fn", rva: 0x577c01, bytes: &[0x48, 0x8b, 0xf8, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0xd4, 0x00, 0x00, 0x00], null_target_rva: 0x577ce1 },
+];
+/// incremented by the stubs themselves
+pub static VT_HITS: AtomicU64 = AtomicU64::new(0);
+static VT_INSTALLED: AtomicU32 = AtomicU32::new(0);
+
+/// ```text
+///   test rax,rax ; jz orig                 ; already NULL: original path
+///   push rcx
+///   mov rcx,[rax]                          ; vtable (faults only where the original would fault next)
+///   push rdx ; mov rdx,lo ; cmp rcx,rdx ; jb bad
+///   mov rdx,hi ; cmp rcx,rdx ; jae bad
+///   pop rdx ; pop rcx ; jmp orig
+/// bad:
+///   pop rdx ; mov rcx,counter ; lock inc qword [rcx] ; pop rcx ; xor eax,eax
+/// orig:
+///   <mov reg,rax ; test rax,rax>           ; first 6 original bytes (rip-independent)
+///   jnz +14 ; jmp [rip+0] ; dq null_target
+///   jmp [rip+0] ; dq cont
+/// ```
+/// xor eax,eax clears the whole rax. Only flags differ from the original at the continuations.
+fn vt_stub(orig6: &[u8], lo: usize, hi: usize, counter: usize, null_target: usize, cont: usize) -> Vec<u8> {
+    let mut s = Vec::with_capacity(128);
+    s.extend_from_slice(&[0x48, 0x85, 0xc0]);           // test rax,rax
+    s.extend_from_slice(&[0x74, 0x00]); let jz_orig = s.len() - 1;
+    s.push(0x51);                                        // push rcx
+    s.extend_from_slice(&[0x48, 0x8b, 0x08]);           // mov rcx,[rax]
+    s.push(0x52);                                        // push rdx
+    s.extend_from_slice(&[0x48, 0xba]); s.extend_from_slice(&(lo as u64).to_le_bytes()); // mov rdx,lo
+    s.extend_from_slice(&[0x48, 0x39, 0xd1]);           // cmp rcx,rdx
+    s.extend_from_slice(&[0x72, 0x00]); let jb_bad = s.len() - 1;
+    s.extend_from_slice(&[0x48, 0xba]); s.extend_from_slice(&(hi as u64).to_le_bytes()); // mov rdx,hi
+    s.extend_from_slice(&[0x48, 0x39, 0xd1]);           // cmp rcx,rdx
+    s.extend_from_slice(&[0x73, 0x00]); let jae_bad = s.len() - 1;
+    s.extend_from_slice(&[0x5a, 0x59]);                  // pop rdx ; pop rcx
+    s.extend_from_slice(&[0xeb, 0x00]); let jmp_orig = s.len() - 1;
+    let bad = s.len();
+    s.push(0x5a);                                        // pop rdx
+    s.extend_from_slice(&[0x48, 0xb9]); s.extend_from_slice(&(counter as u64).to_le_bytes()); // mov rcx,counter
+    s.extend_from_slice(&[0xf0, 0x48, 0xff, 0x01]);     // lock inc qword [rcx]
+    s.push(0x59);                                        // pop rcx
+    s.extend_from_slice(&[0x31, 0xc0]);                  // xor eax,eax
+    let orig = s.len();
+    s.extend_from_slice(orig6);                          // mov reg,rax ; test rax,rax
+    s.extend_from_slice(&[0x75, 14]);                    // jnz over the null jmp (6 + 8 bytes)
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]); s.extend_from_slice(&(null_target as u64).to_le_bytes());
+    s.extend_from_slice(&[0xff, 0x25, 0, 0, 0, 0]); s.extend_from_slice(&(cont as u64).to_le_bytes());
+    s[jz_orig] = (orig - (jz_orig + 1)) as u8;
+    s[jb_bad] = (bad - (jb_bad + 1)) as u8;
+    s[jae_bad] = (bad - (jae_bad + 1)) as u8;
+    s[jmp_orig] = (orig - (jmp_orig + 1)) as u8;
+    s
+}
+
+unsafe fn install_vt_site(base: usize, v: &VtSite) -> Result<(), String> {
+    let site = base + v.rva;
+    if !readable(site, v.bytes.len()) { return Err(format!("{site:#x} unreadable")); }
+    let cur = core::slice::from_raw_parts(site as *const u8, v.bytes.len());
+    if cur != v.bytes { return Err(format!("bytes at {site:#x} differ")); }
+    if IMAGE.get().is_none() {
+        let image = image_range(base).ok_or("PE header unreadable")?;
+        let _ = IMAGE.set(image);
+    }
+    let (lo, hi) = *IMAGE.get().ok_or("no image range")?;
+    let stub = alloc_near(site).ok_or("no free page within rel32 reach")?;
+    let code = vt_stub(&v.bytes[..6], lo, hi, &VT_HITS as *const AtomicU64 as usize,
+                       base + v.null_target_rva, site + v.bytes.len());
+    core::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len());
+    make_executable(stub, code.len());
+    let disp = stub as i64 - (site as i64 + 5);
+    if disp < i32::MIN as i64 || disp > i32::MAX as i64 { return Err("stub out of rel32 reach".into()); }
+    let mut patch = vec![0x90u8; v.bytes.len()];
+    patch[0] = 0xe9;
+    patch[1..5].copy_from_slice(&(disp as i32).to_le_bytes());
+    write_code_for(v.name, "guard_ui_expr", site, &patch)
+}
+
+unsafe fn install_uiexpr(base: usize) -> Result<(), String> {
+    if !crate::build::hook_enabled("guard_ui_expr") { return Err("off (guard_ui_expr=0)".into()); }
+    let mut n = 0;
+    for v in VT_SITES.iter() {
+        match install_vt_site(base, v) {
+            Ok(()) => n += 1,
+            Err(e) => log!("engine guard {} not installed: {e}", v.name),
+        }
+    }
+    VT_INSTALLED.store(n, Ordering::Relaxed);
+    if n == 0 { Err("no uiexpr site matched".into()) } else { Ok(()) }
+}
+
+unsafe fn install_battle_building(base: usize) -> Result<(), String> {
+    if !crate::build::hook_enabled("guard_battle_building") { return Err("off (guard_battle_building=0)".into()); }
+    crate::crash::install_aca_guard(base)
+}
+
 // ---- stale court-screen selection list (UI use-after-free) -------------------------------------
 // Crash exe+0x55b7e0 (thread 1568832033214697514, "Clicked on court tab"; same site as cluster 14
 // "loading into a save"). A court seat's CourtScreenStagedSlot click callback (thunk 0x142f0e9b0,
@@ -920,7 +1039,7 @@ pub fn install(t: &Table) {
     BASE.store(base, Ordering::Relaxed);
     // SAFETY: every guard verifies its bytes first and writes only with other threads frozen.
     unsafe {
-        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 11] = [
+        let steps: [(&str, unsafe fn(usize) -> Result<(), String>); 13] = [
             ("inactive_string", install_inactive_string),
             ("ceo_owner", install_ceo_owner),
             ("text_font", install_font),
@@ -932,6 +1051,8 @@ pub fn install(t: &Table) {
             ("move_faction", install_move_faction),
             ("cco_list_walk", install_cco_list_walk),
             ("garrison_holder", install_garrison_holder),
+            ("ui_expr", install_uiexpr),
+            ("battle_building", install_battle_building),
         ];
         let mut ok = Vec::new();
         for (name, f) in steps {
@@ -951,7 +1072,7 @@ pub unsafe fn register(l: *mut LuaState) {
 
 fn info() -> String {
     format!(
-        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={};move_faction={};move_faction_hits={};cco_list_walk={};cco_list_walk_hits={};garrison_holder={};garrison_holder_hits={}",
+        "inactive_string={};inactive_string_hits={};ceo_owner={};ceo_owner_hits={};text_font={};building_browser={};building_browser_hits={};weak_lock_hits={};clear_selection={};clear_selection_hits={};phase_record={};phase_record_hits={};payload_walk={};payload_walk_hits={};move_faction={};move_faction_hits={};cco_list_walk={};cco_list_walk_hits={};garrison_holder={};garrison_holder_hits={};ui_expr={};ui_expr_hits={};battle_building={};battle_building_hits={}",
         INACTIVE.get().is_some_and(|d| d.is_enabled()) as u8, INACTIVE_HITS.load(Ordering::Relaxed),
         CEO_OWNER.get().is_some_and(|d| d.is_enabled()) as u8, CEO_OWNER_HITS.load(Ordering::Relaxed),
         FONT_PATCHED.load(Ordering::Relaxed) as u8,
@@ -962,6 +1083,8 @@ fn info() -> String {
         (MOVE_STUB.load(Ordering::Relaxed) != 0) as u8, MOVE_HITS.load(Ordering::Relaxed),
         (LIST_STUBS.load(Ordering::Relaxed) != 0) as u8, LIST_HITS.load(Ordering::Relaxed),
         (GARRISON_STUB.load(Ordering::Relaxed) != 0) as u8, GARRISON_HITS.load(Ordering::Relaxed),
+        VT_INSTALLED.load(Ordering::Relaxed), VT_HITS.load(Ordering::Relaxed),
+        crate::crash::aca_installed() as u8, crate::crash::ACA_HITS.load(Ordering::Relaxed),
     )
 }
 
@@ -1578,5 +1701,39 @@ mod tests {
             assert_eq!(run(cur.as_ptr() as usize, sent, rax), 2, "NULL next (the crash): done");
             assert_eq!(COUNTER.load(Ordering::Relaxed), 6);
         }
+    }
+}
+
+#[cfg(test)]
+mod vt_tests {
+    use super::*;
+    #[test]
+    fn vt_stub_layout() {
+        for v in VT_SITES.iter() {
+            let s = vt_stub(&v.bytes[..6], 0x1400_0000, 0x1500_0000, 0x5555_6666_7777_8888, 0x1111, 0x2222);
+            // the first jz lands on the copied original bytes
+            let orig = 5 + s[4] as usize;
+            assert_eq!(&s[orig..orig + 6], &v.bytes[..6]);
+            // jnz skips exactly the 14-byte null jmp
+            assert_eq!(s[orig + 6], 0x75);
+            assert_eq!(s[orig + 7], 14);
+            assert_eq!(&s[orig + 8..orig + 10], &[0xff, 0x25]);
+            assert_eq!(&s[orig + 22..orig + 24], &[0xff, 0x25]);
+            assert_eq!(u64::from_le_bytes(s[orig + 14..orig + 22].try_into().unwrap()), 0x1111);
+            assert_eq!(u64::from_le_bytes(s[orig + 28..orig + 36].try_into().unwrap()), 0x2222);
+            assert_eq!(s.len(), orig + 8 + 14 + 14);
+            // the bad path ends in xor eax,eax right before orig
+            assert_eq!(&s[orig - 2..orig], &[0x31, 0xc0]);
+        }
+    }
+    #[test]
+    fn vt_sites_shape() {
+        // site A: je +1b from 0x577c98 -> 0x577cb5 ; site B: je rel32 0xd4 from 0x577c07 -> 0x577ce1
+        assert_eq!(0x577c98 + 2 + 0x1b, VT_SITES[0].null_target_rva);
+        assert_eq!(0x577c07 + 6 + 0xd4, VT_SITES[1].null_target_rva);
+        assert_eq!(VT_SITES[0].rva + VT_SITES[0].bytes.len(), 0x577c9a);
+        assert_eq!(VT_SITES[1].rva + VT_SITES[1].bytes.len(), 0x577c0d);
+        // a jmp rel32 (5 bytes) fits in both sites
+        assert!(VT_SITES.iter().all(|v| v.bytes.len() >= 5));
     }
 }

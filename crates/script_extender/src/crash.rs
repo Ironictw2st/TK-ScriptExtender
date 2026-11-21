@@ -826,6 +826,94 @@ unsafe extern "C" fn se_crash_selftest(l: *mut LuaState) -> c_int {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Battle-map building loader race (exe+0xACA803 / exe+0xACA808), installed by engineguard
+// (engine_crash_guards + guard_battle_building). FUN_140ac9ca0 reads a building definition that
+// another loader fiber has freed (dump 20 Nov 2026 10:41 PM: definition +0x98 = ASCII text). Block:
+//   0xaca7fb  mov rax,[r12+98h]          ; piece array of the (freed) definition
+//   0xaca803  mov rcx,[rax]               ; <- AV variant 1
+//   0xaca806  mov eax,[rdx]
+//   0xaca808  cmp [rcx+74h],eax           ; <- AV variant 2
+//   0xaca80b  jbe 0xaca819
+//   0xaca80d  mov rax,[rbp+0B8h] ; mov eax,[rax+14h] ; mov [rdx],eax   (writes a destruction level)
+//   0xaca819  ...                         ; uses nothing computed in the block
+// A FIRST vectored handler moves rip from either faulting load to 0xaca819: the only skipped effect
+// is the destruction-level write (the block's own "jbe" outcome), so the building keeps its default.
+// Limits: only these two loads; the definition stays freed, so later code may still fault elsewhere
+// (exe+0x3902E1 seen once, not covered). No logging inside the handler (loader fiber).
+// Notes: 190Expanded Beta/Output/Batch1119/BugSweep/discord1120/DISCORD_CRASHES_1120.md.
+const ACA_SITE_1: usize = 0xaca803;
+const ACA_SITE_2: usize = 0xaca808;
+const ACA_SKIP: usize = 0xaca819;
+/// expected bytes at ACA_SITE_1 .. ACA_SKIP, checked before arming (Steam 1.7.2.0 layout)
+const ACA_ANCHOR: [u8; 22] = [
+    0x48, 0x8b, 0x08,                         // 803 mov rcx,[rax]
+    0x8b, 0x02,                               // 806 mov eax,[rdx]
+    0x39, 0x41, 0x74,                         // 808 cmp [rcx+74h],eax
+    0x76, 0x0c,                               // 80b jbe 819
+    0x48, 0x8b, 0x85, 0xb8, 0x00, 0x00, 0x00, // 80d mov rax,[rbp+0B8h]
+    0x8b, 0x40, 0x14,                         // 814 mov eax,[rax+14h]
+    0x89, 0x02,                               // 817 mov [rdx],eax
+];
+static ACA_BASE: AtomicUsize = AtomicUsize::new(0);
+pub static ACA_HITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn aca_installed() -> bool { ACA_BASE.load(Ordering::Relaxed) != 0 }
+
+/// The new rip for an access violation at `rip`, or None when it is not one of the guarded loads.
+fn aca_redirect(base: usize, rip: usize) -> Option<usize> {
+    if base == 0 { return None; }
+    if rip == base + ACA_SITE_1 || rip == base + ACA_SITE_2 { Some(base + ACA_SKIP) } else { None }
+}
+
+unsafe extern "system" fn aca_veh(ep: *mut ExceptionPointers) -> i32 {
+    if ep.is_null() { return CONTINUE_SEARCH; }
+    let (rec, ctx) = ((*ep).record, (*ep).context);
+    if rec.is_null() || ctx.is_null() || (*rec).code != AV { return CONTINUE_SEARCH; }
+    let rip = ctx_get(&*ctx, OFF_RIP) as usize;
+    let Some(to) = aca_redirect(ACA_BASE.load(Ordering::Relaxed), rip) else { return CONTINUE_SEARCH };
+    ctx_set(&mut *ctx, OFF_RIP, to as u64);
+    ACA_HITS.fetch_add(1, Ordering::Relaxed);
+    CONTINUE_EXECUTION
+}
+
+/// Check the anchor and add the handler FIRST in the chain (ahead of the crash reporter's), so a
+/// guarded fault is neither reported nor passed on.
+pub(crate) unsafe fn install_aca_guard(base: usize) -> Result<(), String> {
+    let site = base + ACA_SITE_1;
+    if !readable(site, ACA_ANCHOR.len()) { return Err(format!("{site:#x} unreadable")); }
+    if core::slice::from_raw_parts(site as *const u8, ACA_ANCHOR.len()) != ACA_ANCHOR { return Err(format!("bytes at {site:#x} differ")); }
+    if aca_installed() { return Err("already installed".into()); }
+    ACA_BASE.store(base, Ordering::Relaxed);
+    if AddVectoredExceptionHandler(1, aca_veh).is_null() {
+        ACA_BASE.store(0, Ordering::Relaxed);
+        return Err("AddVectoredExceptionHandler failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod aca_tests {
+    use super::*;
+    #[test]
+    fn skip_target_matches_jbe() {
+        // jbe +0x0c at 0xaca80b lands on 0xaca819; the anchor covers 0x803..0x819 exactly
+        assert_eq!(0xaca80b + 2 + 0x0c, ACA_SKIP);
+        assert_eq!(ACA_SITE_1 + ACA_ANCHOR.len(), ACA_SKIP);
+        assert_eq!(ACA_SITE_1 + 5, ACA_SITE_2);
+        assert_eq!(&ACA_ANCHOR[5..8], &[0x39, 0x41, 0x74]);
+    }
+    #[test]
+    fn redirect_only_the_two_loads() {
+        let b = 0x1_4000_0000usize;
+        assert_eq!(aca_redirect(b, b + ACA_SITE_1), Some(b + ACA_SKIP));
+        assert_eq!(aca_redirect(b, b + ACA_SITE_2), Some(b + ACA_SKIP));
+        assert_eq!(aca_redirect(b, b + ACA_SITE_1 + 3), None);
+        assert_eq!(aca_redirect(b, b + 0x3902e1), None);
+        assert_eq!(aca_redirect(0, ACA_SITE_1), None);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
