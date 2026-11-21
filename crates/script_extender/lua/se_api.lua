@@ -76,7 +76,7 @@ function se.frontend.available()
 	local st = se.status()
 	return st.state ~= "refused" and st.state ~= "not_game"
 end
--- se.frontend.version() -> "<dll version>", e.g. "0.49.0-creator.1"
+-- se.frontend.version() -> "<dll version>", e.g. "0.49.0"
 function se.frontend.version()
 	return se.version()
 end

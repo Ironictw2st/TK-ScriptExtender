@@ -224,7 +224,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "diag_diplomacy", "diag_crash", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue",
     "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "audio", "ui_dev_loader", "engine_crash_guards",
     "cai_null_guard", "battle_xform_fast", "siege_odds_gate", "siege_odds_bands", "siege_force_assault",
-    "ai_skills", "ai_ceos", "ai_court", "ai_build", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder", "guard_ui_expr", "guard_battle_building",
+    "ai_skills", "ai_ceos", "ai_court", "ai_build", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder", "guard_ui_expr", "guard_battle_building", "guard_mods_line",
     "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
     "battle_turtle_missile_block", "battle_turtle_flank_immunity", "battle_cantabrian",
     "battle_ranged_melee_targets", "battle_ranged_spread_targets",

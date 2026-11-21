@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.49.0-bsw.1 (local test build; branch guard/uiexpr-aca = integ/190e-batch-1115 + two engine guards)
+## 0.49.0 (release candidate, 21 Nov 2026; branch release/0.49.0-rc1 = 0.48.1 + feat/battle-fixes + feat/creator (creator.29) + guard/uiexpr-aca + guard/mods-line)
+
+### Engine guards
+
 - Engine guard `ui_expr` (switch `guard_ui_expr`, default on): the CCO expression evaluator step (exe+0x577bb0) treats a context or function
   object whose vtable is outside the exe image as NULL, so it takes the engine's own NULL path instead of calling through freed memory.
   Covers the frontend CTD exe+0x577ca0 (19 Nov) and the campaign CTD exe+0x577c3f (18 Nov). A freed block re-used by another exe object is not detected.
@@ -8,7 +11,8 @@
   exe+0xaca803 / 0xaca808 (battle-map building setup reading a definition another loader fiber freed). The skipped block only writes a
   building's destruction level, so the building keeps its default. Lowers the battle-load CTD rate; it does not fix the race (0x3902e1 is not covered).
 - se_engine_guards_info: `ui_expr`, `ui_expr_hits`, `battle_building`, `battle_building_hits`.
-## Unreleased (branch guard/mods-line, local only)
+
+### Long mod lists
 
 - **Long mod lists no longer crash 16 s after launch** (engine guard `mods_line`, cfg `guard_mods_line`, default 1):
   - The game's crash-report line (`CRASH_REPORT::set_mods`, exe+0x3a7320) is copied into a 1024-byte buffer with no
@@ -21,7 +25,7 @@
     Manager warns from 1824 characters.
   - `se_mods_line_info()` reports it.
 
-## 0.49.0-batch.1 (unreleased, local trial integration; branch integ/190e-batch-1115 = feat/battle-fixes + feat/creator)
+### Battle fixes
 
 - **Battle fixes** by Alex Zhao, with technical help from Wyccc, rebuilt inside the script extender with his
   permission. There is one switch per fix (cfg key, default 1, all in the version lock), and the 190E MCT page
@@ -40,9 +44,8 @@
     Please unsubscribe from the Workshop originals; they are included here.
   - `se.diag.battle_fixes()` reports each fix's state and counters; `se.modify.battle_fixes{...}` switches the
     fixes at run time (never during a battle).
-- **Character and faction creator natives**: everything in the feat/creator 0.49.0 entry below.
 
-## 0.49.0 (unreleased; branch feat/creator, test builds 0.49.0-creator.N)
+### Character and faction creator
 
 - **Character and faction creator natives** (190E "Create your Character / Faction"; single player only,
   refused in multiplayer; `docs/SCRIPTING.md` §3.23):
