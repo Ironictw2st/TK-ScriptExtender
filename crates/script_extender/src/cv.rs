@@ -108,22 +108,35 @@ impl Buf {
     fn a(&self) -> usize { self.0.as_ptr() as usize }
 }
 
-/// CA::String {u32 len, .., data ptr at +8}; short strings are stored inline (top nibble 8).
-/// Narrow or UTF-16 is detected from the data (a wide ASCII string has a zero second byte).
+/// CA::String {u32 len, .., data ptr at +8}. Short strings are stored INLINE in the 16 bytes
+/// (top nibble of +8 = 8): then +0 is character data, not a length, and the text is
+/// NUL-terminated (verified live 22 Nov: "83", "Runtime"). Narrow or UTF-16 is detected from
+/// the data (a wide ASCII string has a zero second byte).
 unsafe fn ca_string(sp: usize) -> String {
     if !readable(sp, 16) { return String::new(); }
-    let len = (rd(sp) as usize).min(MAX_TEXT);
     let raw_ptr = rq(sp + 8);
-    let inline = raw_ptr >> 60 == 8;
-    let data = if inline { sp } else { raw_ptr };
+    if raw_ptr >> 60 == 8 {
+        let b = core::slice::from_raw_parts(sp as *const u8, 15);
+        if b.len() >= 2 && b[0] != 0 && b[1] == 0 {
+            let w = core::slice::from_raw_parts(sp as *const u16, 7);
+            let n = w.iter().position(|&c| c == 0).unwrap_or(7);
+            return String::from_utf16_lossy(&w[..n]);
+        }
+        let n = b.iter().position(|&c| c == 0).unwrap_or(15);
+        return String::from_utf8_lossy(&b[..n]).into_owned();
+    }
+    let len = (rd(sp) as usize).min(MAX_TEXT);
+    let data = raw_ptr;
     if len == 0 || !readable(data, len) { return String::new(); }
     let bytes = core::slice::from_raw_parts(data as *const u8, len);
-    let wide = (len >= 2 && bytes[1] == 0) || (len == 1 && readable(data, 2) && *(data as *const u8).add(1) == 0 && !inline);
+    let wide = len >= 2 && bytes[1] == 0 || len == 1 && readable(data, 2) && *(data as *const u8).add(1) == 0;
     if wide && readable(data, len * 2) {
         let w = core::slice::from_raw_parts(data as *const u16, len);
-        return String::from_utf16_lossy(w);
+        let n = w.iter().position(|&c| c == 0).unwrap_or(len);
+        return String::from_utf16_lossy(&w[..n]);
     }
-    String::from_utf8_lossy(bytes).into_owned()
+    let n = bytes.iter().position(|&c| c == 0).unwrap_or(len);
+    String::from_utf8_lossy(&bytes[..n]).into_owned()
 }
 
 /// Frees a CA::String's heap buffer the way the engine's inlined destructors do.
@@ -160,8 +173,15 @@ impl Errors {
         let (n, data) = (rd(a + 0xc) as usize, rq(a + 0x10));
         let mut v = Vec::new();
         if data == 0 { return v; }
+        // entry = { CA::String category ("Runtime", ...), CA::String message } (0x20 bytes)
         for i in 0..n.min(64) {
-            let s = ca_string(data + i * 0x20);
+            let cat = ca_string(data + i * 0x20);
+            let msg = ca_string(data + i * 0x20 + 0x10);
+            let s = match (cat.is_empty(), msg.is_empty()) {
+                (false, false) => format!("{cat}: {msg}"),
+                (true, false) => msg,
+                _ => cat,
+            };
             if !s.is_empty() { v.push(s); }
         }
         v

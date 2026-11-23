@@ -2635,6 +2635,10 @@ end
   - Expressions the root reports as commands are refused.
   - A command-typed result is reported but never run.
   - Console `~` lines are refused.
+  - Void members such as `PlayersFaction.AddMoney(5)` evaluate as `kind = "void"` without being
+    run (verified in game: the treasury didn't change).
+- **Names:** row and context `name` values are the raw `Name` text, so text-replacement keys stay
+  as `{{tr:...}}`.
 - **Not for synced logic:** results can depend on the local UI, so never branch multiplayer
   logic on them.
 - **`opts`:**
