@@ -13,6 +13,7 @@ mod addrs;
 mod audio;
 mod uidev;
 mod cv;
+mod cv_allow;
 mod freeze;
 mod hook;
 mod logging;

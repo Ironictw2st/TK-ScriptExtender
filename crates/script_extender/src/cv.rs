@@ -16,9 +16,11 @@
 //!   ({?, u32 count +4, ptr data +8} of context pointers); 10 = command list (never executed)
 //!   cleanup: FUN_1405baec0(variant + 0x10), FUN_142d26090(evalctx), FUN_14054b4e0(parse_state)
 //!
-//! Safety rules: opt-in (cfg `dev_cv_eval=1`), campaign only (model global 0x1443cfa50 non-null),
-//! read-only: expressions the root reports as commands (vfn 0x88, the viewer's own test) are
-//! refused before evaluation and a command-typed result (tag 10) is reported, never run. Not in
+//! Safety rules: opt-in (cfg `dev_cv_eval=1`), campaign only (model global 0x1443cfa50 non-null).
+//! Evaluation EXECUTES Void members (FUN_142fe8880 calls the member function directly; AddMoney
+//! only did nothing because CA stubbed it), so `guard` refuses any expression with an identifier
+//! that is not a known getter (generated allow-list cv_allow.rs) BEFORE compiling. The root's
+//! vfn 0x88 "is command" is a constant false (0x1402e6af0) and is kept only as the viewer does. Not in
 //! the sync tag: it changes nothing. Results may differ per machine (UI state), so mod code must
 //! not branch on them in multiplayer; it is a developer/diagnostic tool.
 //! Never point it at the contexts search (FUN_142d62d10): that path crashed the game (22 Nov).
@@ -332,6 +334,39 @@ unsafe fn push_error(l: *mut LuaState, msg: &str) -> c_int {
     1
 }
 
+/// Read-only guard: evaluation EXECUTES Void members (FUN_142fe8880 calls the member directly), so
+/// every identifier outside string literals must be a known getter (cv_allow::ALLOW) and none may
+/// be a known command (cv_allow::DENY). Unknown names are refused too. Returns the offenders.
+fn guard(expr: &str) -> Vec<String> {
+    const KW: &[&str] = &["and", "false", "nil", "not", "or", "true"];
+    let b = expr.as_bytes();
+    let (mut i, mut bad) = (0usize, Vec::<String>::new());
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < b.len() && b[i] != c { i += 1; }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.') && !(b[i] == b'.' && i + 1 < b.len() && b[i + 1].is_ascii_alphabetic()) { i += 1; }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; }
+            let w = &expr[st..i];
+            let ok = KW.contains(&w)
+                || (crate::cv_allow::DENY.binary_search(&w).is_err() && crate::cv_allow::ALLOW.binary_search(&w).is_ok());
+            if !ok && !bad.iter().any(|x| x == w) { bad.push(w.to_string()); }
+            continue;
+        }
+        i += 1;
+    }
+    bad
+}
+
 /// Fills the result table at the top of the stack (called while the variant is alive).
 unsafe fn push_outcome(f: &Fns, l: *mut LuaState, out: Outcome, errs: &[String], want_names: bool) {
     let Some(api) = lua::api() else { return };
@@ -404,6 +439,17 @@ unsafe extern "C" fn se_cv_eval(l: *mut LuaState) -> c_int {
     let max_rows = { let n = (api.tointeger)(l, 2); if n <= 0 { 500 } else { (n as usize).min(5000) } };
     let want_names = (api.type_)(l, 3) <= 0 || (api.toboolean)(l, 3) != 0;
 
+    let bad = guard(expr);
+    if !bad.is_empty() {
+        let Some(api) = lua::api() else { return 0 };
+        (api.createtable)(l, 0, 5);
+        set_bool(l, "ok", false);
+        set_str(l, "kind", "refused");
+        set_str(l, "reason", "command");
+        set_list(l, "members", &bad);
+        set_list(l, "errors", &[format!("refused: command or unknown member ({}); se.cv.eval only evaluates known getters, because evaluation runs commands", bad.join(", "))]);
+        return 1;
+    }
     // fresh CcoCampaignRoot, as the viewer's "Campaign Root" shortcut builds it
     let mut root: usize = f.root_vtable;
     let root_p = &mut root as *mut usize as usize;

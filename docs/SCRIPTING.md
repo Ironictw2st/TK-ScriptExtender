@@ -2631,12 +2631,14 @@ end
   - `"list"`: `count`, `truncated` and `rows = { {type, id, name}, ... }`.
   - `"command"` or `"void"`.
   - `"error"`: `errors = { "..." }`, holding the compiler's or interpreter's messages.
-- **Read-only:**
-  - Expressions the root reports as commands are refused.
-  - A command-typed result is reported but never run.
-  - Console `~` lines are refused.
-  - Void members such as `PlayersFaction.AddMoney(5)` evaluate as `kind = "void"` without being
-    run (verified in game: the treasury didn't change).
+- **Read-only, by refusal:** the engine RUNS a command member while it evaluates the expression;
+  that's how the viewer and `ContextCommand` bindings work. So `se.cv.eval` refuses any expression
+  that has an identifier outside string literals which isn't a known getter. The allow-list is built
+  from the CCO registrations and reference; known commands are always refused. The result is
+  `{ ok = false, kind = "refused", reason = "command", members = { "AddMoney" } }`. A getter missing
+  from the list is refused too, and that's the safe side. Console `~` lines are refused.
+  (`PlayersFaction.AddMoney(5)` would do nothing anyway: CA compiled out 34 dev cheats, AddMoney
+  included.)
 - **Names:** row and context `name` values are the raw `Name` text, so text-replacement keys stay
   as `{{tr:...}}`.
 - **Not for synced logic:** results can depend on the local UI, so never branch multiplayer
