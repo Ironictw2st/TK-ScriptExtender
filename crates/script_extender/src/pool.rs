@@ -49,6 +49,7 @@ pub unsafe fn register(l: *mut LuaState) {
     crate::recruit::register(l);
     crate::audio::register(l);
     crate::uidev::register(l);
+    crate::cv::register(l);
     crate::units::register(l);
     crate::progression::register(l);
     crate::chars::register(l);

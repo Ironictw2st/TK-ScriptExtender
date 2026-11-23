@@ -5141,4 +5141,28 @@ function se.ui.list()
 	return t
 end
 
+-- ============================================================================ se.cv
+-- Context expressions, evaluated by the engine's own compiler/interpreter (the one behind the dev
+-- Context Viewer) against CcoCampaignRoot. Developer tool: needs dev_cv_eval=1 in
+-- script_extender.cfg; campaign only; read-only (command expressions are refused, a command
+-- result is reported and never run). Results can differ per machine, so never branch synced
+-- logic on them in multiplayer.
+--   se.cv.eval("PlayersFaction.TechnologyList.Filter(IsResearched == false)", {max_rows = 50})
+--   -> { ok = true, kind = "list", count = 59, truncated = true,
+--        rows = { { type = "CcoCampaignTechnology", id = "...", name = "Ancient Rites" }, ... } }
+--   kind: "value" (value = text), "context" (type, id, name), "list", "command", "void", "error"
+--   (errors = { "..." }). opts.names = false skips the per-row Name lookups.
+se.cv = se.cv or {}
+function se.cv.eval(expr, opts)
+	local f = G("se_cv_eval")
+	if type(f) ~= "function" then
+		return { ok = false, kind = "error", errors = { "se_cv_eval missing (DLL older than 0.49.1)" } }
+	end
+	opts = opts or {}
+	if type(expr) ~= "string" then
+		return { ok = false, kind = "error", errors = { "expression must be a string" } }
+	end
+	return f(expr, tonumber(opts.max_rows) or 500, opts.names ~= false)
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")

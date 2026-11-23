@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod addrs;
 mod audio;
 mod uidev;
+mod cv;
 mod freeze;
 mod hook;
 mod logging;
@@ -164,6 +165,7 @@ fn bootstrap() {
     crash::boot("audio");
     audio::install(&table);
     uidev::install();
+    cv::install(&table);
     crash::boot("engineguard");
     engineguard::install(&table);
     crash::boot("sepatches");

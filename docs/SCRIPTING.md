@@ -2611,6 +2611,38 @@ the script extender play vanilla. Numbers can be changed from a campaign script
 `policy_*` decisions), the last 60 decisions in `se.siege.last`.
 
 ---
+## 4f. Context expressions (`se.cv`, DLL 0.49.1-cv+, developer tool)
+
+`se.cv.eval(expr, opts)` evaluates a context expression, the language `.twui.xml` bindings and the
+dev Context Viewer use, against `CcoCampaignRoot`, with the engine's own compiler. The viewer
+doesn't have to be open. It's off unless `dev_cv_eval=1` is in `script_extender.cfg`, and it works
+in the campaign only.
+
+```lua
+local r = se.cv.eval("PlayersFaction.TechnologyList.Filter(IsResearched == false)", { max_rows = 20 })
+if r.ok and r.kind == "list" then
+	for _, row in ipairs(r.rows) do out(row.name .. " " .. row.id) end
+end
+```
+
+- **Result `kind`:**
+  - `"value"`: `value` is text.
+  - `"context"`: `type`, `id` and `name`.
+  - `"list"`: `count`, `truncated` and `rows = { {type, id, name}, ... }`.
+  - `"command"` or `"void"`.
+  - `"error"`: `errors = { "..." }`, holding the compiler's or interpreter's messages.
+- **Read-only:**
+  - Expressions the root reports as commands are refused.
+  - A command-typed result is reported but never run.
+  - Console `~` lines are refused.
+- **Not for synced logic:** results can depend on the local UI, so never branch multiplayer
+  logic on them.
+- **`opts`:**
+  - `max_rows` (default 500, up to 5000).
+  - `names = false` skips the per-row `Name` lookups.
+- **From outside the game:** `tools/secli/secli.py cv "<expr>"` in the workspace prints the same
+  result as JSON, through the tw3k_mcp bridge.
+
 ## 5. Troubleshooting
 
 ### The API is not there at all
