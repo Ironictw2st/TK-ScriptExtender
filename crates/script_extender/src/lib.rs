@@ -14,6 +14,7 @@ mod audio;
 mod uidev;
 mod cv;
 mod cv_allow;
+mod dev;
 mod freeze;
 mod hook;
 mod logging;
@@ -167,6 +168,7 @@ fn bootstrap() {
     audio::install(&table);
     uidev::install();
     cv::install(&table);
+    dev::install(&table);
     crash::boot("engineguard");
     engineguard::install(&table);
     crash::boot("sepatches");

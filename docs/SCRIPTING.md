@@ -2649,6 +2649,30 @@ end
 - **From outside the game:** `tools/secli/secli.py cv "<expr>"` in the workspace prints the same
   result as JSON, through the tw3k_mcp bridge.
 
+## 4g. Developer research completion (`se.dev`, DLL 0.49.1-cv.4+, developer tool)
+
+CA compiled the dev cheats out of the release exe: `CompleteResearch`, `EnableAllTechnologies`,
+`DevEnableTech` and others. `begin_tech_research` / `set_tech_research_cooldown` can't finish a
+technology either. `se.dev.complete_tech` runs the engine's own research tick with the full cost,
+so the technology or reform completes exactly as it would at a turn start. `ResearchCompleted`
+fires, and the faction's next queued research may start. Locked and hidden reforms work too.
+
+```lua
+local ok, msg = se.dev.complete_tech("3k_main_faction_cao_cao", "3k_main_tech_earth_tier0_eunuch_secretaries")
+local state = se.dev.tech_state("3k_main_faction_cao_cao", "3k_main_tech_earth_tier0_eunuch_secretaries")
+-- "researched" | "researching" | "available" | "locked"
+```
+
+- Off unless `dev_complete_tech=1` is in `script_extender.cfg`. The key is part of the multiplayer
+  version tag, since it changes the simulation.
+- Single player only: refused in multiplayer. Outside a model callback the call is queued with
+  `wait_for_model_sp`, and the result goes to the log.
+- Refused while the faction is researching a different technology.
+- From outside the game:
+  - `secli tech complete <faction> <key...>`
+  - `secli tech complete player --all --filter reform`
+  - `secli tech state <faction> <key...>`
+
 ## 5. Troubleshooting
 
 ### The API is not there at all

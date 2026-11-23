@@ -5165,4 +5165,37 @@ function se.cv.eval(expr, opts)
 	return f(expr, tonumber(opts.max_rows) or 500, opts.names ~= false)
 end
 
+-- ============================================================================ se.dev
+-- Developer research completion (dev_complete_tech=1 in script_extender.cfg; single player only).
+-- CA compiled its own CompleteResearch / EnableAllTechnologies cheats out of the release exe; this
+-- runs the engine's research tick with the full cost, so the tech completes as at a turn start
+-- (ResearchCompleted fires, the next queued research may start). Locked/hidden reforms included.
+--   se.dev.complete_tech("3k_main_faction_cao_cao", "3k_main_tech_...") -> ok, message
+--   se.dev.tech_state(faction_key, tech_key) -> "researched"|"researching"|"available"|"locked", n
+se.dev = se.dev or {}
+local function dev_mp()
+	local cm = G("cm")
+	if not cm then return true end
+	local ok, mp = pcall(function() return cm:query_model():is_multiplayer() end)
+	if ok and type(mp) == "boolean" then return mp end
+	return true
+end
+function se.dev.tech_state(faction_key, tech_key)
+	local okn, err = need("se_dev_tech_state")
+	if not okn then return nil, err end
+	local f, e1 = se.faction(faction_key)
+	if not f then return nil, e1 end
+	return se_dev_tech_state(f, str(tech_key))
+end
+function se.dev.complete_tech(faction_key, tech_key)
+	local okn, err = need("se_dev_complete_tech")
+	if not okn then return false, err end
+	if dev_mp() then return false, "refused: developer research completion is single player only" end
+	return on_model("dev.complete_tech(" .. str(faction_key) .. ", " .. str(tech_key) .. ")", function()
+		local f, e1 = se.faction(faction_key)
+		if not f then return false, e1 end
+		return se_dev_complete_tech(f, str(tech_key))
+	end)
+end
+
 log("se_api loaded (dll " .. se.version() .. ")")

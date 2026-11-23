@@ -194,6 +194,9 @@ pub fn sync_tag() -> String {
     // opt-in (default off): the 0.48.1 garrison guard only moved the crash in game
     feed("guard_garrison_holder");
     feed(if crate::engineguard::garrison_holder_enabled() { "1" } else { "0" });
+    // developer research completion changes the simulation (opt-in, single player only)
+    feed("dev_complete_tech");
+    feed(if crate::dev::enabled() { "1" } else { "0" });
     feed("siege_odds_gate");
     feed(if crate::siege::gate_enabled() { "1" } else { "0" });
     // the odds bands change which assaults the AI accepts
@@ -222,7 +225,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "marriage_inlaws", "marriage_blood_generations",
     "ui_recruit_cache_ms", "ai_recruit_cache", "recruit_perm_cache", "file_probe_cache_ms",
     "diag_diplomacy", "diag_crash", "save_chunking", "duel_power_hook", "prebattle_single_delegate", "postbattle_single_continue",
-    "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "audio", "ui_dev_loader", "dev_cv_eval", "engine_crash_guards",
+    "naval_to_land", "followup_respond_hook", "ceo_ui_refresh", "audio", "ui_dev_loader", "dev_cv_eval", "dev_complete_tech", "engine_crash_guards",
     "cai_null_guard", "battle_xform_fast", "siege_odds_gate", "siege_odds_bands", "siege_force_assault",
     "ai_skills", "ai_ceos", "ai_court", "ai_build", "guard_move_faction", "guard_cco_list_walk", "guard_garrison_holder", "guard_ui_expr", "guard_battle_building", "guard_mods_line",
     "battle_elephant_gate", "battle_shieldwall_hold", "battle_shieldwall_width", "battle_charge_hold",
