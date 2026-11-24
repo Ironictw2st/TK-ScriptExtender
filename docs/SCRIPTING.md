@@ -2611,7 +2611,7 @@ the script extender play vanilla. Numbers can be changed from a campaign script
 `policy_*` decisions), the last 60 decisions in `se.siege.last`.
 
 ---
-## 4f. Context expressions (`se.cv`, DLL 0.49.1-cv+, developer tool)
+## 4f. Context expressions (`se.cv`, DLL 0.49.0+, developer tool)
 
 `se.cv.eval(expr, opts)` evaluates a context expression, the language `.twui.xml` bindings and the
 dev Context Viewer use, against `CcoCampaignRoot`, with the engine's own compiler. The viewer
@@ -2649,7 +2649,7 @@ end
 - **From outside the game:** `tools/secli/secli.py cv "<expr>"` in the workspace prints the same
   result as JSON, through the tw3k_mcp bridge.
 
-## 4g. Developer research completion (`se.dev`, DLL 0.49.1-cv.4+, developer tool)
+## 4g. Developer research completion (`se.dev`, DLL 0.49.0+, developer tool)
 
 CA compiled the dev cheats out of the release exe: `CompleteResearch`, `EnableAllTechnologies`,
 `DevEnableTech` and others. `begin_tech_research` / `set_tech_research_cooldown` can't finish a

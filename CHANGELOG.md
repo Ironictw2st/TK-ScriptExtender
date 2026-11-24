@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.49.0 (release candidate, 21 Nov 2026; branch release/0.49.0-rc1 = 0.48.1 + feat/battle-fixes + feat/creator (creator.29) + guard/uiexpr-aca + guard/mods-line)
+## 0.49.0 (23 Nov 2026; = 0.48.1 + feat/battle-fixes + feat/creator (creator.29) + guard/uiexpr-aca + guard/mods-line + feat/secli-cv)
+
+### Developer tools (off by default)
+
+- `se.cv.eval(expr, opts)` (cfg `dev_cv_eval`, default 0): evaluates a context expression (the `.twui.xml` / dev Context Viewer
+  language) against `CcoCampaignRoot` with the engine's own compiler, viewer closed. Returns values, contexts and lists
+  (`{type, id, name}` rows, text-replacement names resolved) or the engine's error text. Read-only by refusal: anything but a
+  known getter is refused (the engine runs command members while it evaluates). `docs/SCRIPTING.md` §4f.
+- `se.dev.complete_tech(faction, tech)` / `se.dev.tech_state` (cfg `dev_complete_tech`, default 0, in the version lock):
+  completes a technology or reform through the engine's own research tick, so `ResearchCompleted` fires; works on locked and
+  hidden reforms. Single player only. For testing reform trees, since CA compiled the dev research cheats out. §4g.
 
 ### Engine guards
 
